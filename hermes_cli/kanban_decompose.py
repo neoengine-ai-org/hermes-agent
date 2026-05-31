@@ -45,6 +45,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from agent.token_budget_policy import resolve_llm_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -331,7 +332,11 @@ def decompose_task(
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
-            max_tokens=4000,
+            max_tokens=resolve_llm_max_tokens(
+                None,
+                prompt=user_msg,
+                task_type="kanban decomposition json",
+            ),
             timeout=timeout or 180,
             extra_body=get_auxiliary_extra_body() or None,
         )

@@ -47,6 +47,7 @@ import re
 import asyncio
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
 import httpx  # noqa: F401 — kept at module top so tests can patch tools.web_tools.httpx
+from agent.token_budget_policy import resolve_llm_max_tokens
 # After the web-provider plugin migration (PR #25182), the Firecrawl SDK
 # proxy, client construction, and response-shape normalizers all live in
 # plugins.web.firecrawl.provider. We re-export the names that external
@@ -116,6 +117,19 @@ from tools.website_policy import check_website_access
 import sys
 
 logger = logging.getLogger(__name__)
+
+WEB_EXTRACT_SUMMARY_MAX_TOKENS = max(
+    2048,
+    int(os.getenv("HERMES_WEB_EXTRACT_SUMMARY_MAX_TOKENS", "2048")),
+)
+WEB_EXTRACT_CHUNK_MAX_TOKENS = max(
+    2048,
+    int(os.getenv("HERMES_WEB_EXTRACT_CHUNK_MAX_TOKENS", "3072")),
+)
+WEB_EXTRACT_SYNTHESIS_MAX_TOKENS = max(
+    2048,
+    int(os.getenv("HERMES_WEB_EXTRACT_SYNTHESIS_MAX_TOKENS", "2048")),
+)
 
 
 # ─── Backend Selection ────────────────────────────────────────────────────────
@@ -431,7 +445,7 @@ async def _call_summarizer_llm(
     content: str, 
     context_str: str, 
     model: Optional[str], 
-    max_tokens: int = 20000,
+    max_tokens: Optional[int] = None,
     is_chunk: bool = False,
     chunk_info: str = ""
 ) -> Optional[str]:
@@ -509,7 +523,11 @@ Create a markdown summary that captures all key information in a well-organized,
                     {"role": "user", "content": user_prompt},
                 ],
                 "temperature": 0.1,
-                "max_tokens": max_tokens,
+                "max_tokens": resolve_llm_max_tokens(
+                    max_tokens if max_tokens is not None else WEB_EXTRACT_SUMMARY_MAX_TOKENS,
+                    prompt=user_prompt,
+                    task_type="web extract summary evidence",
+                ),
                 # No explicit timeout — async_call_llm reads auxiliary.web_extract.timeout
                 # from config.yaml. Fresh configs ship with 360s; if the key is absent
                 # the runtime default is 30s (_DEFAULT_AUX_TIMEOUT in
@@ -583,7 +601,7 @@ async def _process_large_content_chunked(
                 chunk_content, 
                 context_str, 
                 model, 
-                max_tokens=10000,
+                max_tokens=WEB_EXTRACT_CHUNK_MAX_TOKENS,
                 is_chunk=True,
                 chunk_info=chunk_info
             )
@@ -660,7 +678,11 @@ Create a single, unified markdown summary."""
                 {"role": "user", "content": synthesis_prompt},
             ],
             "temperature": 0.1,
-            "max_tokens": 20000,
+            "max_tokens": resolve_llm_max_tokens(
+                WEB_EXTRACT_SYNTHESIS_MAX_TOKENS,
+                prompt=synthesis_prompt,
+                task_type="web extract synthesis evidence",
+            ),
         }
         if extra_body:
             call_kwargs["extra_body"] = extra_body
@@ -1545,7 +1567,7 @@ registry.register(
     check_fn=check_web_api_key,
     requires_env=_web_requires_env(),
     emoji="🔍",
-    max_result_size_chars=100_000,
+    max_result_size_chars=50_000,
 )
 registry.register(
     name="web_extract",
@@ -1557,5 +1579,5 @@ registry.register(
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",
-    max_result_size_chars=100_000,
+    max_result_size_chars=50_000,
 )

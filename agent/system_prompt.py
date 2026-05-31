@@ -42,6 +42,49 @@ from agent.prompt_builder import (
 )
 
 
+COMPACT_TASK_COMPLETION_GUIDANCE = (
+    "# Completion\n"
+    "Use tools instead of promises when tools can make progress. Finish the requested work, "
+    "verify results, and clearly state blockers instead of fabricating completion."
+)
+
+COMPACT_MEMORY_GUIDANCE = (
+    "Memory: save compact durable user preferences/environment facts only; never save stale task progress, "
+    "PRs/issues/SHAs, or temporary TODOs. Write declarative facts; procedures belong in skills."
+)
+
+COMPACT_SESSION_SEARCH_GUIDANCE = (
+    "Use session_search for relevant past-session context before asking the user to repeat it."
+)
+
+COMPACT_SKILLS_GUIDANCE = (
+    "Skills: after complex/tricky work, save reusable procedures with skill_manage; "
+    "if a loaded skill is stale or missing a pitfall, patch it immediately."
+)
+
+COMPACT_TOOL_USE_ENFORCEMENT_GUIDANCE = (
+    "# Tool-use discipline\n"
+    "If a tool can answer, verify, inspect files/git/system state, calculate, or perform the requested action, "
+    "call it now. Do not end with plans/promises. Gather prerequisites first, retry empty/partial lookups with "
+    "a different strategy, verify results before finalizing, and ask only when required context cannot be retrieved."
+)
+
+
+def _compact_system_guidance_enabled() -> bool:
+    """Return True when verbose operational guidance should be shortened."""
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        raw_agent_cfg = cfg.get("agent")
+        agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+        value = agent_cfg.get("compact_system_guidance", False)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "compact", "short"}
+        return bool(value)
+    except Exception:
+        return False
+
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -79,6 +122,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
+    compact_guidance = _compact_system_guidance_enabled()
 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
@@ -100,14 +144,23 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
+    # Universal task-completion / no-fabrication guidance.  Applied to ALL
+    # models regardless of tool_use_enforcement gating — the failure modes
+    # this targets (stopping after a stub; fabricating output when a real
+    # path is blocked) are not model-family specific.  Gated only by
+    # config.yaml ``agent.task_completion_guidance`` (default True) so
+    # users who want a leaner prompt can turn it off.
+    if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
+        stable_parts.append(COMPACT_TASK_COMPLETION_GUIDANCE)
+
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
     if "memory" in agent.valid_tool_names:
-        tool_guidance.append(MEMORY_GUIDANCE)
+        tool_guidance.append(COMPACT_MEMORY_GUIDANCE if compact_guidance else MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
-        tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+        tool_guidance.append(COMPACT_SESSION_SEARCH_GUIDANCE if compact_guidance else SESSION_SEARCH_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
-        tool_guidance.append(SKILLS_GUIDANCE)
+        tool_guidance.append(COMPACT_SKILLS_GUIDANCE if compact_guidance else SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
     # dispatcher spawned this process (kanban_show check_fn gates on
     # HERMES_KANBAN_TASK env var). Normal chat sessions never see
@@ -152,18 +205,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
         if _inject:
-            stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+            stable_parts.append(COMPACT_TOOL_USE_ENFORCEMENT_GUIDANCE if compact_guidance else TOOL_USE_ENFORCEMENT_GUIDANCE)
             _model_lower = (agent.model or "").lower()
             # Google model operational guidance (conciseness, absolute
             # paths, parallel tool calls, verify-before-edit, etc.)
-            if "gemini" in _model_lower or "gemma" in _model_lower:
+            if not compact_guidance and ("gemini" in _model_lower or "gemma" in _model_lower):
                 stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
             # OpenAI GPT/Codex execution discipline (tool persistence,
             # prerequisite checks, verification, anti-hallucination).
             # Also applied to xAI Grok — same failure modes (claims completion
             # without tool calls, suggests workarounds instead of using
             # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+            if not compact_guidance and ("gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower):
                 stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])

@@ -225,7 +225,7 @@ def _extract_output_tail(
     result: Dict[str, Any],
     *,
     max_entries: int = 12,
-    max_chars: int = 8000,
+    max_chars: int = 4000,
 ) -> List[Dict[str, Any]]:
     """Pull the last N tool-call results from a child's conversation.
 

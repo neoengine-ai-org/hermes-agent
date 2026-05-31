@@ -161,7 +161,7 @@ def _pinned_guard(name: str) -> Optional[str]:
     return None
 
 
-MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
+MAX_SKILL_CONTENT_CHARS = 50_000    # ~18k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
 # Characters allowed in skill names (filesystem-safe, URL-friendly)

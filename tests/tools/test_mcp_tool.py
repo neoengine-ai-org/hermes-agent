@@ -2369,7 +2369,7 @@ class TestSamplingHandlerInit:
         assert h.server_name == "srv"
         assert h.max_rpm == 10
         assert h.timeout == 30
-        assert h.max_tokens_cap == 4096
+        assert h.max_tokens_cap == 2048
         assert h.max_tool_rounds == 5
         assert h.model_override is None
         assert h.allowed_models == []
