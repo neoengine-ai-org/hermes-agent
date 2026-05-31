@@ -1,0 +1,136 @@
+name: auto-arm-auto-merge
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_run:
+    workflows:
+      - '*'
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to arm
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || inputs.pr_number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  arm-auto-merge:
+    name: arm-auto-merge
+    runs-on: ubuntu-latest
+    env:
+      HAS_MERGE_STEWARD_APP: ${{ secrets.NEOENGINE_MERGE_STEWARD_APP_ID != '' && secrets.NEOENGINE_MERGE_STEWARD_PRIVATE_KEY != '' }}
+    steps:
+      - name: Create merge steward app token
+        id: merge-steward-token
+        if: env.HAS_MERGE_STEWARD_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.NEOENGINE_MERGE_STEWARD_APP_ID }}
+          private-key: ${{ secrets.NEOENGINE_MERGE_STEWARD_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - name: Enable native GitHub auto-merge
+        env:
+          GH_TOKEN: ${{ steps.merge-steward-token.outputs.token || secrets.NEOENGINE_AUTOMERGE_TOKEN || github.token }}
+          TOKEN_SOURCE: ${{ steps.merge-steward-token.outputs.token != '' && 'neo-merge-steward-app' || secrets.NEOENGINE_AUTOMERGE_TOKEN != '' && 'NEOENGINE_AUTOMERGE_TOKEN' || 'github.token' }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+
+          const token = process.env.GH_TOKEN;
+          const tokenSource = process.env.TOKEN_SOURCE || 'github.token';
+          const repository = process.env.REPOSITORY;
+          const eventName = process.env.EVENT_NAME;
+          const eventPath = process.env.GITHUB_EVENT_PATH;
+          const manualPrNumber = process.env.PR_NUMBER;
+
+          if (!token || !repository || !eventName || !eventPath) {
+            throw new Error('missing GH_TOKEN, REPOSITORY, EVENT_NAME, or EVENT_PATH');
+          }
+
+          async function githubRest(path) {
+            const response = await fetch(`https://api.github.com${path}`, {
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/vnd.github+json',
+                'User-Agent': 'neoengine-auto-arm-auto-merge',
+                'X-GitHub-Api-Version': '2022-11-28',
+              },
+            });
+            const text = await response.text();
+            const body = text ? JSON.parse(text) : null;
+            if (!response.ok) throw new Error(`GitHub REST ${response.status}: ${text.slice(0, 500)}`);
+            return body;
+          }
+
+          async function githubGraphql(query, variables) {
+            const response = await fetch('https://api.github.com/graphql', {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${token}`,
+                Accept: 'application/vnd.github+json',
+                'Content-Type': 'application/json',
+                'User-Agent': 'neoengine-auto-arm-auto-merge',
+              },
+              body: JSON.stringify({ query, variables }),
+            });
+            const body = await response.json();
+            if (!response.ok || body.errors?.length) throw new Error(`GitHub GraphQL ${response.status}: ${JSON.stringify(body.errors ?? body).slice(0, 1000)}`);
+            return body.data;
+          }
+
+          async function resolvePullRequest() {
+            const event = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+            if (eventName === 'workflow_dispatch') {
+              if (!/^\d+$/.test(manualPrNumber || '')) throw new Error(`workflow_dispatch pr_number must be numeric: ${manualPrNumber}`);
+              return githubRest(`/repos/${repository}/pulls/${manualPrNumber}`);
+            }
+            if (eventName === 'workflow_run') {
+              const run = event.workflow_run;
+              if (!run || run.event !== 'pull_request' || run.conclusion !== 'success') return null;
+              const prNumber = (run.pull_requests || []).find((candidate) => candidate?.number)?.number;
+              if (prNumber) return githubRest(`/repos/${repository}/pulls/${prNumber}`);
+              if (!run.head_sha) return null;
+              const associated = await githubRest(`/repos/${repository}/commits/${run.head_sha}/pulls`);
+              return (associated || []).find((candidate) => candidate?.state === 'open' && candidate?.head?.sha === run.head_sha) || null;
+            }
+            return event.pull_request || null;
+          }
+
+          async function main() {
+            const pr = await resolvePullRequest();
+            if (!pr) return;
+            if (pr.state !== 'open' || pr.draft || pr.auto_merge) return;
+            if (pr.head?.repo?.full_name?.toLowerCase() !== repository.toLowerCase()) return;
+
+            const data = await githubGraphql(
+              `mutation EnableAutoMerge($pullRequestId: ID!) {
+                enablePullRequestAutoMerge(input: { pullRequestId: $pullRequestId, mergeMethod: SQUASH }) {
+                  pullRequest { number autoMergeRequest { enabledAt mergeMethod } }
+                }
+              }`,
+              { pullRequestId: pr.node_id },
+            );
+            const request = data.enablePullRequestAutoMerge.pullRequest.autoMergeRequest;
+            console.log(`ok: armed auto-merge for PR #${pr.number} using ${request.mergeMethod} at ${request.enabledAt}; token source: ${tokenSource}`);
+          }
+
+          main().catch((error) => {
+            console.error(error);
+            console.error('Configure NEOENGINE_MERGE_STEWARD_APP_ID and NEOENGINE_MERGE_STEWARD_PRIVATE_KEY for neo-merge-steward-app, or configure a distinct-bot NEOENGINE_AUTOMERGE_TOKEN. Do not use the PR author token for approval.');
+            process.exit(1);
+          });
+          NODE
