@@ -38,14 +38,25 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from agent.token_budget_policy import resolve_llm_max_tokens
 from hermes_cli import kanban_db as kb
 
-HERMES_KANBAN_SPECIFY_MAX_TOKENS = max(
-    1500,
-    int(os.getenv("HERMES_KANBAN_SPECIFY_MAX_TOKENS", "6000")),
-)
+HERMES_KANBAN_SPECIFY_MAX_TOKENS = os.getenv("HERMES_KANBAN_SPECIFY_MAX_TOKENS")
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_max_tokens() -> Optional[int]:
+    if not HERMES_KANBAN_SPECIFY_MAX_TOKENS:
+        return None
+    try:
+        return max(1500, int(HERMES_KANBAN_SPECIFY_MAX_TOKENS))
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid HERMES_KANBAN_SPECIFY_MAX_TOKENS=%r; using budget policy default",
+            HERMES_KANBAN_SPECIFY_MAX_TOKENS,
+        )
+        return None
 
 
 _SYSTEM_PROMPT = """You are the Kanban triage specifier for the Hermes Agent board.
@@ -190,7 +201,11 @@ def specify_task(
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
-            max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS,
+            max_tokens=resolve_llm_max_tokens(
+                _configured_max_tokens(),
+                prompt=user_msg,
+                task_type="kanban task specification json",
+            ),
             timeout=timeout or 120,
             extra_body=get_auxiliary_extra_body() or None,
         )

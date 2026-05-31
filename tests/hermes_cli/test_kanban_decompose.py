@@ -90,10 +90,14 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     })
 
     patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    client = _mock_client_returning(llm_payload)
     for p in patches:
         p.start()
     try:
-        with _patch_aux_client(llm_payload), _patch_extra_body():
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "test-model"),
+        ), _patch_extra_body():
             outcome = decomp.decompose_task(tid, author="me")
     finally:
         for p in patches:
@@ -102,6 +106,7 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert outcome.ok, outcome.reason
     assert outcome.fanout is True
     assert outcome.child_ids and len(outcome.child_ids) == 2
+    assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 3072
 
     with kb.connect() as conn:
         root = kb.get_task(conn, tid)

@@ -38,6 +38,7 @@ from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+from agent.token_budget_policy import resolve_llm_max_tokens
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
@@ -800,7 +801,11 @@ async def vision_analyze_tool(
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
+            "max_tokens": resolve_llm_max_tokens(
+                1024,
+                prompt=user_prompt,
+                task_type="image vision analysis",
+            ),
             "timeout": vision_timeout,
         }
         if model:
@@ -1283,7 +1288,11 @@ async def video_analyze_tool(
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 4000,
+            "max_tokens": resolve_llm_max_tokens(
+                2048,
+                prompt=user_prompt,
+                task_type="video vision analysis",
+            ),
             "timeout": vision_timeout,
         }
         if model:

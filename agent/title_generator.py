@@ -9,6 +9,7 @@ import threading
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
+from agent.token_budget_policy import resolve_llm_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +58,11 @@ def generate_title(
         response = call_llm(
             task="title_generation",
             messages=messages,
-            max_tokens=500,
+            max_tokens=resolve_llm_max_tokens(
+                128,
+                prompt=user_snippet,
+                task_type="title generation",
+            ),
             temperature=0.3,
             timeout=timeout,
             main_runtime=main_runtime,

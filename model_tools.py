@@ -261,6 +261,42 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _compact_tool_schema_descriptions(schema: Any) -> Any:
+    """Return *schema* with JSON-schema ``description`` fields removed.
+
+    Tool descriptions are useful for broad discoverability, but they are also
+    the dominant fixed payload in long-lived gateway sessions.  For operators
+    who prefer a tiny always-on schema surface, ``tools.compact_schemas`` strips
+    prose while preserving names, types, properties, enums, defaults, and
+    required fields.
+    """
+    if isinstance(schema, dict):
+        return {
+            key: _compact_tool_schema_descriptions(value)
+            for key, value in schema.items()
+            if key != "description"
+        }
+    if isinstance(schema, list):
+        return [_compact_tool_schema_descriptions(item) for item in schema]
+    return schema
+
+
+def _compact_tool_schemas_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        raw_tools_cfg = cfg.get("tools")
+        raw_agent_cfg = cfg.get("agent")
+        tools_cfg = raw_tools_cfg if isinstance(raw_tools_cfg, dict) else {}
+        agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+        value = tools_cfg.get("compact_schemas", agent_cfg.get("compact_tool_schemas", False))
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "compact", "strip"}
+        return bool(value)
+    except Exception:
+        return False
+
+
 def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
@@ -480,6 +516,39 @@ def _compute_tool_definitions(
         filtered_tools = sanitize_tool_schemas(filtered_tools)
     except Exception as e:  # pragma: no cover — defensive
         logger.warning("Schema sanitization skipped: %s", e)
+
+    # ── Tool Search (progressive disclosure) ────────────────────────────
+    # Conditionally replace MCP + plugin (non-core) tools with three bridge
+    # tools (tool_search / tool_describe / tool_call) when the deferrable
+    # surface exceeds the configured threshold (default 10% of context
+    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
+    # deferred. See tools/tool_search.py for full design notes.
+    #
+    # This is deliberately the last step before returning — sanitization
+    # has already normalized schemas, and the assembly is idempotent in
+    # case some caller invokes get_tool_definitions twice.
+    try:
+        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
+        ts_cfg = _load_ts_config()
+        if not skip_tool_search_assembly and ts_cfg.enabled != "off":
+            context_length = _resolve_active_context_length()
+            assembly = assemble_tool_defs(
+                filtered_tools,
+                context_length=context_length,
+                config=ts_cfg,
+            )
+            if assembly.activated and not quiet_mode:
+                print(
+                    f"🔎 Tool Search: {assembly.deferred_count} MCP/plugin tools deferred "
+                    f"(~{assembly.deferred_tokens} tokens) behind tool_search/describe/call. "
+                    f"Threshold ~{assembly.threshold_tokens} tokens."
+                )
+            filtered_tools = assembly.tool_defs
+    except Exception as e:  # pragma: no cover — never break tool loading
+        logger.warning("Tool search assembly skipped: %s", e)
+
+    if _compact_tool_schemas_enabled():
+        filtered_tools = _compact_tool_schema_descriptions(filtered_tools)
 
     return filtered_tools
 

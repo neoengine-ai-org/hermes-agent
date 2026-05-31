@@ -160,7 +160,7 @@ Switching mode changes where scripts run and which interpreter runs them, not wh
 | Resource | Limit | Notes |
 |----------|-------|-------|
 | **Timeout** | 5 minutes (300s) | Script is killed with SIGTERM, then SIGKILL after 5s grace |
-| **Stdout** | 50 KB | Output truncated with `[output truncated at 50KB]` notice |
+| **Stdout** | 24 KB | Output truncated with `[OUTPUT TRUNCATED]` notice |
 | **Stderr** | 10 KB | Included in output on non-zero exit for debugging |
 | **Tool calls** | 50 per execution | Error returned when limit reached |
 
@@ -172,6 +172,7 @@ code_execution:
   mode: project      # project (default) | strict
   timeout: 300       # Max seconds per script (default: 300)
   max_tool_calls: 50 # Max tool calls per execution (default: 50)
+  max_stdout_bytes: 24000 # Max stdout chars returned to the model
 ```
 
 ## How Tool Calls Work Inside Scripts

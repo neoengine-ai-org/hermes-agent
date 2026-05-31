@@ -200,6 +200,7 @@ class TestFirecrawlClientConfig:
 
         assert result == "summary text"
         mock_async_call.assert_awaited_once()
+        assert mock_async_call.await_args.kwargs["max_tokens"] == 2048
 
     # ── Singleton caching ────────────────────────────────────────────
 

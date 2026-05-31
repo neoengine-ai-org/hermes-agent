@@ -17,7 +17,7 @@ Defense against context-window overflow operates at three levels:
 
 3. **Per-turn aggregate budget** (enforce_turn_budget): After all tool
    results in a single assistant turn are collected, if the total exceeds
-   MAX_TURN_BUDGET_CHARS (200K), the largest non-persisted results are
+   the compact turn budget, the largest non-persisted results are
    spilled to disk until the aggregate is under budget. This catches cases
    where many medium-sized results combine to overflow context.
 """

@@ -877,7 +877,7 @@ def build_converse_kwargs(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -887,13 +887,21 @@ def build_converse_kwargs(
 
     Converts OpenAI-format inputs to Converse API parameters.
     """
+    from agent.token_budget_policy import resolve_llm_max_tokens
+
     system_prompt, converse_messages = convert_messages_to_converse(messages)
+    effective_max_tokens = resolve_llm_max_tokens(
+        max_tokens,
+        messages=messages,
+        has_tools=bool(tools),
+        task_type="bedrock_converse",
+    )
 
     kwargs: Dict[str, Any] = {
         "modelId": model,
         "messages": converse_messages,
         "inferenceConfig": {
-            "maxTokens": max_tokens,
+            "maxTokens": effective_max_tokens,
         },
     }
 
@@ -936,7 +944,7 @@ def call_converse(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,
@@ -977,7 +985,7 @@ def call_converse_stream(
     model: str,
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
-    max_tokens: int = 4096,
+    max_tokens: Optional[int] = None,
     temperature: Optional[float] = None,
     top_p: Optional[float] = None,
     stop_sequences: Optional[List[str]] = None,

@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import profiles as profiles_mod
+from agent.token_budget_policy import resolve_llm_max_tokens
 from agent.skill_utils import is_excluded_skill_path
 
 logger = logging.getLogger(__name__)
@@ -245,7 +246,11 @@ def describe_profile(
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
-            max_tokens=400,
+            max_tokens=resolve_llm_max_tokens(
+                256,
+                prompt=user_msg,
+                task_type="profile description json",
+            ),
             timeout=timeout or 60,
             extra_body=get_auxiliary_extra_body() or None,
         )

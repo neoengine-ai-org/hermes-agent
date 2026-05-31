@@ -2955,7 +2955,7 @@ def install_from_quarantine(
     if skill_md.exists():
         try:
             skill_size = skill_md.stat().st_size
-            if skill_size > 100_000:
+            if skill_size > 50_000:
                 logger.warning(
                     "Skill '%s' has a large SKILL.md (%s chars). "
                     "Large skills consume significant context when loaded. "

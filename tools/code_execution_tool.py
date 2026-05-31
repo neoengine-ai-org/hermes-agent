@@ -70,7 +70,7 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
-MAX_STDOUT_BYTES = 50_000    # 50 KB
+MAX_STDOUT_BYTES = 24_000    # compact default; override with code_execution.max_stdout_bytes
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
 # Environment variable scrubbing rules (shared between the local + remote
@@ -976,9 +976,10 @@ def _execute_remote(
     # --- Post-process output (same as local path) ---
 
     # Truncate stdout to cap
-    if len(stdout_text) > MAX_STDOUT_BYTES:
-        head_bytes = int(MAX_STDOUT_BYTES * 0.4)
-        tail_bytes = MAX_STDOUT_BYTES - head_bytes
+    max_stdout_bytes = _resolve_max_stdout_bytes()
+    if len(stdout_text) > max_stdout_bytes:
+        head_bytes = int(max_stdout_bytes * 0.4)
+        tail_bytes = max_stdout_bytes - head_bytes
         head = stdout_text[:head_bytes]
         tail = stdout_text[-tail_bytes:]
         omitted = len(stdout_text) - len(head) - len(tail)
@@ -1249,8 +1250,9 @@ def execute_code(
         # For stdout we use a head+tail strategy: keep the first HEAD_BYTES
         # and a rolling window of the last TAIL_BYTES so the final print()
         # output is never lost.  Stderr keeps head-only (errors appear early).
-        _STDOUT_HEAD_BYTES = int(MAX_STDOUT_BYTES * 0.4)   # 40% head
-        _STDOUT_TAIL_BYTES = MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES  # 60% tail
+        max_stdout_bytes = _resolve_max_stdout_bytes()
+        _STDOUT_HEAD_BYTES = int(max_stdout_bytes * 0.4)   # 40% head
+        _STDOUT_TAIL_BYTES = max_stdout_bytes - _STDOUT_HEAD_BYTES  # 60% tail
 
         def _drain(pipe, chunks, max_bytes):
             """Simple head-only drain (used for stderr)."""
@@ -1349,7 +1351,7 @@ def execute_code(
 
         # Assemble stdout with head+tail truncation
         total_stdout = stdout_total_bytes[0]
-        if total_stdout > MAX_STDOUT_BYTES and stdout_tail:
+        if total_stdout > max_stdout_bytes and stdout_tail:
             omitted = total_stdout - len(stdout_head) - len(stdout_tail)
             truncated_notice = (
                 f"\n\n... [OUTPUT TRUNCATED - {omitted:,} chars omitted "
@@ -1517,6 +1519,16 @@ def _load_config() -> dict:
         return cfg if isinstance(cfg, dict) else {}
     except Exception:
         return {}
+
+
+def _resolve_max_stdout_bytes() -> int:
+    """Return the configured stdout cap for execute_code output."""
+    try:
+        raw_value = _load_config().get("max_stdout_bytes", MAX_STDOUT_BYTES)
+        value = int(raw_value)
+        return value if value > 0 else MAX_STDOUT_BYTES
+    except Exception:
+        return MAX_STDOUT_BYTES
 
 
 # ---------------------------------------------------------------------------
@@ -1730,7 +1742,7 @@ def build_execute_code_schema(enabled_sandbox_tools: set = None,
         "or the task requires interactive user input.\n\n"
         f"Available via `from hermes_tools import ...`:\n\n"
         f"{tool_lines}\n\n"
-        "Limits: 5-minute timeout, 50KB stdout cap, max 50 tool calls per script. "
+        "Limits: 5-minute timeout, 24KB stdout cap, max 50 tool calls per script. "
         "terminal() is foreground-only (no background or pty).\n\n"
         f"{cwd_note}\n\n"
         "Print your final result to stdout. Use Python stdlib (json, re, math, csv, "
@@ -1779,5 +1791,5 @@ registry.register(
         enabled_tools=kw.get("enabled_tools")),
     check_fn=check_sandbox_requirements,
     emoji="🐍",
-    max_result_size_chars=100_000,
+    max_result_size_chars=50_000,
 )

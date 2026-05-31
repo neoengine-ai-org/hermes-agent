@@ -7,22 +7,24 @@ OpenCode hardcoded ``MAX_LINES = 2000`` and ``MAX_BYTES = 50 * 1024``
 as tool-output truncation thresholds. Hermes-agent had the same
 hardcoded constants in two places:
 
-* ``tools/terminal_tool.py`` — ``MAX_OUTPUT_CHARS = 50000`` (terminal
-  stdout/stderr cap)
-* ``tools/file_operations.py`` — ``MAX_LINES = 2000`` /
+* ``tools/terminal_tool.py`` — compact terminal stdout/stderr cap
+* ``tools/file_operations.py`` — compact ``MAX_LINES`` /
   ``MAX_LINE_LENGTH = 2000`` (read_file pagination cap + per-line cap)
 
 This module centralises those values behind a single config section
 (``tool_output`` in ``config.yaml``) so power users can tune them
-without patching the source. The existing hardcoded numbers remain as
-defaults, so behaviour is unchanged when the config key is absent.
+without patching the source. The defaults are compact, with legacy caps
+available through config for runs that need wider pages.
 
 Example ``config.yaml``::
 
     tool_output:
-      max_bytes: 100000        # terminal output cap (chars)
-      max_lines: 5000          # read_file pagination + truncation cap
+      max_bytes: 24000         # terminal output cap (chars)
+      max_lines: 1000          # read_file pagination + truncation cap
       max_line_length: 2000    # per-line length cap before '... [truncated]'
+
+Set ``tool_output.max_bytes: 50000`` and ``tool_output.max_lines: 2000``
+to restore the legacy terminal/read caps.
 
 The limits reader is defensive: any error (missing config file, invalid
 value type, etc.) falls back to the built-in defaults so tools never
@@ -33,11 +35,10 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-# Hardcoded defaults — these match the pre-existing values, so adding
-# this module is behaviour-preserving for users who don't set
-# ``tool_output`` in config.yaml.
-DEFAULT_MAX_BYTES = 50_000       # terminal_tool.MAX_OUTPUT_CHARS
-DEFAULT_MAX_LINES = 2000         # file_operations.MAX_LINES
+# Compact defaults. Users who need the legacy caps can set
+# ``tool_output.max_bytes: 50000`` and ``tool_output.max_lines: 2000``.
+DEFAULT_MAX_BYTES = 24_000
+DEFAULT_MAX_LINES = 1000         # file_operations.MAX_LINES
 DEFAULT_MAX_LINE_LENGTH = 2000   # file_operations.MAX_LINE_LENGTH
 
 

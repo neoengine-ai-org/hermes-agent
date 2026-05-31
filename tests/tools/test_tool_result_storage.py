@@ -430,7 +430,7 @@ class TestEnforceTurnBudget:
             {"role": "tool", "tool_call_id": "t1", "content": "small"},
             {"role": "tool", "tool_call_id": "t2", "content": "also small"},
         ]
-        result = enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
+        result = enforce_turn_budget(msgs, env=None)
         assert result[0]["content"] == "small"
         assert result[1]["content"] == "also small"
 
@@ -438,12 +438,12 @@ class TestEnforceTurnBudget:
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}
         msgs = [
-            {"role": "tool", "tool_call_id": "t1", "content": "a" * 80_000},
-            {"role": "tool", "tool_call_id": "t2", "content": "b" * 130_000},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 40_000},
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 70_000},
         ]
-        # Total 210K > 200K budget
-        enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=200_000))
-        # The larger one (130K) should be persisted first
+        # Total 110K > compact 100K budget
+        enforce_turn_budget(msgs, env=env)
+        # The larger one (70K) should be persisted first
         assert PERSISTED_OUTPUT_TAG in msgs[1]["content"]
 
     def test_already_persisted_results_skipped(self):
@@ -454,43 +454,43 @@ class TestEnforceTurnBudget:
              "content": f"{PERSISTED_OUTPUT_TAG}\nalready persisted\n{PERSISTED_OUTPUT_CLOSING_TAG}"},
             {"role": "tool", "tool_call_id": "t2", "content": "x" * 250_000},
         ]
-        enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=200_000))
+        enforce_turn_budget(msgs, env=env)
         # t1 should be untouched (already persisted)
         assert msgs[0]["content"].startswith(PERSISTED_OUTPUT_TAG)
         # t2 should be persisted
         assert PERSISTED_OUTPUT_TAG in msgs[1]["content"]
 
     def test_medium_result_regression(self):
-        """6 results of 42K chars each (252K total) — each under 100K default
-        threshold but aggregate exceeds 200K budget. L3 should persist."""
+        """6 results of 42K chars each (252K total) — each under 50K default
+        threshold but aggregate exceeds the 100K budget. L3 should persist."""
         env = MagicMock()
         env.execute.return_value = {"output": "", "returncode": 0}
         msgs = [
             {"role": "tool", "tool_call_id": f"t{i}", "content": "x" * 42_000}
             for i in range(6)
         ]
-        enforce_turn_budget(msgs, env=env, config=BudgetConfig(turn_budget=200_000))
-        # At least some results should be persisted to get under 200K
+        enforce_turn_budget(msgs, env=env)
+        # At least some results should be persisted to get under 100K
         persisted_count = sum(
             1 for m in msgs if PERSISTED_OUTPUT_TAG in m["content"]
         )
-        assert persisted_count >= 2  # Need to shed at least ~52K
+        assert persisted_count >= 4  # Need to shed at least ~152K
 
     def test_no_env_falls_back_to_truncation(self):
         msgs = [
             {"role": "tool", "tool_call_id": "t1", "content": "x" * 250_000},
         ]
-        enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
+        enforce_turn_budget(msgs, env=None)
         # Should be truncated (no sandbox available)
         assert "Truncated" in msgs[0]["content"] or PERSISTED_OUTPUT_TAG in msgs[0]["content"]
 
     def test_returns_same_list(self):
         msgs = [{"role": "tool", "tool_call_id": "t1", "content": "ok"}]
-        result = enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
+        result = enforce_turn_budget(msgs, env=None)
         assert result is msgs
 
     def test_empty_messages(self):
-        result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
+        result = enforce_turn_budget([], env=None)
         assert result == []
 
 
@@ -515,7 +515,7 @@ class TestPerToolThresholds:
         try:
             import tools.terminal_tool  # noqa: F401
             val = registry.get_max_result_size("terminal")
-            assert val == 100_000
+            assert val == 50_000
         except ImportError:
             pytest.skip("terminal_tool not importable in test env")
 
@@ -524,18 +524,18 @@ class TestPerToolThresholds:
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("read_file")
-            assert val == 100_000
+            assert val == 50_000
         except ImportError:
             pytest.skip("file_tools not importable in test env")
 
-    def test_read_file_registry_cap_is_100k(self):
-        """Regression test: read_file must have a 100_000 char registry cap (Layer 2 safety net)."""
+    def test_read_file_registry_cap_is_50k(self):
+        """Regression test: read_file keeps a compact registry cap (Layer 2 safety net)."""
         from tools.registry import registry
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("read_file")
-            assert val == 100_000, (
-                f"read_file registry cap must be 100_000, got {val!r}. "
+            assert val == 50_000, (
+                f"read_file registry cap must be 50_000, got {val!r}. "
                 "float('inf') is not allowed — it disables the Layer 2 result-size guard."
             )
         except ImportError:
@@ -546,6 +546,6 @@ class TestPerToolThresholds:
         try:
             import tools.file_tools  # noqa: F401
             val = registry.get_max_result_size("search_files")
-            assert val == 100_000
+            assert val == 50_000
         except ImportError:
             pytest.skip("file_tools not importable in test env")

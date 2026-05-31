@@ -96,13 +96,14 @@ def test_specify_task_happy_path(kanban_home):
         "title": "Refined rough",
         "body": "**Goal**\nA concrete goal.",
     })
-    p, _ = _patch_aux_client(content)
+    p, client = _patch_aux_client(content)
     with p:
         outcome = spec.specify_task(tid, author="ace")
 
     assert outcome.ok is True
     assert outcome.task_id == tid
     assert outcome.new_title == "Refined rough"
+    assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 2048
 
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
