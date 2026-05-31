@@ -3,10 +3,6 @@ name: auto-arm-auto-merge
 on:
   pull_request_target:
     types: [opened, reopened, synchronize, ready_for_review]
-  workflow_run:
-    workflows:
-      - '*'
-    types: [completed]
   workflow_dispatch:
     inputs:
       pr_number:
@@ -15,7 +11,7 @@ on:
         type: string
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_sha || inputs.pr_number }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number }}
   cancel-in-progress: true
 
 permissions:
@@ -97,15 +93,6 @@ jobs:
             if (eventName === 'workflow_dispatch') {
               if (!/^\d+$/.test(manualPrNumber || '')) throw new Error(`workflow_dispatch pr_number must be numeric: ${manualPrNumber}`);
               return githubRest(`/repos/${repository}/pulls/${manualPrNumber}`);
-            }
-            if (eventName === 'workflow_run') {
-              const run = event.workflow_run;
-              if (!run || run.event !== 'pull_request' || run.conclusion !== 'success') return null;
-              const prNumber = (run.pull_requests || []).find((candidate) => candidate?.number)?.number;
-              if (prNumber) return githubRest(`/repos/${repository}/pulls/${prNumber}`);
-              if (!run.head_sha) return null;
-              const associated = await githubRest(`/repos/${repository}/commits/${run.head_sha}/pulls`);
-              return (associated || []).find((candidate) => candidate?.state === 'open' && candidate?.head?.sha === run.head_sha) || null;
             }
             return event.pull_request || null;
           }
