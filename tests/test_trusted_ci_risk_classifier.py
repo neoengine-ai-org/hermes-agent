@@ -78,6 +78,7 @@ def body(**overrides: str) -> str:
 def test_classifier_self_change_detects_script_workflow_and_template() -> None:
     files = [
         "scripts/ci_risk_classifier.py",
+        "scripts/review_receipt_validator.py",
         ".github/workflows/pr-risk-classifier.yml",
         ".github/PULL_REQUEST_TEMPLATE.md",
     ]

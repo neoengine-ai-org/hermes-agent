@@ -54,6 +54,25 @@ Fixes #
 - Expected state change:
 - Stop condition:
 
+## Review Receipt
+
+<!-- Optional until review receipt validation is enforced. Repeat this section for each review receipt. -->
+
+- review_type: secondary/adversarial/opposite_provider_adversarial/human_protected/founder/security/finance_sensitive
+- provider:
+- reviewer_identity:
+- same_provider_fallback: yes/no
+- fallback_reason:
+- pr_reviewed:
+- head_sha_reviewed:
+- base_sha_reviewed:
+- verdict: PASS/PASS_WITH_CAVEATS/REQUEST_CHANGES/PARK/SUPERSEDE/PROTECTED_GATE_REQUIRED/MERGE_REPAIR_REQUIRED
+- material_findings:
+- unresolved_blockers:
+- protected_claims_checked:
+- review_timestamp:
+- evidence_url_or_path:
+
 ## RuntimePayloadContract
 
 <!-- Required for runtime/protected surfaces. Non-runtime lanes may leave this blank when a valid blocker exemption applies. -->
