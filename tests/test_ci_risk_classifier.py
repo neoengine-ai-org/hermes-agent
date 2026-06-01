@@ -50,8 +50,8 @@ def runtime_payload_contract(**overrides: str) -> str:
         "protected_non_claims": "No production, launch, customer-data, or protected approval readiness is claimed.",
     }
     fields.update(overrides)
-    lines = ["", "runtimePayloadContract:"]
-    lines.extend(f"  {key}: {value}" for key, value in fields.items())
+    lines = ["", "## RuntimePayloadContract", ""]
+    lines.extend(f"- {key}: {value}" for key, value in fields.items())
     return "\n".join(lines) + "\n"
 
 
@@ -116,6 +116,26 @@ def test_protected_surface_requires_human_and_non_claims() -> None:
 
 
 
+def test_runtime_contract_yes_without_any_contract_block_blocks_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["agent/system_prompt.py"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C2",
+                "Impacted surfaces": "runtime_backend",
+                "RuntimePayloadContract present": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build",
+            }
+        ),
+        additions=80,
+    )
+
+    assert result.runtime_payload_contract_present is False
+    assert "runtime_surface_without_runtimePayloadContract" in result.merge_blocking_conditions
+    assert result.allowed_to_mark_ready is False
+
+
 def test_runtime_contract_yes_without_contract_block_blocks_ready() -> None:
     result = ci_risk_classifier.classify(
         ["agent/system_prompt.py"],
@@ -137,7 +157,28 @@ def test_runtime_contract_yes_without_contract_block_blocks_ready() -> None:
     assert result.allowed_to_mark_ready is False
 
 
-def test_runtime_contract_block_missing_required_fields_blocks_ready() -> None:
+def test_runtime_contract_block_missing_tests_field_blocks_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["agent/system_prompt.py"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C2",
+                "Impacted surfaces": "runtime_backend",
+                "RuntimePayloadContract present": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build",
+            }
+        )
+        + runtime_payload_contract(tests_that_prove_runtime_behavior=""),
+        additions=80,
+    )
+
+    assert result.runtime_payload_contract_present is False
+    assert "runtimePayloadContract_missing_required_fields:tests_that_prove_runtime_behavior" in result.merge_blocking_conditions
+    assert result.allowed_to_mark_ready is False
+
+
+def test_runtime_contract_block_with_blank_rollback_blocks_ready() -> None:
     result = ci_risk_classifier.classify(
         ["agent/system_prompt.py"],
         body(
@@ -156,6 +197,27 @@ def test_runtime_contract_block_missing_required_fields_blocks_ready() -> None:
     assert result.runtime_payload_contract_present is False
     assert "runtimePayloadContract_missing_required_fields:rollback" in result.merge_blocking_conditions
     assert result.allowed_to_mark_ready is False
+
+
+def test_runtime_contract_full_block_allows_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["agent/system_prompt.py"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C2",
+                "Impacted surfaces": "runtime_backend",
+                "RuntimePayloadContract present": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build",
+            }
+        )
+        + runtime_payload_contract(),
+        additions=80,
+    )
+
+    assert result.runtime_payload_contract_present is True
+    assert result.merge_blocking_conditions == []
+    assert result.allowed_to_mark_ready is True
 
 def test_declared_lanes_weaker_than_classifier_blocks_ready() -> None:
     result = ci_risk_classifier.classify(

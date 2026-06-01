@@ -233,18 +233,16 @@ def split_lanes(value: str | None) -> set[str]:
 
 
 def parse_runtime_payload_contract(body: str) -> dict[str, str] | None:
-    """Parse the YAML-ish runtimePayloadContract block used in PR bodies."""
+    """Parse the required Markdown RuntimePayloadContract section."""
 
     lines = body.splitlines()
     for index, line in enumerate(lines):
-        if re.match(r"^runtimePayloadContract\s*:\s*$", line):
+        if re.match(r"^##\s+RuntimePayloadContract\s*$", line):
             fields: dict[str, str] = {}
             for contract_line in lines[index + 1 :]:
-                if not contract_line.strip():
-                    continue
-                if not contract_line.startswith((" ", "\t")):
+                if re.match(r"^##\s+", contract_line):
                     break
-                match = re.match(r"^\s+([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$", contract_line)
+                match = re.match(r"^\s*-\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$", contract_line)
                 if match:
                     fields[match.group(1)] = match.group(2).strip()
             return fields

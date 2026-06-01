@@ -54,6 +54,19 @@ Fixes #
 - Expected state change:
 - Stop condition:
 
+## RuntimePayloadContract
+
+<!-- Required for runtime/protected surfaces. Non-runtime lanes may leave this blank when a valid blocker exemption applies. -->
+
+- user_or_operator_visible_outcome:
+- runtime_surface_touched:
+- product_or_platform_capability_advanced:
+- why_this_is_not_only_docs_or_scaffolding:
+- tests_that_prove_runtime_behavior:
+- acceptance_gate:
+- rollback:
+- protected_non_claims:
+
 ## Checklist
 
 <!-- Complete these before requesting review. -->
