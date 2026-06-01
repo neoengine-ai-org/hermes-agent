@@ -658,10 +658,19 @@ def with_trusted_execution_metadata(
     blocking = list(existing_blocking) if isinstance(existing_blocking, list) else []
     blocking.extend(f"head_classifier_weakened_posture:{weakening}" for weakening in weakenings)
     result["merge_blocking_conditions"] = sorted(set(str(item) for item in blocking))
+    body_blocking = [
+        blocker
+        for blocker in result["merge_blocking_conditions"]
+        if str(blocker).startswith(("missing_", "declared_", "runtime", "protected_surface_without_protected_non_claims"))
+    ]
+    head_weakened = any(
+        str(blocker).startswith("head_classifier_weakened_posture:")
+        for blocker in result["merge_blocking_conditions"]
+    )
+    result["body_and_classification_ready"] = not body_blocking
+    result["review_ready"] = result["body_and_classification_ready"] and not head_weakened
     result["merge_ready"] = not result["merge_blocking_conditions"]
     result["allowed_to_mark_ready"] = result["merge_ready"]
-    result.setdefault("body_and_classification_ready", result["merge_ready"])
-    result.setdefault("review_ready", result["merge_ready"])
     result["schema_version"] = SCHEMA_VERSION
     result["classifier_execution"] = {
         "trusted_source": "base",
