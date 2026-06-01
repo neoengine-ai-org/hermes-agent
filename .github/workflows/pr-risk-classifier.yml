@@ -104,14 +104,15 @@ jobs:
               echo "::error::trusted base classifier lacks --base-classification; refusing PR-head finalizer"
               python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
           blocker = "trusted_base_classifier_lacks_finalization_support"
           data = {
               "schema_version": "ci-classification.v1",
               "repo": "neoengine-ai-org/hermes-agent",
-              "pr_number": "${{ github.event.pull_request.number }}",
-              "title": "${{ github.event.pull_request.title }}",
+              "pr_number": os.environ["PR_NUMBER"],
+              "title": os.environ["PR_TITLE"],
               "risk_class": "R3",
               "complexity_class": "C3",
               "impacted_surfaces": ["ci_workflow"],
@@ -134,10 +135,10 @@ jobs:
               "classifier_execution": {
                   "trusted_source": "base",
                   "repo": "neoengine-ai-org/hermes-agent",
-                  "pr_number": "${{ github.event.pull_request.number }}",
-                  "base_sha": "${{ github.event.pull_request.base.sha }}",
-                  "head_sha": "${{ github.event.pull_request.head.sha }}",
-                  "classifier_commit": "${{ github.event.pull_request.base.sha }}",
+                  "pr_number": os.environ["PR_NUMBER"],
+                  "base_sha": os.environ["GITHUB_BASE_SHA"],
+                  "head_sha": os.environ["GITHUB_HEAD_SHA"],
+                  "classifier_commit": os.environ["GITHUB_BASE_SHA"],
                   "classifier_self_change": True,
                   "base_classifier_result": {},
                   "head_classifier_result": {},
