@@ -26,6 +26,7 @@ SELF_CHANGE_PATHS = {
     "scripts/ci_risk_classifier.py",
     ".github/workflows/pr-risk-classifier.yml",
     ".github/PULL_REQUEST_TEMPLATE.md",
+    "scripts/review_receipt_validator.py",
 }
 
 RISK_TO_CI = {

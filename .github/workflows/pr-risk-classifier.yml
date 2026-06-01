@@ -240,6 +240,76 @@ jobs:
           Path('downstream-matrix.json').write_text(json.dumps(matrix, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
 
+      - name: Validate review receipts dry-run
+        if: always()
+        run: |
+          if [ ! -f ci-classification.json ]; then
+            echo "::warning::ci-classification.json missing; skipping review receipt validation"
+            exit 0
+          fi
+          if [ -f trusted-classifier/scripts/review_receipt_validator.py ]; then
+            VALIDATOR=trusted-classifier/scripts/review_receipt_validator.py
+            echo trusted-base > review-receipt-validator-source.txt
+          else
+            # Bootstrap compatibility for PR #9: emit review receipt telemetry,
+            # but do not mutate trusted classification/downstream readiness from
+            # a PR-head validator result.
+            VALIDATOR=pr-head/scripts/review_receipt_validator.py
+            echo pr-head-bootstrap-telemetry > review-receipt-validator-source.txt
+          fi
+          python "$VALIDATOR" \
+            --classification ci-classification.json \
+            --pr-body pr-body.md \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --primary-provider codex \
+            --output-dir .
+
+      - name: Backfill dry-run review readiness outputs
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          classification_path = Path('ci-classification.json')
+          receipts_path = Path('review-receipts.json')
+          source_path = Path('review-receipt-validator-source.txt')
+          matrix_path = Path('downstream-matrix.json')
+          if not classification_path.exists() or not receipts_path.exists():
+              raise SystemExit(0)
+          if source_path.read_text(encoding='utf-8').strip() != 'trusted-base':
+              print('Skipping trusted readiness backfill for untrusted bootstrap review validator')
+              raise SystemExit(0)
+          classification = json.loads(classification_path.read_text(encoding='utf-8'))
+          receipts = json.loads(receipts_path.read_text(encoding='utf-8'))
+          body_ready = bool(classification.get('body_and_classification_ready', False))
+          review_ready = bool(receipts.get('review_ready', False))
+          merge_blockers = classification.get('merge_blocking_conditions', [])
+          classification['review_ready'] = review_ready
+          classification['merge_ready'] = body_ready and review_ready and not merge_blockers
+          classification['review_receipt_validation'] = {
+              'schema_version': receipts.get('schema_version'),
+              'enforced': False,
+              'evidence_verification_mode': receipts.get('evidence_verification_mode'),
+              'non_claims': receipts.get('non_claims', []),
+              'review_ready_dry_run': review_ready,
+              'merge_ready_dry_run': body_ready and review_ready and not merge_blockers,
+              'required_review_types': receipts.get('required_review_types', []),
+              'missing_required_review_types': receipts.get('missing_required_review_types', []),
+              'invalid_receipt_reasons': receipts.get('invalid_receipt_reasons', []),
+          }
+          classification_path.write_text(json.dumps(classification, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          if matrix_path.exists():
+              matrix = json.loads(matrix_path.read_text(encoding='utf-8'))
+              matrix['readiness'] = {
+                  'body_and_classification_ready': body_ready,
+                  'review_ready': review_ready,
+                  'merge_ready': classification['merge_ready'],
+              }
+              matrix_path.write_text(json.dumps(matrix, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+
       - name: Read outputs
         id: read
         if: always()
@@ -278,6 +348,9 @@ jobs:
             ci-classification.json
             ci-classification.md
             downstream-matrix.json
+            review-receipts.json
+            review-receipts.md
+            review-receipt-validator-source.txt
           if-no-files-found: error
 
       - name: Upload base classifier artifacts
