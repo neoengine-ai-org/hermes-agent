@@ -79,11 +79,13 @@ def test_classifier_self_change_detects_script_workflow_and_template() -> None:
     files = [
         "scripts/ci_risk_classifier.py",
         "scripts/review_receipt_validator.py",
+        "scripts/dispatch_advisory.py",
         ".github/workflows/pr-risk-classifier.yml",
         ".github/PULL_REQUEST_TEMPLATE.md",
     ]
 
-    assert ci_risk_classifier.classifier_self_change(files) is True
+    for path in files:
+        assert ci_risk_classifier.classifier_self_change([path]) is True
 
     result = ci_risk_classifier.classify(files, body(), additions=40)
     assert "ci_workflow" in result.impacted_surfaces

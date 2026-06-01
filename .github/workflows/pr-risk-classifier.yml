@@ -310,6 +310,32 @@ jobs:
               matrix_path.write_text(json.dumps(matrix, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
 
+      - name: Emit Hermes dispatch advisory dry-run
+        if: always()
+        run: |
+          if [ ! -f ci-classification.json ]; then
+            echo "::warning::ci-classification.json missing; skipping Hermes dispatch advisory"
+            exit 0
+          fi
+          if [ -f trusted-classifier/scripts/dispatch_advisory.py ]; then
+            DISPATCH_ADVISOR=trusted-classifier/scripts/dispatch_advisory.py
+            echo trusted-base > hermes-dispatch-advisory-source.txt
+          else
+            # Bootstrap compatibility for PR #10: emit advisory telemetry from
+            # the PR-head dispatcher consumer, but do not mutate trusted
+            # classifier/review/downstream readiness or dispatch agents.
+            DISPATCH_ADVISOR=pr-head/scripts/dispatch_advisory.py
+            echo pr-head-bootstrap-telemetry > hermes-dispatch-advisory-source.txt
+          fi
+          ARGS=(--classification ci-classification.json --output-dir .)
+          if [ -f review-receipts.json ]; then
+            ARGS+=(--review-receipts review-receipts.json)
+          fi
+          if [ -f downstream-matrix.json ]; then
+            ARGS+=(--downstream-matrix downstream-matrix.json)
+          fi
+          python "$DISPATCH_ADVISOR" "${ARGS[@]}"
+
       - name: Read outputs
         id: read
         if: always()
@@ -351,6 +377,9 @@ jobs:
             review-receipts.json
             review-receipts.md
             review-receipt-validator-source.txt
+            hermes-dispatch-advisory.json
+            hermes-dispatch-advisory.md
+            hermes-dispatch-advisory-source.txt
           if-no-files-found: error
 
       - name: Upload base classifier artifacts
