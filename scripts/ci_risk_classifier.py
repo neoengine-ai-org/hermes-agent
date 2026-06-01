@@ -21,6 +21,12 @@ from typing import Iterable
 
 RISK_ORDER = ["R0", "R1", "R2", "R3", "R4", "R5"]
 COMPLEXITY_ORDER = ["C0", "C1", "C2", "C3", "C4", "C5"]
+SCHEMA_VERSION = "ci-classification.v1"
+SELF_CHANGE_PATHS = {
+    "scripts/ci_risk_classifier.py",
+    ".github/workflows/pr-risk-classifier.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+}
 
 RISK_TO_CI = {
     "R0": {"pr_body_contract", "diff_check"},
@@ -273,6 +279,8 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
 
         if file.startswith(".github/workflows/"):
             surfaces.add("ci_workflow")
+        if file in SELF_CHANGE_PATHS:
+            surfaces.add("ci_workflow")
         if file.startswith("gateway/") or "dispatch" in file or "conductor" in file:
             surfaces.add("conductor_dispatch")
         if file.startswith(("agent/", "tools/", "hermes_cli/", "cron/", "tui_gateway/", "plugins/", "gateway/")):
@@ -338,6 +346,10 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
         if surface.replace("_", " ") in body_lower or surface in body_lower:
             surfaces.add(surface)
     return surfaces or {"docs_only"}
+
+
+def classifier_self_change(files: list[str]) -> bool:
+    return any(file in SELF_CHANGE_PATHS for file in files)
 
 
 def infer_risk(surfaces: set[str]) -> str:
@@ -531,6 +543,92 @@ def markdown_report(data: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _list_value(data: dict[str, object], key: str) -> set[str]:
+    value = data.get(key, [])
+    if isinstance(value, list):
+        return {str(item) for item in value}
+    return set()
+
+
+def _bool_value(data: dict[str, object], key: str) -> bool:
+    return bool(data.get(key, False))
+
+
+def detect_head_classifier_weakenings(base: dict[str, object], head: dict[str, object] | None) -> list[str]:
+    if not head:
+        return []
+
+    weakenings: list[str] = []
+    base_risk = str(base.get("risk_class", "R0"))
+    head_risk = str(head.get("risk_class", "R0"))
+    if base_risk in RISK_ORDER and head_risk in RISK_ORDER and RISK_ORDER.index(head_risk) < RISK_ORDER.index(base_risk):
+        weakenings.append("lower_risk_class")
+
+    base_complexity = str(base.get("complexity_class", "C0"))
+    head_complexity = str(head.get("complexity_class", "C0"))
+    if base_complexity in COMPLEXITY_ORDER and head_complexity in COMPLEXITY_ORDER and COMPLEXITY_ORDER.index(head_complexity) < COMPLEXITY_ORDER.index(base_complexity):
+        weakenings.append("lower_complexity_class")
+
+    for key, label in (
+        ("required_ci_lanes", "fewer_required_ci_lanes"),
+        ("required_reviews", "fewer_required_reviews"),
+        ("protected_flags", "fewer_protected_flags"),
+        ("merge_blocking_conditions", "fewer_merge_blocking_conditions"),
+    ):
+        if not _list_value(base, key).issubset(_list_value(head, key)):
+            weakenings.append(label)
+
+    for key, label in (
+        ("secondary_review_required", "missing_secondary_review_required"),
+        ("adversarial_review_required", "missing_adversarial_review_required"),
+        ("opposite_provider_required", "missing_opposite_provider_required"),
+        ("human_gate_required", "missing_human_gate_required"),
+        ("founder_review_required", "missing_founder_review_required"),
+    ):
+        if _bool_value(base, key) and not _bool_value(head, key):
+            weakenings.append(label)
+
+    if base.get("allowed_to_mark_ready") is False and head.get("allowed_to_mark_ready") is True:
+        weakenings.append("allowed_to_mark_ready_weaker_than_base")
+
+    return sorted(set(weakenings))
+
+
+def with_trusted_execution_metadata(
+    base_classifier_result: dict[str, object],
+    *,
+    files: list[str],
+    repo: str,
+    pr_number: str,
+    base_sha: str,
+    head_sha: str,
+    classifier_commit: str,
+    head_classifier_result: dict[str, object] | None = None,
+) -> dict[str, object]:
+    result = dict(base_classifier_result)
+    weakenings = detect_head_classifier_weakenings(base_classifier_result, head_classifier_result)
+    existing_blocking = result.get("merge_blocking_conditions", [])
+    blocking = list(existing_blocking) if isinstance(existing_blocking, list) else []
+    blocking.extend(f"head_classifier_weakened_posture:{weakening}" for weakening in weakenings)
+    result["merge_blocking_conditions"] = sorted(set(str(item) for item in blocking))
+    result["allowed_to_mark_ready"] = not result["merge_blocking_conditions"]
+    result["schema_version"] = SCHEMA_VERSION
+    result["classifier_execution"] = {
+        "trusted_source": "base",
+        "repo": repo,
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "classifier_commit": classifier_commit,
+        "classifier_self_change": classifier_self_change(files),
+        "base_classifier_result": base_classifier_result,
+        "head_classifier_result": head_classifier_result or {},
+        "weakened_by_head_classifier": bool(weakenings),
+        "head_classifier_weakenings": weakenings,
+    }
+    return result
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base")
@@ -542,12 +640,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--pr-number", default=os.getenv("PR_NUMBER", "unknown"))
     parser.add_argument("--repo", default=os.getenv("GITHUB_REPOSITORY", "unknown"))
     parser.add_argument("--title", default=os.getenv("PR_TITLE", "unknown"))
+    parser.add_argument("--base-sha", default=os.getenv("GITHUB_BASE_SHA", "unknown"))
+    parser.add_argument("--head-sha", default=os.getenv("GITHUB_HEAD_SHA", "unknown"))
+    parser.add_argument("--classifier-commit", default=os.getenv("CLASSIFIER_COMMIT", "unknown"))
+    parser.add_argument("--compare-head-classification")
+    parser.add_argument("--base-classification", help="Existing trusted base classification JSON to wrap with trusted execution metadata")
     args = parser.parse_args(argv)
 
     files = args.changed_file or changed_files_from_git(args.base, args.head)
-    body = read_body(args.pr_body)
-    additions = args.additions if args.additions is not None else additions_from_git(args.base, args.head)
-    classification = classify(files, body, additions, args.pr_number, args.repo, args.title).as_dict()
+    if args.base_classification:
+        base_classification = json.loads(Path(args.base_classification).read_text(encoding="utf-8"))
+    else:
+        body = read_body(args.pr_body)
+        additions = args.additions if args.additions is not None else additions_from_git(args.base, args.head)
+        base_classification = classify(files, body, additions, args.pr_number, args.repo, args.title).as_dict()
+    head_classification = None
+    if args.compare_head_classification:
+        compare_path = Path(args.compare_head_classification)
+        if compare_path.exists():
+            head_classification = json.loads(compare_path.read_text(encoding="utf-8"))
+    classification = with_trusted_execution_metadata(
+        base_classification,
+        files=files,
+        repo=args.repo,
+        pr_number=args.pr_number,
+        base_sha=args.base_sha,
+        head_sha=args.head_sha,
+        classifier_commit=args.classifier_commit,
+        head_classifier_result=head_classification,
+    )
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

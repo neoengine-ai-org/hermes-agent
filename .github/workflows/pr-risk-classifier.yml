@@ -19,28 +19,152 @@ jobs:
       allowed_to_mark_ready: ${{ steps.read.outputs.allowed_to_mark_ready }}
       required_ci_lanes: ${{ steps.read.outputs.required_ci_lanes }}
     steps:
-      - name: Checkout
+      - name: Checkout PR head for diff context
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
         with:
+          repository: neoengine-ai-org/hermes-agent
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          path: pr-head
+
+      - name: Checkout trusted base classifier
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
+        with:
+          repository: neoengine-ai-org/hermes-agent
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 1
+          path: trusted-classifier
 
       - name: Write PR body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: printf '%s' "$PR_BODY" > pr-body.md
 
-      - name: Classify
-        id: classify
+      - name: Run trusted base classifier
+        id: base_classify
+        continue-on-error: true
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_REPOSITORY: neoengine-ai-org/hermes-agent
         run: |
+          cd pr-head
+          python ../trusted-classifier/scripts/ci_risk_classifier.py \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --pr-body ../pr-body.md \
+            --repo neoengine-ai-org/hermes-agent \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --output-dir ../base-classification
+
+      - name: Run PR-head classifier for telemetry only
+        id: head_classify
+        continue-on-error: true
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          GITHUB_REPOSITORY: neoengine-ai-org/hermes-agent
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CLASSIFIER_COMMIT: ${{ github.event.pull_request.head.sha }}
+        run: |
+          cd pr-head
           python scripts/ci_risk_classifier.py \
             --base "${{ github.event.pull_request.base.sha }}" \
             --head "${{ github.event.pull_request.head.sha }}" \
-            --pr-body pr-body.md \
-            --output-dir .
+            --pr-body ../pr-body.md \
+            --repo neoengine-ai-org/hermes-agent \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --classifier-commit "${{ github.event.pull_request.head.sha }}" \
+            --output-dir ../head-classification
+
+      - name: Finalize trusted classification artifacts
+        id: classify
+        if: always()
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          GITHUB_REPOSITORY: neoengine-ai-org/hermes-agent
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CLASSIFIER_COMMIT: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cd pr-head
+          if python ../trusted-classifier/scripts/ci_risk_classifier.py --help | grep -q -- '--base-classification'; then
+            FINALIZER=../trusted-classifier/scripts/ci_risk_classifier.py
+          else
+            # Bootstrap compatibility for the PR that introduces trusted finalization:
+            # the risk/CI decision comes from ../base-classification, while the
+            # PR-head script only wraps that trusted result with new metadata. Do
+            # not allow this path for later PRs; once PR #7 lands, the trusted
+            # base classifier must provide --base-classification itself.
+            if [ "${{ github.event.pull_request.number }}" != "7" ]; then
+              echo "::error::trusted base classifier lacks --base-classification; refusing PR-head finalizer"
+              python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          blocker = "trusted_base_classifier_lacks_finalization_support"
+          data = {
+              "schema_version": "ci-classification.v1",
+              "repo": "neoengine-ai-org/hermes-agent",
+              "pr_number": os.environ["PR_NUMBER"],
+              "title": os.environ["PR_TITLE"],
+              "risk_class": "R3",
+              "complexity_class": "C3",
+              "impacted_surfaces": ["ci_workflow"],
+              "protected_flags": [],
+              "runtime_payload_contract_present": False,
+              "blocker_exemption_present": False,
+              "required_ci_lanes": ["pr_body_contract", "diff_check", "workflow_lint", "governance_required"],
+              "optional_ci_lanes": [],
+              "skipped_ci_lanes": [],
+              "required_reviews": ["secondary_review_required", "adversarial_review_required", "opposite_provider_adversarial_required"],
+              "secondary_review_required": True,
+              "adversarial_review_required": True,
+              "opposite_provider_required": True,
+              "human_gate_required": False,
+              "founder_review_required": False,
+              "reason": "Fail-closed: trusted base classifier cannot finalize trusted execution metadata.",
+              "token_class": "L",
+              "merge_blocking_conditions": [blocker],
+              "allowed_to_mark_ready": False,
+              "classifier_execution": {
+                  "trusted_source": "base",
+                  "repo": "neoengine-ai-org/hermes-agent",
+                  "pr_number": os.environ["PR_NUMBER"],
+                  "base_sha": os.environ["GITHUB_BASE_SHA"],
+                  "head_sha": os.environ["GITHUB_HEAD_SHA"],
+                  "classifier_commit": os.environ["GITHUB_BASE_SHA"],
+                  "classifier_self_change": True,
+                  "base_classifier_result": {},
+                  "head_classifier_result": {},
+                  "weakened_by_head_classifier": False,
+                  "head_classifier_weakenings": [],
+              },
+          }
+          Path("..").joinpath("ci-classification.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          lines = ["# CI Classification", ""] + [f"- {key}: {value}" for key, value in data.items() if key != "classifier_execution"]
+          Path("..").joinpath("ci-classification.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+              exit 2
+            fi
+            FINALIZER=scripts/ci_risk_classifier.py
+          fi
+          python "$FINALIZER" \
+            --base "${{ github.event.pull_request.base.sha }}" \
+            --head "${{ github.event.pull_request.head.sha }}" \
+            --base-classification ../base-classification/ci-classification.json \
+            --compare-head-classification ../head-classification/ci-classification.json \
+            --repo neoengine-ai-org/hermes-agent \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --classifier-commit "${{ github.event.pull_request.base.sha }}" \
+            --output-dir ..
 
       - name: Read outputs
         id: read
@@ -55,7 +179,7 @@ jobs:
           print('required_ci_lanes=' + ','.join(data['required_ci_lanes']))
           PY
 
-      - name: Upload classification artifacts
+      - name: Upload trusted classification artifacts
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
@@ -64,3 +188,23 @@ jobs:
             ci-classification.json
             ci-classification.md
           if-no-files-found: error
+
+      - name: Upload base classifier artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ci-classification-base-authoritative
+          path: |
+            base-classification/ci-classification.json
+            base-classification/ci-classification.md
+          if-no-files-found: error
+
+      - name: Upload head classifier telemetry artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ci-classification-head-telemetry
+          path: |
+            head-classification/ci-classification.json
+            head-classification/ci-classification.md
+          if-no-files-found: warn
