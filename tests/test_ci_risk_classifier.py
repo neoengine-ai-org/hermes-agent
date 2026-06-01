@@ -115,3 +115,35 @@ def test_declared_lanes_weaker_than_classifier_blocks_ready() -> None:
     assert any(item.startswith("declared_ci_lanes_weaker_than_classifier:") for item in result.merge_blocking_conditions)
     assert "workflow_lint" in result.required_ci_lanes
     assert "pr_impact_classifier_tests" in result.required_ci_lanes
+
+
+def test_missing_classification_section_blocks_ready() -> None:
+    result = ci_risk_classifier.classify(["docs/usage.md"], "plain body without required section", additions=3)
+
+    assert result.allowed_to_mark_ready is False
+    assert "missing_required_pr_body_classification_section" in result.merge_blocking_conditions
+    assert "missing_or_invalid_declared_risk_class" in result.merge_blocking_conditions
+    assert "missing_or_invalid_declared_complexity_class" in result.merge_blocking_conditions
+
+
+def test_invalid_risk_and_complexity_declarations_block_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/usage.md"],
+        body(**{"Risk class": "medium", "Complexity class": "large"}),
+        additions=3,
+    )
+
+    assert result.allowed_to_mark_ready is False
+    assert "missing_or_invalid_declared_risk_class" in result.merge_blocking_conditions
+    assert "missing_or_invalid_declared_complexity_class" in result.merge_blocking_conditions
+
+
+def test_missing_required_ci_lanes_blocks_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/usage.md"],
+        body(**{"Required CI lanes": "N/A"}),
+        additions=3,
+    )
+
+    assert result.allowed_to_mark_ready is False
+    assert "missing_required_ci_lanes" in result.merge_blocking_conditions

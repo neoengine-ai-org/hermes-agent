@@ -443,8 +443,11 @@ def classify(files: list[str], body: str, additions: int = 0, pr_number: str = "
     if surfaces & PROTECTED_SURFACES and "protected_non_claims" not in body and "Protected non-claims" not in body:
         blocking.append("protected_surface_without_protected_non_claims")
 
-    declared_lanes = split_lanes(parse_declared_field(body, "Required CI lanes"))
-    if declared_lanes:
+    declared_lanes_value = parse_declared_field(body, "Required CI lanes")
+    declared_lanes = split_lanes(declared_lanes_value)
+    if not declared_lanes:
+        blocking.append("missing_required_ci_lanes")
+    else:
         missing_lanes = sorted(lanes - declared_lanes)
         if missing_lanes:
             blocking.append("declared_ci_lanes_weaker_than_classifier:" + ",".join(missing_lanes))
