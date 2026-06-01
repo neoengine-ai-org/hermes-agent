@@ -102,6 +102,53 @@ jobs:
             # base classifier must provide --base-classification itself.
             if [ "${{ github.event.pull_request.number }}" != "7" ]; then
               echo "::error::trusted base classifier lacks --base-classification; refusing PR-head finalizer"
+              python - <<'PY'
+          import json
+          from pathlib import Path
+
+          blocker = "trusted_base_classifier_lacks_finalization_support"
+          data = {
+              "schema_version": "ci-classification.v1",
+              "repo": "neoengine-ai-org/hermes-agent",
+              "pr_number": "${{ github.event.pull_request.number }}",
+              "title": "${{ github.event.pull_request.title }}",
+              "risk_class": "R3",
+              "complexity_class": "C3",
+              "impacted_surfaces": ["ci_workflow"],
+              "protected_flags": [],
+              "runtime_payload_contract_present": False,
+              "blocker_exemption_present": False,
+              "required_ci_lanes": ["pr_body_contract", "diff_check", "workflow_lint", "governance_required"],
+              "optional_ci_lanes": [],
+              "skipped_ci_lanes": [],
+              "required_reviews": ["secondary_review_required", "adversarial_review_required", "opposite_provider_adversarial_required"],
+              "secondary_review_required": True,
+              "adversarial_review_required": True,
+              "opposite_provider_required": True,
+              "human_gate_required": False,
+              "founder_review_required": False,
+              "reason": "Fail-closed: trusted base classifier cannot finalize trusted execution metadata.",
+              "token_class": "L",
+              "merge_blocking_conditions": [blocker],
+              "allowed_to_mark_ready": False,
+              "classifier_execution": {
+                  "trusted_source": "base",
+                  "repo": "neoengine-ai-org/hermes-agent",
+                  "pr_number": "${{ github.event.pull_request.number }}",
+                  "base_sha": "${{ github.event.pull_request.base.sha }}",
+                  "head_sha": "${{ github.event.pull_request.head.sha }}",
+                  "classifier_commit": "${{ github.event.pull_request.base.sha }}",
+                  "classifier_self_change": True,
+                  "base_classifier_result": {},
+                  "head_classifier_result": {},
+                  "weakened_by_head_classifier": False,
+                  "head_classifier_weakenings": [],
+              },
+          }
+          Path("..").joinpath("ci-classification.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          lines = ["# CI Classification", ""] + [f"- {key}: {value}" for key, value in data.items() if key != "classifier_execution"]
+          Path("..").joinpath("ci-classification.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
               exit 2
             fi
             FINALIZER=scripts/ci_risk_classifier.py
