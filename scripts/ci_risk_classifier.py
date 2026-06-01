@@ -448,6 +448,9 @@ class Classification:
     reason: str = ""
     token_class: str = "S"
     merge_blocking_conditions: list[str] = field(default_factory=list)
+    body_and_classification_ready: bool = True
+    review_ready: bool = True
+    merge_ready: bool = True
     allowed_to_mark_ready: bool = True
 
     def as_dict(self) -> dict[str, object]:
@@ -505,6 +508,17 @@ def classify(files: list[str], body: str, additions: int = 0, pr_number: str = "
         if missing_lanes:
             blocking.append("declared_ci_lanes_weaker_than_classifier:" + ",".join(missing_lanes))
 
+    body_blocking = [
+        blocker
+        for blocker in blocking
+        if blocker.startswith(("missing_", "declared_", "runtime", "protected_surface_without_protected_non_claims"))
+    ]
+    body_and_classification_ready = not body_blocking
+    review_ready = body_and_classification_ready and not any(
+        blocker.startswith("head_classifier_weakened_posture:") for blocker in blocking
+    )
+    merge_ready = not blocking
+
     return Classification(
         pr_number=pr_number,
         repo=repo,
@@ -527,7 +541,10 @@ def classify(files: list[str], body: str, additions: int = 0, pr_number: str = "
         reason=f"Inferred from {len(files)} changed file(s), {additions} addition(s), surfaces: {', '.join(sorted(surfaces))}.",
         token_class=token_class(risk, complexity),
         merge_blocking_conditions=blocking,
-        allowed_to_mark_ready=not blocking,
+        body_and_classification_ready=body_and_classification_ready,
+        review_ready=review_ready,
+        merge_ready=merge_ready,
+        allowed_to_mark_ready=merge_ready,
     )
 
 
@@ -541,6 +558,36 @@ def markdown_report(data: dict[str, object]) -> str:
         lines.append(f"- {key}: {rendered}")
     lines.append("")
     return "\n".join(lines)
+
+
+def downstream_matrix(data: dict[str, object]) -> dict[str, object]:
+    """Build an optional dry-run matrix artifact without enforcing downstream CI."""
+    required_value = data.get("required_ci_lanes", [])
+    optional_value = data.get("optional_ci_lanes", [])
+    required_lanes = [str(lane) for lane in required_value] if isinstance(required_value, list) else []
+    optional_lanes = [str(lane) for lane in optional_value] if isinstance(optional_value, list) else []
+    return {
+        "schema_version": "ci-downstream-matrix-dry-run.v1",
+        "repo": data.get("repo", "unknown"),
+        "pr_number": data.get("pr_number", "unknown"),
+        "enforced": False,
+        "non_claims": [
+            "dry_run_only",
+            "not_downstream_ci_matrix_enforced",
+            "not_cross_repo_propagated",
+            "not_support_or_marketing_classifier_implemented",
+        ],
+        "readiness": {
+            "body_and_classification_ready": bool(data.get("body_and_classification_ready", False)),
+            "review_ready": bool(data.get("review_ready", False)),
+            "merge_ready": bool(data.get("merge_ready", False)),
+        },
+        "include": [
+            {"lane": lane, "required": True, "dry_run_only": True} for lane in required_lanes
+        ] + [
+            {"lane": lane, "required": False, "dry_run_only": True} for lane in optional_lanes
+        ],
+    }
 
 
 def _list_value(data: dict[str, object], key: str) -> set[str]:
@@ -611,7 +658,19 @@ def with_trusted_execution_metadata(
     blocking = list(existing_blocking) if isinstance(existing_blocking, list) else []
     blocking.extend(f"head_classifier_weakened_posture:{weakening}" for weakening in weakenings)
     result["merge_blocking_conditions"] = sorted(set(str(item) for item in blocking))
-    result["allowed_to_mark_ready"] = not result["merge_blocking_conditions"]
+    body_blocking = [
+        blocker
+        for blocker in result["merge_blocking_conditions"]
+        if str(blocker).startswith(("missing_", "declared_", "runtime", "protected_surface_without_protected_non_claims"))
+    ]
+    head_weakened = any(
+        str(blocker).startswith("head_classifier_weakened_posture:")
+        for blocker in result["merge_blocking_conditions"]
+    )
+    result["body_and_classification_ready"] = not body_blocking
+    result["review_ready"] = result["body_and_classification_ready"] and not head_weakened
+    result["merge_ready"] = not result["merge_blocking_conditions"]
+    result["allowed_to_mark_ready"] = result["merge_ready"]
     result["schema_version"] = SCHEMA_VERSION
     result["classifier_execution"] = {
         "trusted_source": "base",
@@ -674,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "ci-classification.json").write_text(json.dumps(classification, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "ci-classification.md").write_text(markdown_report(classification), encoding="utf-8")
+    (out_dir / "downstream-matrix.json").write_text(json.dumps(downstream_matrix(classification), indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(classification, indent=2, sort_keys=True))
     return 1 if classification["merge_blocking_conditions"] else 0
 

@@ -118,7 +118,14 @@ def test_head_classifier_weakenings_detect_required_posture_loss() -> None:
 
 
 def test_authoritative_base_result_gets_execution_metadata_and_blocks_weakened_head() -> None:
-    base = classification(risk_class="R3", allowed_to_mark_ready=True, merge_blocking_conditions=[])
+    base = classification(
+        risk_class="R3",
+        allowed_to_mark_ready=True,
+        merge_blocking_conditions=[],
+        body_and_classification_ready=True,
+        review_ready=True,
+        merge_ready=True,
+    )
     head = classification(risk_class="R2", allowed_to_mark_ready=True, merge_blocking_conditions=[])
 
     final = ci_risk_classifier.with_trusted_execution_metadata(
@@ -134,7 +141,16 @@ def test_authoritative_base_result_gets_execution_metadata_and_blocks_weakened_h
 
     assert final["risk_class"] == "R3"
     assert final["allowed_to_mark_ready"] is False
+    assert final["body_and_classification_ready"] is True
+    assert final["review_ready"] is False
+    assert final["merge_ready"] is False
     assert "head_classifier_weakened_posture:lower_risk_class" in final["merge_blocking_conditions"]
+    matrix = ci_risk_classifier.downstream_matrix(final)
+    assert matrix["readiness"] == {
+        "body_and_classification_ready": True,
+        "review_ready": False,
+        "merge_ready": False,
+    }
     assert final["schema_version"] == "ci-classification.v1"
     assert final["classifier_execution"]["trusted_source"] == "base"
     assert final["classifier_execution"]["repo"] == "neoengine-ai-org/hermes-agent"
@@ -180,6 +196,9 @@ def test_cli_emits_artifacts_even_when_fail_closed(tmp_path: Path) -> None:
     assert completed.returncode == 1
     data = json.loads((output_dir / "ci-classification.json").read_text(encoding="utf-8"))
     assert (output_dir / "ci-classification.md").exists()
+    matrix = json.loads((output_dir / "downstream-matrix.json").read_text(encoding="utf-8"))
+    assert matrix["enforced"] is False
+    assert matrix["readiness"]["merge_ready"] is False
     assert data["schema_version"] == "ci-classification.v1"
     assert data["classifier_execution"]["repo"] == "neoengine-ai-org/hermes-agent"
     assert data["classifier_execution"]["classifier_self_change"] is True
