@@ -149,6 +149,16 @@ RUNTIME_SURFACES = {
 }
 
 CLASSIFICATION_HEADER = "Risk, Complexity, Review, and CI Classification"
+RUNTIME_PAYLOAD_CONTRACT_FIELDS = {
+    "user_or_operator_visible_outcome",
+    "runtime_surface_touched",
+    "product_or_platform_capability_advanced",
+    "why_this_is_not_only_docs_or_scaffolding",
+    "tests_that_prove_runtime_behavior",
+    "acceptance_gate",
+    "rollback",
+    "protected_non_claims",
+}
 
 
 def _max(values: Iterable[str], order: list[str]) -> str:
@@ -220,6 +230,31 @@ def split_lanes(value: str | None) -> set[str]:
     if not value:
         return set()
     return {item.strip().strip("`") for item in re.split(r"[,\n]", value) if item.strip()}
+
+
+def parse_runtime_payload_contract(body: str) -> dict[str, str] | None:
+    """Parse the YAML-ish runtimePayloadContract block used in PR bodies."""
+
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if re.match(r"^runtimePayloadContract\s*:\s*$", line):
+            fields: dict[str, str] = {}
+            for contract_line in lines[index + 1 :]:
+                if not contract_line.strip():
+                    continue
+                if not contract_line.startswith((" ", "\t")):
+                    break
+                match = re.match(r"^\s+([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$", contract_line)
+                if match:
+                    fields[match.group(1)] = match.group(2).strip()
+            return fields
+    return None
+
+
+def missing_runtime_payload_contract_fields(fields: dict[str, str] | None) -> list[str]:
+    if fields is None:
+        return sorted(RUNTIME_PAYLOAD_CONTRACT_FIELDS)
+    return sorted(field for field in RUNTIME_PAYLOAD_CONTRACT_FIELDS if not fields.get(field))
 
 
 def infer_surfaces(files: list[str], body: str) -> set[str]:
@@ -426,7 +461,13 @@ def classify(files: list[str], body: str, additions: int = 0, pr_number: str = "
     lanes.add("diff_check")
 
     reviews = required_reviews(risk, complexity, surfaces)
-    runtime_contract_present = "runtimePayloadContract" in body and parse_yes_no(body, "RuntimePayloadContract present") == "yes"
+    runtime_contract_fields = parse_runtime_payload_contract(body)
+    missing_contract_fields = missing_runtime_payload_contract_fields(runtime_contract_fields)
+    runtime_contract_present = (
+        parse_yes_no(body, "RuntimePayloadContract present") == "yes"
+        and runtime_contract_fields is not None
+        and not missing_contract_fields
+    )
     blocker_exemption = parse_declared_field(body, "Blocker exemption, if any") is not None
 
     blocking: list[str] = []
@@ -438,9 +479,11 @@ def classify(files: list[str], body: str, additions: int = 0, pr_number: str = "
         blocking.append("missing_or_invalid_declared_complexity_class")
     if surfaces & RUNTIME_SURFACES and not runtime_contract_present:
         blocking.append("runtime_surface_without_runtimePayloadContract")
+        if runtime_contract_fields is not None and missing_contract_fields:
+            blocking.append("runtimePayloadContract_missing_required_fields:" + ",".join(missing_contract_fields))
     if reviews - {"no_secondary_review_required"} and parse_declared_field(body, "Expected state change") is None:
         blocking.append("missing_expected_state_change")
-    if surfaces & PROTECTED_SURFACES and "protected_non_claims" not in body and "Protected non-claims" not in body:
+    if surfaces & PROTECTED_SURFACES and not (runtime_contract_fields or {}).get("protected_non_claims") and "Protected non-claims" not in body:
         blocking.append("protected_surface_without_protected_non_claims")
 
     declared_lanes_value = parse_declared_field(body, "Required CI lanes")

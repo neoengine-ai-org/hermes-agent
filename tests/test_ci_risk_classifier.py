@@ -38,6 +38,23 @@ def body(**overrides: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def runtime_payload_contract(**overrides: str) -> str:
+    fields = {
+        "user_or_operator_visible_outcome": "Operators see deterministic CI classification artifacts.",
+        "runtime_surface_touched": "Classifier script used by the PR workflow.",
+        "product_or_platform_capability_advanced": "Risk-appropriate CI and review routing foundation.",
+        "why_this_is_not_only_docs_or_scaffolding": "The classifier executes and blocks weaker PR bodies.",
+        "tests_that_prove_runtime_behavior": "scripts/run_tests.sh tests/test_ci_risk_classifier.py",
+        "acceptance_gate": "Classifier tests and live workflow pass.",
+        "rollback": "Revert the classifier workflow and script changes.",
+        "protected_non_claims": "No production, launch, customer-data, or protected approval readiness is claimed.",
+    }
+    fields.update(overrides)
+    lines = ["", "runtimePayloadContract:"]
+    lines.extend(f"  {key}: {value}" for key, value in fields.items())
+    return "\n".join(lines) + "\n"
+
+
 def test_docs_only_pr_is_low_risk_and_ready() -> None:
     result = ci_risk_classifier.classify(
         ["docs/usage.md"],
@@ -87,7 +104,8 @@ def test_protected_surface_requires_human_and_non_claims() -> None:
                 "RuntimePayloadContract present": "yes",
                 "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, auth_tests, session_isolation_tests, secret_scan, token_storage_tests, encryption_tests, protected_human_review",
             }
-        ),
+        )
+        + runtime_payload_contract(protected_non_claims=""),
         additions=120,
     )
 
@@ -96,6 +114,48 @@ def test_protected_surface_requires_human_and_non_claims() -> None:
     assert result.opposite_provider_required is True
     assert "protected_surface_without_protected_non_claims" in result.merge_blocking_conditions
 
+
+
+def test_runtime_contract_yes_without_contract_block_blocks_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["agent/system_prompt.py"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C2",
+                "Impacted surfaces": "runtime_backend",
+                "RuntimePayloadContract present": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build",
+            }
+        )
+        + "\nThis prose mentions runtimePayloadContract without providing a contract block.\n",
+        additions=80,
+    )
+
+    assert result.runtime_payload_contract_present is False
+    assert "runtime_surface_without_runtimePayloadContract" in result.merge_blocking_conditions
+    assert result.allowed_to_mark_ready is False
+
+
+def test_runtime_contract_block_missing_required_fields_blocks_ready() -> None:
+    result = ci_risk_classifier.classify(
+        ["agent/system_prompt.py"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C2",
+                "Impacted surfaces": "runtime_backend",
+                "RuntimePayloadContract present": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build",
+            }
+        )
+        + runtime_payload_contract(rollback=""),
+        additions=80,
+    )
+
+    assert result.runtime_payload_contract_present is False
+    assert "runtimePayloadContract_missing_required_fields:rollback" in result.merge_blocking_conditions
+    assert result.allowed_to_mark_ready is False
 
 def test_declared_lanes_weaker_than_classifier_blocks_ready() -> None:
     result = ci_risk_classifier.classify(
