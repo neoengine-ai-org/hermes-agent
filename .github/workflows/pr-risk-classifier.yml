@@ -17,7 +17,21 @@ jobs:
       complexity_class: ${{ steps.read.outputs.complexity_class }}
       token_class: ${{ steps.read.outputs.token_class }}
       allowed_to_mark_ready: ${{ steps.read.outputs.allowed_to_mark_ready }}
+      impacted_surfaces: ${{ steps.read.outputs.impacted_surfaces }}
+      protected_flags: ${{ steps.read.outputs.protected_flags }}
       required_ci_lanes: ${{ steps.read.outputs.required_ci_lanes }}
+      required_reviews: ${{ steps.read.outputs.required_reviews }}
+      merge_blocking_conditions: ${{ steps.read.outputs.merge_blocking_conditions }}
+      secondary_review_required: ${{ steps.read.outputs.secondary_review_required }}
+      adversarial_review_required: ${{ steps.read.outputs.adversarial_review_required }}
+      opposite_provider_required: ${{ steps.read.outputs.opposite_provider_required }}
+      human_gate_required: ${{ steps.read.outputs.human_gate_required }}
+      founder_review_required: ${{ steps.read.outputs.founder_review_required }}
+      runtime_payload_contract_present: ${{ steps.read.outputs.runtime_payload_contract_present }}
+      blocker_exemption_present: ${{ steps.read.outputs.blocker_exemption_present }}
+      body_and_classification_ready: ${{ steps.read.outputs.body_and_classification_ready }}
+      review_ready: ${{ steps.read.outputs.review_ready }}
+      merge_ready: ${{ steps.read.outputs.merge_ready }}
     steps:
       - name: Checkout PR head for diff context
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8  # v5.0.0
@@ -131,6 +145,9 @@ jobs:
               "reason": "Fail-closed: trusted base classifier cannot finalize trusted execution metadata.",
               "token_class": "L",
               "merge_blocking_conditions": [blocker],
+              "body_and_classification_ready": False,
+              "review_ready": False,
+              "merge_ready": False,
               "allowed_to_mark_ready": False,
               "classifier_execution": {
                   "trusted_source": "base",
@@ -149,6 +166,20 @@ jobs:
           Path("..").joinpath("ci-classification.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           lines = ["# CI Classification", ""] + [f"- {key}: {value}" for key, value in data.items() if key != "classifier_execution"]
           Path("..").joinpath("ci-classification.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          matrix = {
+              "schema_version": "ci-downstream-matrix-dry-run.v1",
+              "repo": "neoengine-ai-org/hermes-agent",
+              "pr_number": os.environ["PR_NUMBER"],
+              "enforced": False,
+              "non_claims": ["dry_run_only", "not_downstream_ci_matrix_enforced", "not_cross_repo_propagated"],
+              "readiness": {
+                  "body_and_classification_ready": False,
+                  "review_ready": False,
+                  "merge_ready": False,
+              },
+              "include": [{"lane": lane, "required": True, "dry_run_only": True} for lane in data["required_ci_lanes"]],
+          }
+          Path("..").joinpath("downstream-matrix.json").write_text(json.dumps(matrix, indent=2, sort_keys=True) + "\n", encoding="utf-8")
           PY
               exit 2
             fi
@@ -166,6 +197,49 @@ jobs:
             --classifier-commit "${{ github.event.pull_request.base.sha }}" \
             --output-dir ..
 
+      - name: Backfill dry-run downstream output artifacts
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          classification_path = Path('ci-classification.json')
+          if not classification_path.exists():
+              raise SystemExit(0)
+          data = json.loads(classification_path.read_text(encoding='utf-8'))
+          merge_ready = bool(data.get('allowed_to_mark_ready', False)) and not data.get('merge_blocking_conditions', [])
+          data.setdefault('body_and_classification_ready', merge_ready)
+          data.setdefault('review_ready', merge_ready)
+          data.setdefault('merge_ready', merge_ready)
+          classification_path.write_text(json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          required = data.get('required_ci_lanes', []) if isinstance(data.get('required_ci_lanes', []), list) else []
+          optional = data.get('optional_ci_lanes', []) if isinstance(data.get('optional_ci_lanes', []), list) else []
+          matrix = {
+              'schema_version': 'ci-downstream-matrix-dry-run.v1',
+              'repo': data.get('repo', 'unknown'),
+              'pr_number': data.get('pr_number', 'unknown'),
+              'enforced': False,
+              'non_claims': [
+                  'dry_run_only',
+                  'not_downstream_ci_matrix_enforced',
+                  'not_cross_repo_propagated',
+                  'not_support_or_marketing_classifier_implemented',
+              ],
+              'readiness': {
+                  'body_and_classification_ready': bool(data.get('body_and_classification_ready', False)),
+                  'review_ready': bool(data.get('review_ready', False)),
+                  'merge_ready': bool(data.get('merge_ready', False)),
+              },
+              'include': [
+                  {'lane': str(lane), 'required': True, 'dry_run_only': True} for lane in required
+              ] + [
+                  {'lane': str(lane), 'required': False, 'dry_run_only': True} for lane in optional
+              ],
+          }
+          Path('downstream-matrix.json').write_text(json.dumps(matrix, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+
       - name: Read outputs
         id: read
         if: always()
@@ -174,9 +248,25 @@ jobs:
           import json
           from pathlib import Path
           data = json.loads(Path('ci-classification.json').read_text(encoding='utf-8'))
-          for key in ('risk_class', 'complexity_class', 'token_class', 'allowed_to_mark_ready'):
+          for key in (
+              'risk_class',
+              'complexity_class',
+              'token_class',
+              'allowed_to_mark_ready',
+              'secondary_review_required',
+              'adversarial_review_required',
+              'opposite_provider_required',
+              'human_gate_required',
+              'founder_review_required',
+              'runtime_payload_contract_present',
+              'blocker_exemption_present',
+              'body_and_classification_ready',
+              'review_ready',
+              'merge_ready',
+          ):
               print(f"{key}={str(data[key]).lower() if isinstance(data[key], bool) else data[key]}")
-          print('required_ci_lanes=' + ','.join(data['required_ci_lanes']))
+          for key in ('impacted_surfaces', 'protected_flags', 'required_ci_lanes', 'required_reviews', 'merge_blocking_conditions'):
+              print(f"{key}=" + ','.join(data[key]))
           PY
 
       - name: Upload trusted classification artifacts
@@ -187,6 +277,7 @@ jobs:
           path: |
             ci-classification.json
             ci-classification.md
+            downstream-matrix.json
           if-no-files-found: error
 
       - name: Upload base classifier artifacts
@@ -197,7 +288,8 @@ jobs:
           path: |
             base-classification/ci-classification.json
             base-classification/ci-classification.md
-          if-no-files-found: error
+            base-classification/downstream-matrix.json
+          if-no-files-found: warn
 
       - name: Upload head classifier telemetry artifacts
         if: always()
@@ -207,4 +299,5 @@ jobs:
           path: |
             head-classification/ci-classification.json
             head-classification/ci-classification.md
+            head-classification/downstream-matrix.json
           if-no-files-found: warn

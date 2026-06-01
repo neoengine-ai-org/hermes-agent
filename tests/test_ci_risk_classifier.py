@@ -269,3 +269,40 @@ def test_missing_required_ci_lanes_blocks_ready() -> None:
 
     assert result.allowed_to_mark_ready is False
     assert "missing_required_ci_lanes" in result.merge_blocking_conditions
+
+
+def test_readiness_split_and_downstream_matrix_are_dry_run_only() -> None:
+    result = ci_risk_classifier.classify(
+        ["agent/system_prompt.py"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C2",
+                "Impacted surfaces": "runtime_backend",
+                "RuntimePayloadContract present": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build",
+            }
+        )
+        + runtime_payload_contract(),
+        additions=80,
+        pr_number="8",
+        repo="neoengine-ai-org/hermes-agent",
+    )
+
+    data = result.as_dict()
+    matrix = ci_risk_classifier.downstream_matrix(data)
+
+    assert data["body_and_classification_ready"] is True
+    assert data["review_ready"] is True
+    assert data["merge_ready"] is True
+    assert matrix["enforced"] is False
+    assert matrix["readiness"] == {
+        "body_and_classification_ready": True,
+        "review_ready": True,
+        "merge_ready": True,
+    }
+    assert {entry["lane"] for entry in matrix["include"]} >= {"pr_body_contract", "diff_check"}
+    assert all(entry["dry_run_only"] is True for entry in matrix["include"])
+    assert "not_downstream_ci_matrix_enforced" in matrix["non_claims"]
+    assert "not_cross_repo_propagated" in matrix["non_claims"]
+    assert "not_support_or_marketing_classifier_implemented" in matrix["non_claims"]

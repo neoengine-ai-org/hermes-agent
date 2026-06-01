@@ -180,6 +180,9 @@ def test_cli_emits_artifacts_even_when_fail_closed(tmp_path: Path) -> None:
     assert completed.returncode == 1
     data = json.loads((output_dir / "ci-classification.json").read_text(encoding="utf-8"))
     assert (output_dir / "ci-classification.md").exists()
+    matrix = json.loads((output_dir / "downstream-matrix.json").read_text(encoding="utf-8"))
+    assert matrix["enforced"] is False
+    assert matrix["readiness"]["merge_ready"] is False
     assert data["schema_version"] == "ci-classification.v1"
     assert data["classifier_execution"]["repo"] == "neoengine-ai-org/hermes-agent"
     assert data["classifier_execution"]["classifier_self_change"] is True
