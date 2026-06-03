@@ -2,7 +2,7 @@
 Process Registry -- In-memory registry for managed background processes.
 
 Tracks processes spawned via terminal(background=true), providing:
-  - Output buffering (rolling 200KB window)
+  - Output buffering (rolling 100KB window)
   - Status polling and log retrieval
   - Blocking wait with interrupt support
   - Process killing
@@ -55,7 +55,7 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 
 # Limits
-MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
+MAX_OUTPUT_CHARS = 100_000      # 100KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 
@@ -1595,4 +1595,5 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    max_result_size_chars=50_000,
 )

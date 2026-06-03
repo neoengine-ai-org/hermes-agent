@@ -166,14 +166,14 @@ class TestBuildAnthropicKwargsClamping:
             context_length=context_length,
         )
 
-    def test_no_clamping_when_output_ceiling_fits_in_window(self):
-        """Opus 4.6 native output (128K) < context window (200K) — no clamping."""
+    def test_no_clamping_when_default_budget_fits_in_window(self):
+        """Missing max_tokens now uses Hermes' compact default budget."""
         kwargs = self._build("claude-opus-4-6", context_length=200_000)
-        assert kwargs["max_tokens"] == 128_000
+        assert kwargs["max_tokens"] == 1024
 
     def test_clamping_fires_for_tiny_custom_window(self):
         """When context_length is 8K (local model), output cap is clamped to 7999."""
-        kwargs = self._build("claude-opus-4-6", context_length=8_000)
+        kwargs = self._build("claude-opus-4-6", max_tokens=32_768, context_length=8_000)
         assert kwargs["max_tokens"] == 7_999
 
     def test_explicit_max_tokens_respected_when_within_window(self):
@@ -186,10 +186,10 @@ class TestBuildAnthropicKwargsClamping:
         kwargs = self._build("claude-opus-4-6", max_tokens=32_768, context_length=16_000)
         assert kwargs["max_tokens"] == 15_999
 
-    def test_no_context_length_uses_native_ceiling(self):
-        """Without context_length the native output ceiling is used directly."""
+    def test_no_context_length_uses_compact_default_budget(self):
+        """Without explicit max_tokens, Hermes uses compact policy defaults."""
         kwargs = self._build("claude-sonnet-4-6")
-        assert kwargs["max_tokens"] == 64_000
+        assert kwargs["max_tokens"] == 1024
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +247,12 @@ class TestEphemeralMaxOutputTokens:
         """A second _build_api_kwargs call uses the normal max_tokens path."""
         agent = self._make_agent()
         agent._ephemeral_max_output_tokens = 5_000
-        agent.max_tokens = None  # will resolve to native ceiling (128K for Opus 4.6)
+        agent.max_tokens = None  # will resolve through Hermes token policy
 
         agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         # Second call — ephemeral is gone
         kwargs2 = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
-        assert kwargs2["max_tokens"] == 128_000  # Opus 4.6 native ceiling
+        assert kwargs2["max_tokens"] == 1024
 
     def test_no_ephemeral_uses_self_max_tokens_directly(self):
         """Without an ephemeral override, self.max_tokens is used normally."""

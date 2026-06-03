@@ -19,6 +19,8 @@ def test_moa_defaults_are_well_formed():
         assert isinstance(m, str) and "/" in m and not m.startswith("/")
     assert isinstance(moa.AGGREGATOR_MODEL, str)
     assert "/" in moa.AGGREGATOR_MODEL
+    assert moa.REFERENCE_MAX_TOKENS == 4096
+    assert moa.AGGREGATOR_MAX_TOKENS == 4096
 
 
 @pytest.mark.asyncio

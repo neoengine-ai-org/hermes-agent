@@ -116,3 +116,104 @@ def test_json_serializable(isolated_home):
     data = compute_prompt_breakdown("cli")
     # Round-trips cleanly for ``--json`` output.
     assert json.loads(json.dumps(data)) == json.loads(json.dumps(data))
+
+
+def test_compact_tool_schemas_strip_descriptions(isolated_home):
+    """``tools.compact_schemas`` removes prose while preserving callable shapes."""
+    (isolated_home / "config.yaml").write_text(
+        "tools:\n  compact_schemas: true\n",
+        encoding="utf-8",
+    )
+    from model_tools import _clear_tool_defs_cache
+    from hermes_cli.prompt_size import _build_inspection_agent
+
+    _clear_tool_defs_cache()
+    agent = _build_inspection_agent("cli")
+    tools_json = json.dumps(agent.tools, ensure_ascii=False)
+
+    assert agent.tools
+    assert '"description"' not in tools_json
+    assert '"parameters"' in tools_json
+
+
+def test_context_file_max_chars_is_configurable(isolated_home, tmp_path):
+    """Large project rules can be capped aggressively for low-token profiles."""
+    (isolated_home / "config.yaml").write_text(
+        "agent:\n  context_file_max_chars: 1000\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "AGENTS.md").write_text("A" * 5000, encoding="utf-8")
+
+    from agent.prompt_builder import build_context_files_prompt
+
+    prompt = build_context_files_prompt(cwd=str(tmp_path), skip_soul=True)
+
+    assert "[...truncated AGENTS.md:" in prompt
+    assert len(prompt) < 1500
+
+
+def test_compact_skills_index_lists_names_only(isolated_home):
+    """``skills.compact_index`` keeps discovery names and drops description prose."""
+    _seed_skill(isolated_home, "alpha", "verbose description " * 20)
+    _seed_skill(isolated_home, "beta", "another long description " * 20)
+    (isolated_home / "config.yaml").write_text(
+        "skills:\n  compact_index: true\n",
+        encoding="utf-8",
+    )
+
+    from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
+
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    prompt = build_skills_system_prompt()
+
+    assert "    - alpha\n" in prompt
+    assert "    - beta\n" in prompt
+    assert "verbose description" not in prompt
+    assert "another long description" not in prompt
+
+
+def test_compact_skills_index_reduces_prompt_size(isolated_home):
+    """Name-only skill indexes are materially smaller for description-heavy libraries."""
+    for idx in range(30):
+        _seed_skill(isolated_home, f"skill-{idx}", "description token " * 50)
+
+    from agent.prompt_builder import build_skills_system_prompt, clear_skills_system_prompt_cache
+
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    verbose_prompt = build_skills_system_prompt()
+    (isolated_home / "config.yaml").write_text(
+        "skills:\n  compact_index: true\n",
+        encoding="utf-8",
+    )
+    clear_skills_system_prompt_cache(clear_snapshot=True)
+    compact_prompt = build_skills_system_prompt()
+
+    verbose_match = _SKILLS_BLOCK_RE.search(verbose_prompt)
+    compact_match = _SKILLS_BLOCK_RE.search(compact_prompt)
+    assert verbose_match is not None
+    assert compact_match is not None
+    verbose_block = verbose_match.group(0)
+    compact_block = compact_match.group(0)
+
+    assert len(compact_block.encode("utf-8")) < len(verbose_block.encode("utf-8")) / 2
+    assert "skill-0" in compact_prompt
+
+
+def test_compact_system_guidance_reduces_stable_prompt(isolated_home):
+    """``agent.compact_system_guidance`` shortens always-on behavioral prose."""
+    from agent.system_prompt import build_system_prompt_parts
+    from hermes_cli.prompt_size import _build_inspection_agent
+
+    verbose_agent = _build_inspection_agent("cli")
+    verbose_stable = build_system_prompt_parts(verbose_agent)["stable"]
+
+    (isolated_home / "config.yaml").write_text(
+        "model:\n  default: gpt-5\nagent:\n  compact_system_guidance: true\n",
+        encoding="utf-8",
+    )
+    compact_agent = _build_inspection_agent("cli")
+    compact_stable = build_system_prompt_parts(compact_agent)["stable"]
+
+    assert "# Tool-use discipline" in compact_stable
+    assert "# Execution discipline" not in compact_stable
+    assert len(compact_stable.encode("utf-8")) < len(verbose_stable.encode("utf-8"))

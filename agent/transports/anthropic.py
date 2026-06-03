@@ -61,12 +61,21 @@ class AnthropicTransport(ProviderTransport):
             drop_context_1m_beta: bool
         """
         from agent.anthropic_adapter import build_anthropic_kwargs
+        from agent.token_budget_policy import resolve_llm_max_tokens
+
+        max_tokens = resolve_llm_max_tokens(
+            params.get("max_tokens"),
+            messages=messages,
+            has_tools=bool(tools),
+            reasoning_config=params.get("reasoning_config"),
+            task_type="anthropic_messages",
+        )
 
         return build_anthropic_kwargs(
             model=model,
             messages=messages,
             tools=tools,
-            max_tokens=params.get("max_tokens", 16384),
+            max_tokens=max_tokens,
             reasoning_config=params.get("reasoning_config"),
             tool_choice=params.get("tool_choice"),
             is_oauth=params.get("is_oauth", False),

@@ -647,7 +647,7 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         schema = build_execute_code_schema()
         desc = schema["description"]
         self.assertIn("5-minute timeout", desc)
-        self.assertIn("50KB", desc)
+        self.assertIn("24KB", desc)
         self.assertIn("50 tool calls", desc)
 
     def test_description_mentions_helpers(self):

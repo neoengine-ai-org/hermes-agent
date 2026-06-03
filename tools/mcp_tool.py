@@ -40,7 +40,7 @@ Example config::
         sampling:                    # server-initiated LLM requests
           enabled: true              # default: true
           model: "gemini-3-flash"    # override model (optional)
-          max_tokens_cap: 4096       # max tokens per request
+          max_tokens_cap: 2048       # max tokens per request
           timeout: 30                # LLM call timeout (seconds)
           max_rpm: 10                # max requests per minute
           allowed_models: []         # model whitelist (empty = all)
@@ -741,7 +741,7 @@ class SamplingHandler:
         self.server_name = server_name
         self.max_rpm = _safe_numeric(config.get("max_rpm", 10), 10, int)
         self.timeout = _safe_numeric(config.get("timeout", 30), 30, float)
-        self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 4096), 4096, int)
+        self.max_tokens_cap = _safe_numeric(config.get("max_tokens_cap", 2048), 2048, int)
         self.max_tool_rounds = _safe_numeric(
             config.get("max_tool_rounds", 5), 5, int, minimum=0,
         )

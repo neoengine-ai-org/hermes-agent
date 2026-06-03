@@ -521,5 +521,5 @@ registry.register(
     check_fn=check_x_search_requirements,
     requires_env=["XAI_API_KEY"],
     emoji="🐦",
-    max_result_size_chars=100_000,
+    max_result_size_chars=50_000,
 )

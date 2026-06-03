@@ -50,6 +50,14 @@ class TestBedrockBuildKwargs:
         )
         assert kw["inferenceConfig"]["maxTokens"] == 8192
 
+    def test_default_max_tokens_uses_compact_budget(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            messages=msgs,
+        )
+        assert kw["inferenceConfig"]["maxTokens"] == 1024
+
 
 class TestBedrockConvertTools:
 

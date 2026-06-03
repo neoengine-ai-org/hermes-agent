@@ -533,7 +533,7 @@ memory:
 Controls how much content a single `read_file` call can return. Reads that exceed the limit are rejected with an error telling the agent to use `offset` and `limit` for a smaller range. This prevents a single read of a minified JS bundle or large data file from flooding the context window.
 
 ```yaml
-file_read_max_chars: 100000  # default — ~25-35K tokens
+file_read_max_chars: 50000   # default — ~12-18K tokens
 ```
 
 Raise it if you're on a model with a large context window and frequently read big files. Lower it for small-context models to keep reads efficient:
@@ -554,13 +554,13 @@ Three related caps control how much raw output a tool can return before Hermes t
 
 ```yaml
 tool_output:
-  max_bytes: 50000        # terminal output cap (chars)
-  max_lines: 2000         # read_file pagination cap
+  max_bytes: 24000        # terminal output cap (chars)
+  max_lines: 1000         # read_file pagination cap
   max_line_length: 2000   # per-line cap in read_file's line-numbered view
 ```
 
-- **`max_bytes`** — When a `terminal` command produces more than this many characters of combined stdout/stderr, Hermes keeps the first 40% and last 60% and inserts a `[OUTPUT TRUNCATED]` notice between them. Default `50000` (≈12-15K tokens across typical tokenisers).
-- **`max_lines`** — Upper bound on the `limit` parameter of a single `read_file` call. Requests above this are clamped so a single read can't flood the context window. Default `2000`.
+- **`max_bytes`** — When a `terminal` command produces more than this many characters of combined stdout/stderr, Hermes keeps the first 40% and last 60% and inserts a `[OUTPUT TRUNCATED]` notice between them. Default `24000` (≈6-8K tokens across typical tokenisers).
+- **`max_lines`** — Upper bound on the `limit` parameter of a single `read_file` call. Requests above this are clamped so a single read can't flood the context window. Default `1000`.
 - **`max_line_length`** — Per-line cap applied when `read_file` emits the line-numbered view. Lines longer than this are truncated to this many chars followed by `... [truncated]`. Default `2000`.
 
 Raise the limits on models with large context windows that can afford more raw output per call. Lower them for small-context models to keep tool results compact:
@@ -1479,6 +1479,7 @@ code_execution:
   mode: project                # project (default) | strict
   timeout: 300                 # Max execution time in seconds
   max_tool_calls: 50           # Max tool calls within code execution
+  max_stdout_bytes: 24000      # Max stdout chars returned to the model
 ```
 
 **`mode`** controls the working directory and Python interpreter for scripts:

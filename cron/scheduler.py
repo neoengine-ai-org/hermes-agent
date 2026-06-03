@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -848,7 +849,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, script_args=None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -870,6 +871,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
         script_path: Path to the script.  Relative paths are resolved
             against HERMES_HOME/scripts/.  Absolute and ~-prefixed paths
             are also validated to ensure they stay within the scripts dir.
+        script_args: Optional argv tail passed to the script after path
+            validation. Prefer a list in jobs.json; a string is split with
+            shlex for backward-compatible hand-edited jobs.
 
     Returns:
         (success, output) — on failure *output* contains the error message so the
@@ -900,6 +904,19 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    if script_args is None:
+        argv_tail = []
+    elif isinstance(script_args, str):
+        import shlex
+        try:
+            argv_tail = shlex.split(script_args)
+        except ValueError as exc:
+            return False, f"Invalid script_args for {path.name!r}: {exc}"
+    elif isinstance(script_args, (list, tuple)):
+        argv_tail = [str(arg) for arg in script_args]
+    else:
+        return False, f"Invalid script_args type for {path.name!r}: {type(script_args).__name__}"
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
@@ -922,9 +939,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
             )
-        argv = [_bash, str(path)]
+        argv = [_bash, str(path), *argv_tail]
     else:
-        argv = [sys.executable, str(path)]
+        argv = [sys.executable, str(path), *argv_tail]
 
     run_env = os.environ.copy()
     run_env["HERMES_HOME"] = str(_get_hermes_home())
@@ -1021,7 +1038,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         if prerun_script is not None:
             success, script_output = prerun_script
         else:
-            success, script_output = _run_job_script(script_path)
+            success, script_output = _run_job_script(script_path, job.get("script_args"))
         if success:
             if script_output:
                 prompt = (
@@ -1256,7 +1273,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 _prior_cwd = None
 
         try:
-            ok, output = _run_job_script(script_path)
+            ok, output = _run_job_script(script_path, job.get("script_args"))
         finally:
             if _prior_cwd is not None:
                 try:
@@ -1930,6 +1947,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
 
         def _process_job(job: dict) -> bool:
             """Run one due job end-to-end: execute, save, deliver, mark."""
+            scheduled_at = job.get("next_run_at") or _hermes_now().isoformat()
+            started_at = datetime.now(timezone.utc).isoformat()
+            output = ""
+            output_file = None
             try:
                 success, output, final_response, error = run_job(job)
 
@@ -1964,11 +1985,56 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                     success = False
                     error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+                try:
+                    from cron.observability import capture_cron_run, generate_agent_review_inbox, generate_agent_review_rollup, generate_schedule_recommendations, summarize_cron_observability
+                    finished_at = datetime.now(timezone.utc).isoformat()
+                    record = capture_cron_run(
+                        job=job,
+                        scheduled_at=scheduled_at,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        exit_code=0 if success else 1,
+                        output=output,
+                        cron_output_path=str(output_file) if output_file else None,
+                    )
+                    # Add the compact observability line to the saved cron output.
+                    if output_file:
+                        try:
+                            with open(output_file, "a", encoding="utf-8") as _obs_f:
+                                _obs_f.write(f"\n\nObservability: captured {record['run_id']}; review {'yes' if record.get('should_agent_review') else 'no'}\n")
+                        except Exception:
+                            logger.debug("Job '%s': failed to append observability line", job["id"], exc_info=True)
+                    summarize_cron_observability()
+                    generate_schedule_recommendations()
+                    generate_agent_review_inbox()
+                    generate_agent_review_rollup()
+                except Exception:
+                    logger.debug("Job '%s': cron observability capture failed", job["id"], exc_info=True)
+
                 mark_job_run(job["id"], success, error, delivery_error=delivery_error)
                 return True
 
             except Exception as e:
                 logger.error("Error processing job %s: %s", job['id'], e)
+                try:
+                    from cron.observability import capture_cron_run, generate_agent_review_inbox, generate_agent_review_rollup, generate_schedule_recommendations, summarize_cron_observability
+                    finished_at = datetime.now(timezone.utc).isoformat()
+                    record = capture_cron_run(
+                        job=job,
+                        scheduled_at=scheduled_at,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                        exit_code=1,
+                        output=output or str(e),
+                        cron_output_path=str(output_file) if output_file else None,
+                    )
+                    summarize_cron_observability()
+                    generate_schedule_recommendations()
+                    generate_agent_review_inbox()
+                    generate_agent_review_rollup()
+                    logger.debug("Job '%s': observability captured failed processing run %s", job["id"], record.get("run_id"))
+                except Exception:
+                    logger.debug("Job '%s': cron observability capture failed after exception", job["id"], exc_info=True)
                 mark_job_run(job["id"], False, str(e))
                 return False
 

@@ -4833,11 +4833,12 @@ class TestBuildApiKwargsAnthropicMaxTokens:
             mock_build.return_value = {"model": "claude-sonnet-4-20250514", "messages": [], "max_tokens": 16384}
             agent._build_api_kwargs([{"role": "user", "content": "test"}])
             call_args = mock_build.call_args
-            # max_tokens should be None (let adapter use its default)
+            # Unset agent max_tokens should be resolved by Hermes' shared request
+            # budget policy before calling the Anthropic adapter.
             if call_args[1]:
-                assert call_args[1].get("max_tokens") is None
+                assert call_args[1].get("max_tokens") == 2048
             else:
-                assert call_args[0][3] is None
+                assert call_args[0][3] == 2048
 
 
 class TestAnthropicImageFallback:

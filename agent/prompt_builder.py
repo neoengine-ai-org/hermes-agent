@@ -877,6 +877,19 @@ CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
 CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
 
 
+def _context_file_max_chars(default: int = CONTEXT_FILE_MAX_CHARS) -> int:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        raw_agent_cfg = cfg.get("agent")
+        agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+        value = agent_cfg.get("context_file_max_chars", default)
+        max_chars = int(value)
+        return max(1_000, max_chars)
+    except Exception:
+        return default
+
+
 # =========================================================================
 # Skills prompt cache
 # =========================================================================
@@ -885,6 +898,29 @@ _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: OrderedDict[tuple, str] = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
 _SKILLS_SNAPSHOT_VERSION = 1
+
+
+def _compact_skills_index_enabled() -> bool:
+    """Return True when the system prompt should list skill names only.
+
+    Skill descriptions are useful for discovery, but large skill libraries make
+    them one of the biggest fixed prompt blocks.  ``skills.compact_index`` keeps
+    the category/name index that lets the model discover and load skills while
+    relying on ``skill_view`` for full instructions and descriptions on demand.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        raw_skills_cfg = cfg.get("skills")
+        raw_agent_cfg = cfg.get("agent")
+        skills_cfg = raw_skills_cfg if isinstance(raw_skills_cfg, dict) else {}
+        agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+        value = skills_cfg.get("compact_index", agent_cfg.get("compact_skills_index", False))
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "compact", "names", "names-only"}
+        return bool(value)
+    except Exception:
+        return False
 
 
 def _skills_prompt_snapshot_path() -> Path:
@@ -1070,6 +1106,7 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    compact_index = _compact_skills_index_enabled()
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1077,6 +1114,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        compact_index,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1216,7 +1254,7 @@ def build_skills_system_prompt(
         index_lines = []
         for category in sorted(skills_by_category.keys()):
             cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
+            if cat_desc and not compact_index:
                 index_lines.append(f"  {category}: {cat_desc}")
             else:
                 index_lines.append(f"  {category}:")
@@ -1226,7 +1264,7 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
+                if desc and not compact_index:
                     index_lines.append(f"    - {name}: {desc}")
                 else:
                     index_lines.append(f"    - {name}")
@@ -1340,8 +1378,10 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
-def _truncate_content(content: str, filename: str, max_chars: int = CONTEXT_FILE_MAX_CHARS) -> str:
+def _truncate_content(content: str, filename: str, max_chars: int | None = None) -> str:
     """Head/tail truncation with a marker in the middle."""
+    if max_chars is None:
+        max_chars = _context_file_max_chars()
     if len(content) <= max_chars:
         return content
     head_chars = int(max_chars * CONTEXT_TRUNCATE_HEAD_RATIO)
@@ -1475,7 +1515,8 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
     SOUL.md from HERMES_HOME is independent and always included when present.
-    Each context source is capped at 20,000 chars.
+    Each context source is capped at ``agent.context_file_max_chars``
+    (default 20,000 chars; minimum 1,000 chars).
 
     When *skip_soul* is True, SOUL.md is not included here (it was already
     loaded via ``load_soul_md()`` for the identity slot).

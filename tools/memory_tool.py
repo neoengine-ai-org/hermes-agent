@@ -488,7 +488,37 @@ class MemoryStore:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
         separator = "═" * 46
+        content = self._truncate_prompt_content(target, content)
         return f"{separator}\n{header}\n{separator}\n{content}"
+
+    @staticmethod
+    def _prompt_content_cap(target: str) -> Optional[int]:
+        """Optional low-token cap for memory content injected into prompts."""
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+            raw_memory_cfg = cfg.get("memory")
+            memory_cfg = raw_memory_cfg if isinstance(raw_memory_cfg, dict) else {}
+            key = "user_prompt_max_chars" if target == "user" else "memory_prompt_max_chars"
+            value = memory_cfg.get(key, 0)
+            cap = int(value or 0)
+            return cap if cap > 0 else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _truncate_prompt_content(cls, target: str, content: str) -> str:
+        cap = cls._prompt_content_cap(target)
+        if not cap or len(content) <= cap:
+            return content
+        head = max(1, int(cap * 0.8))
+        tail = max(0, cap - head)
+        omitted = len(content) - head - tail
+        marker = (
+            f"\n[…truncated {target} prompt snapshot: omitted {omitted:,} chars; "
+            "use memory/session_search tools if more detail is needed.]\n"
+        )
+        return content[:head] + marker + (content[-tail:] if tail else "")
 
     @staticmethod
     def _read_file(path: Path) -> List[str]:

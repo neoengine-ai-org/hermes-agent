@@ -65,6 +65,7 @@ import requests
 from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 from agent.auxiliary_client import call_llm
+from agent.token_budget_policy import resolve_llm_max_tokens
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 from hermes_cli.config import cfg_get
@@ -186,7 +187,7 @@ _last_screenshot_cleanup_by_dir: dict[str, float] = {}
 DEFAULT_COMMAND_TIMEOUT = 30
 
 # Max tokens for snapshot content before summarization
-SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
+SNAPSHOT_SUMMARIZE_THRESHOLD = 4000
 
 # Commands that legitimately return empty stdout (e.g. close, record).
 _EMPTY_OK_COMMANDS: frozenset = frozenset({"close", "record"})
@@ -1484,7 +1485,7 @@ BROWSER_TOOL_SCHEMAS = [
     },
     {
         "name": "browser_snapshot",
-        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 8000 chars are truncated or LLM-summarized. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
+        "description": "Get a text-based snapshot of the current page's accessibility tree. Returns interactive elements with ref IDs (like @e1, @e2) for browser_click and browser_type. full=false (default): compact view with interactive elements. full=true: complete page content. Snapshots over 4000 chars are truncated or LLM-summarized. Requires browser_navigate first. Note: browser_navigate already returns a compact snapshot — use this to refresh after interactions that change the page, or with full=true for complete content.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2237,7 +2238,11 @@ def _extract_relevant_content(
         call_kwargs = {
             "task": "web_extract",
             "messages": [{"role": "user", "content": extraction_prompt}],
-            "max_tokens": 4000,
+            "max_tokens": resolve_llm_max_tokens(
+                2048,
+                prompt=extraction_prompt,
+                task_type="browser snapshot extraction",
+            ),
             "temperature": 0.1,
         }
         model = _get_extraction_model()
@@ -2251,7 +2256,7 @@ def _extract_relevant_content(
         return _truncate_snapshot(snapshot_text)
 
 
-def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
+def _truncate_snapshot(snapshot_text: str, max_chars: int = 4000) -> str:
     """Structure-aware truncation for snapshots.
 
     Cuts at line boundaries so that accessibility tree elements are never
@@ -3277,7 +3282,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     ],
                 }
             ],
-            "max_tokens": 2000,
+            "max_tokens": resolve_llm_max_tokens(
+                1024,
+                prompt=vision_prompt,
+                task_type="browser screenshot vision",
+            ),
             "temperature": vision_temperature,
             "timeout": vision_timeout,
         }

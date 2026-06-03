@@ -24,6 +24,9 @@ from urllib.parse import urlparse
 from hermes_constants import get_hermes_home
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
+from agent.token_budget_policy import resolve_llm_max_tokens
+
+_REAL_SUBPROCESS_RUN = subprocess.run
 
 # NOTE: `import anthropic` is deliberately NOT at module top — the SDK pulls
 # ~220 ms of imports (anthropic.types, anthropic.lib.tools._beta_runner, etc.)
@@ -811,6 +814,13 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
     """
     if platform.system() != "Darwin":
         return None
+    # Unit tests commonly monkeypatch Path.home() to a temp fixture; in that
+    # case, do not leak real user Keychain credentials into the isolated home.
+    if (
+        Path.home() != Path(os.path.expanduser("~"))
+        and os.getenv("HERMES_ALLOW_ISOLATED_KEYCHAIN_FOR_TESTS") != "1"
+    ):
+        return None
 
     try:
         # Read the "Claude Code-credentials" generic password entry
@@ -836,7 +846,7 @@ def _read_claude_code_credentials_from_keychain() -> Optional[Dict[str, Any]]:
 
     try:
         data = json.loads(raw)
-    except json.JSONDecodeError:
+    except (TypeError, json.JSONDecodeError):
         logger.debug("Keychain: credentials payload is not valid JSON")
         return None
 
@@ -2102,6 +2112,15 @@ def build_anthropic_kwargs(
     anthropic_tools = convert_tools_to_anthropic(tools) if tools else []
 
     model = normalize_model_name(model, preserve_dots=preserve_dots)
+    if max_tokens is None:
+        max_tokens = resolve_llm_max_tokens(
+            None,
+            messages=messages,
+            has_tools=bool(tools),
+            reasoning_config=reasoning_config,
+            task_type="anthropic_messages",
+        )
+
     # effective_max_tokens = output cap for this call (≠ total context window)
     # Use the resolver helper so non-positive values (negative ints,
     # fractional floats, NaN, non-numeric) fail locally with a clear error

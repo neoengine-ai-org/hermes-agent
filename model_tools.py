@@ -261,6 +261,42 @@ def _clear_tool_defs_cache() -> None:
     _tool_defs_cache.clear()
 
 
+def _compact_tool_schema_descriptions(schema: Any) -> Any:
+    """Return *schema* with JSON-schema ``description`` fields removed.
+
+    Tool descriptions are useful for broad discoverability, but they are also
+    the dominant fixed payload in long-lived gateway sessions.  For operators
+    who prefer a tiny always-on schema surface, ``tools.compact_schemas`` strips
+    prose while preserving names, types, properties, enums, defaults, and
+    required fields.
+    """
+    if isinstance(schema, dict):
+        return {
+            key: _compact_tool_schema_descriptions(value)
+            for key, value in schema.items()
+            if key != "description"
+        }
+    if isinstance(schema, list):
+        return [_compact_tool_schema_descriptions(item) for item in schema]
+    return schema
+
+
+def _compact_tool_schemas_enabled() -> bool:
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        raw_tools_cfg = cfg.get("tools")
+        raw_agent_cfg = cfg.get("agent")
+        tools_cfg = raw_tools_cfg if isinstance(raw_tools_cfg, dict) else {}
+        agent_cfg = raw_agent_cfg if isinstance(raw_agent_cfg, dict) else {}
+        value = tools_cfg.get("compact_schemas", agent_cfg.get("compact_tool_schemas", False))
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on", "compact", "strip"}
+        return bool(value)
+    except Exception:
+        return False
+
+
 def get_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -519,6 +555,9 @@ def _compute_tool_definitions(
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
+
+    if _compact_tool_schemas_enabled():
+        filtered_tools = _compact_tool_schema_descriptions(filtered_tools)
 
     return filtered_tools
 

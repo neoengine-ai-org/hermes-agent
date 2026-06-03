@@ -462,7 +462,7 @@ memory:
 控制单次 `read_file` 调用可以返回多少内容。超过限制的读取将被拒绝，并向 agent 返回错误，提示使用 `offset` 和 `limit` 读取较小范围。这可以防止单次读取压缩的 JS 包或大型数据文件时淹没上下文窗口。
 
 ```yaml
-file_read_max_chars: 100000  # 默认 —— ~25-35K tokens
+file_read_max_chars: 50000   # 默认 —— ~12-18K tokens
 ```
 
 如果您使用具有大上下文窗口的模型并经常读取大文件，请调高此值。对于小上下文模型，请降低以保持读取高效：
@@ -483,13 +483,13 @@ Agent 还会自动去重文件读取 —— 如果同一文件区域被读取两
 
 ```yaml
 tool_output:
-  max_bytes: 50000        # 终端输出上限（字符）
-  max_lines: 2000         # read_file 分页上限
+  max_bytes: 24000        # 终端输出上限（字符）
+  max_lines: 1000         # read_file 分页上限
   max_line_length: 2000   # read_file 行号视图中的每行上限
 ```
 
-- **`max_bytes`** —— 当 `terminal` 命令产生超过此字符数的合并 stdout/stderr 时，Hermes 保留前 40% 和后 60%，并在中间插入 `[OUTPUT TRUNCATED]` 通知。默认 `50000`（典型分词器约 12-15K tokens）。
-- **`max_lines`** —— 单次 `read_file` 调用的 `limit` 参数上限。超过此值的请求将被截断，以防单次读取淹没上下文窗口。默认 `2000`。
+- **`max_bytes`** —— 当 `terminal` 命令产生超过此字符数的合并 stdout/stderr 时，Hermes 保留前 40% 和后 60%，并在中间插入 `[OUTPUT TRUNCATED]` 通知。默认 `24000`（典型分词器约 6-8K tokens）。
+- **`max_lines`** —— 单次 `read_file` 调用的 `limit` 参数上限。超过此值的请求将被截断，以防单次读取淹没上下文窗口。默认 `1000`。
 - **`max_line_length`** —— `read_file` 发出行号视图时应用的每行上限。超过此长度的行将被截断为此字符数，后跟 `... [truncated]`。默认 `2000`。
 
 对于具有大上下文窗口且每次调用可以承受更多原始输出的模型，请调高限制。对于小上下文模型，请降低以保持工具结果紧凑：

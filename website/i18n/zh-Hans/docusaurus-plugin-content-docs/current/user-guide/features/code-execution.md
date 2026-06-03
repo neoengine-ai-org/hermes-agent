@@ -160,7 +160,7 @@ code_execution:
 | 资源 | 限制 | 说明 |
 |------|------|------|
 | **超时** | 5 分钟（300 秒） | 脚本先收到 SIGTERM，5 秒宽限期后收到 SIGKILL |
-| **Stdout** | 50 KB | 输出截断并附加 `[output truncated at 50KB]` 提示 |
+| **Stdout** | 24 KB | 输出截断并附加 `[OUTPUT TRUNCATED]` 提示 |
 | **Stderr** | 10 KB | 非零退出时包含在输出中，用于调试 |
 | **工具调用** | 每次执行 50 次 | 达到上限时返回错误 |
 
@@ -172,6 +172,7 @@ code_execution:
   mode: project      # project (default) | strict
   timeout: 300       # Max seconds per script (default: 300)
   max_tool_calls: 50 # Max tool calls per execution (default: 50)
+  max_stdout_bytes: 24000 # Max stdout chars returned to the model
 ```
 
 ## 脚本内工具调用的工作方式

@@ -23,9 +23,9 @@ from tools import tool_output_limits as tol
 
 
 class TestDefaults:
-    def test_defaults_match_previous_hardcoded_values(self):
-        assert tol.DEFAULT_MAX_BYTES == 50_000
-        assert tol.DEFAULT_MAX_LINES == 2000
+    def test_defaults_match_compact_runtime_values(self):
+        assert tol.DEFAULT_MAX_BYTES == 24_000
+        assert tol.DEFAULT_MAX_LINES == 1000
         assert tol.DEFAULT_MAX_LINE_LENGTH == 2000
 
     def test_get_limits_returns_defaults_when_config_missing(self):

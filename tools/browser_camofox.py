@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_TIMEOUT = 30  # seconds per HTTP request
-_SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
+_SNAPSHOT_MAX_CHARS = 40_000  # camofox paginates at this compact limit
 _vnc_url: Optional[str] = None  # cached from /health response
 _vnc_url_checked = False  # only probe once per process
 
@@ -789,6 +789,5 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
 
 

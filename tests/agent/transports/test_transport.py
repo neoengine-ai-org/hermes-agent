@@ -221,6 +221,14 @@ class TestAnthropicTransport:
         assert "max_tokens" in kw
         assert "messages" in kw
 
+    def test_build_kwargs_default_uses_compact_budget(self, transport):
+        messages = [{"role": "user", "content": "Hello"}]
+        kw = transport.build_kwargs(
+            model="claude-sonnet-4-6",
+            messages=messages,
+        )
+        assert kw["max_tokens"] == 1024
+
     def test_convert_messages_extracts_system(self, transport):
         """Test convert_messages separates system from messages."""
         messages = [

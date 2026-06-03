@@ -45,6 +45,7 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from agent.token_budget_policy import resolve_llm_max_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,13 @@ Output a single JSON object with this exact shape:
       ...
     ]
   }
+
+Runtime-First v1-v10 Maturity Ladder and Ralph convergence:
+  - Every packet must answer: What can the system do after this that it could not do before?
+  - Treat v1-v10 as earned runtime maturity, not ambition: v1 seed, v2 path, v3 contract, v4 surface, v5 workflow, v6 intelligence, v7 adaptation, v8 bounded autonomy, v9 ecosystem, v10 institution.
+  - Require a Ralph acceptance boundary: productSurfaceTarget, runtimePayloadContract, runtime behavior delta, user/system-visible delta, validation/test delta, finite close condition, non-claims, and blocker exemption only when runtime is impossible.
+  - Reject docs-only, evidence-only, rubric-only, maturity-only, governance-only, closeout-only, adversarial-only, scaffolding-only, or planning-only work unless it is explicitly bound to a runtime-bearing packet with a finite close condition.
+  - Proof protects runtime; it does not substitute for runtime. Preserve explicit non-claims and route the next runtime-bearing packet.
 
 Rules:
   - "parents" is a list of INDICES (0-based) into this same "tasks" list,
@@ -331,7 +339,11 @@ def decompose_task(
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.3,
-            max_tokens=4000,
+            max_tokens=resolve_llm_max_tokens(
+                None,
+                prompt=user_msg,
+                task_type="kanban decomposition json",
+            ),
             timeout=timeout or 180,
             extra_body=get_auxiliary_extra_body() or None,
         )

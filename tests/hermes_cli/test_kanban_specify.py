@@ -96,13 +96,14 @@ def test_specify_task_happy_path(kanban_home):
         "title": "Refined rough",
         "body": "**Goal**\nA concrete goal.",
     })
-    p, _ = _patch_aux_client(content)
+    p, client = _patch_aux_client(content)
     with p:
         outcome = spec.specify_task(tid, author="ace")
 
     assert outcome.ok is True
     assert outcome.task_id == tid
     assert outcome.new_title == "Refined rough"
+    assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 2048
 
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
@@ -335,3 +336,8 @@ def test_cli_specify_author_passed_through(kanban_home, capsys):
     with kb.connect() as conn:
         comments = kb.list_comments(conn, tid)
     assert comments and comments[0].author == "custom-agent"
+
+
+def test_prompt_enforces_runtime_first_maturity_ladder_and_ralph() -> None:
+    assert "Runtime-First v1-v10 Maturity Ladder" in spec._SYSTEM_PROMPT
+    assert "What can the system do after this that it could not do before?" in spec._SYSTEM_PROMPT

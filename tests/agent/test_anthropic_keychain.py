@@ -106,6 +106,7 @@ class TestReadClaudeCodeCredentialsPriority:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_ALLOW_ISOLATED_KEYCHAIN_FOR_TESTS", "1")
 
         # Mock Keychain to return a "newer" token
         with patch("agent.anthropic_adapter.platform.system", return_value="Darwin"), \

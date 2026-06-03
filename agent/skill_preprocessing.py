@@ -17,7 +17,7 @@ _SKILL_TEMPLATE_RE = re.compile(r"\$\{(HERMES_SKILL_DIR|HERMES_SESSION_ID)\}")
 _INLINE_SHELL_RE = re.compile(r"!`([^`\n]+)`")
 
 # Cap inline-shell output so a runaway command can't blow out the context.
-_INLINE_SHELL_MAX_OUTPUT = 4000
+_INLINE_SHELL_MAX_OUTPUT = 2000
 
 
 def load_skills_config() -> dict:

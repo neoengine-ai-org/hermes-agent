@@ -78,6 +78,8 @@ AGGREGATOR_TEMPERATURE = 0.4  # Focused synthesis for consistency
 
 # Failure handling configuration
 MIN_SUCCESSFUL_REFERENCES = 1  # Minimum successful reference models needed to proceed
+REFERENCE_MAX_TOKENS = 4096
+AGGREGATOR_MAX_TOKENS = 4096
 
 # System prompt for the aggregator model (from the research paper)
 AGGREGATOR_SYSTEM_PROMPT = """You have been provided with a set of responses from various open-source models to the latest user query. Your task is to synthesize these responses into a single, high-quality response. It is crucial to critically evaluate the information provided in these responses, recognizing that some of it may be biased or incorrect. Your response should not simply replicate the given answers but should offer a refined, accurate, and comprehensive reply to the instruction. Ensure your response is well-structured, coherent, and adheres to the highest standards of accuracy and reliability.
@@ -106,7 +108,7 @@ async def _run_reference_model_safe(
     model: str,
     user_prompt: str,
     temperature: float = REFERENCE_TEMPERATURE,
-    max_tokens: int = 32000,
+    max_tokens: int = REFERENCE_MAX_TOKENS,
     max_retries: int = 6
 ) -> tuple[str, str, bool]:
     """
@@ -182,7 +184,7 @@ async def _run_aggregator_model(
     system_prompt: str,
     user_prompt: str,
     temperature: float = AGGREGATOR_TEMPERATURE,
-    max_tokens: int = None
+    max_tokens: int = AGGREGATOR_MAX_TOKENS
 ) -> str:
     """
     Run the aggregator model to synthesize the final response.

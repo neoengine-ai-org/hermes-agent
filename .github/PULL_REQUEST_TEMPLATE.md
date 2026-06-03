@@ -36,6 +36,45 @@ Fixes #
 2. 
 3. 
 
+## Risk, Complexity, Review, and CI Classification
+
+- Risk class: R0/R1/R2/R3/R4/R5
+- Complexity class: C0/C1/C2/C3/C4/C5
+- Impacted surfaces:
+- runtime_payload_required: true/false
+- RuntimePayloadContract present: yes/no
+- maturityLevelTarget: v1/v2/v3/v4/v5/v6/v7/v8/v9/v10
+- currentMaturityLevel: v1/v2/v3/v4/v5/v6/v7/v8/v9/v10
+- targetMaturityLevel: v1/v2/v3/v4/v5/v6/v7/v8/v9/v10
+- ralphLoopStage: runtime_intent/acceptance_boundary/implementation_pass/adversarial_pass/runtime_proof_pass/memory_closeout_pass
+- productSurfaceTarget:
+- runtimeBehaviorDelta: <!-- What can the system do after this that it could not do before? -->
+- userOrSystemVisibleDelta:
+- validationTestDelta:
+- runtimeProofRequired:
+- finiteCloseCondition:
+- supportWorkClassification: <!-- N/A or evidence-only/rubric-only/maturity-only/governance-only/closeout-only/adversarial-only/scaffolding-only/planning-only -->
+- Bound runtime-bearing packet: <!-- required for support-only work -->
+- runtimeBlockerExemption: <!-- only if runtime work is impossible -->
+- nonClaims:
+- nextRuntimePacketRecommendation:
+- Product/runtime artifact:
+- Changed runtime/product files:
+- Behavior tests:
+- Validation commands:
+- Explicit non-claims:
+- Blocker exemption, if any:
+- Secondary review required: yes/no
+- Adversarial review required: yes/no
+- Opposite-provider adversarial required: yes/no
+- Human/protected review required: yes/no
+- Founder review required: yes/no
+- Required CI lanes:
+- Skipped CI lanes and rationale:
+- Token class: S/M/L/XL
+- Expected state change:
+- Stop condition:
+
 ## Checklist
 
 <!-- Complete these before requesting review. -->

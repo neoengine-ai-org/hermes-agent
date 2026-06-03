@@ -1252,8 +1252,8 @@ class TestBuildAnthropicKwargs:
         )
         assert "thinking" not in kwargs
 
-    def test_default_max_tokens_uses_model_output_limit(self):
-        """When max_tokens is None, use the model's native output limit."""
+    def test_default_max_tokens_uses_compact_budget(self):
+        """When max_tokens is None, use Hermes' compact request budget."""
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-20250514",
             messages=[{"role": "user", "content": "Hi"}],
@@ -1261,7 +1261,7 @@ class TestBuildAnthropicKwargs:
             max_tokens=None,
             reasoning_config=None,
         )
-        assert kwargs["max_tokens"] == 64_000  # Sonnet 4 output limit
+        assert kwargs["max_tokens"] == 1024
 
     def test_default_max_tokens_opus_4_6(self):
         kwargs = build_anthropic_kwargs(
@@ -1271,7 +1271,7 @@ class TestBuildAnthropicKwargs:
             max_tokens=None,
             reasoning_config=None,
         )
-        assert kwargs["max_tokens"] == 128_000
+        assert kwargs["max_tokens"] == 1024
 
     def test_default_max_tokens_sonnet_4_6(self):
         kwargs = build_anthropic_kwargs(
@@ -1281,10 +1281,10 @@ class TestBuildAnthropicKwargs:
             max_tokens=None,
             reasoning_config=None,
         )
-        assert kwargs["max_tokens"] == 64_000
+        assert kwargs["max_tokens"] == 1024
 
-    def test_default_max_tokens_date_stamped_model(self):
-        """Date-stamped model IDs should resolve via substring match."""
+    def test_default_max_tokens_date_stamped_model_uses_policy(self):
+        """Date-stamped model IDs still use Hermes' default request policy."""
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-5-20250929",
             messages=[{"role": "user", "content": "Hi"}],
@@ -1292,7 +1292,7 @@ class TestBuildAnthropicKwargs:
             max_tokens=None,
             reasoning_config=None,
         )
-        assert kwargs["max_tokens"] == 64_000
+        assert kwargs["max_tokens"] == 1024
 
     def test_default_max_tokens_older_model(self):
         kwargs = build_anthropic_kwargs(
@@ -1302,10 +1302,10 @@ class TestBuildAnthropicKwargs:
             max_tokens=None,
             reasoning_config=None,
         )
-        assert kwargs["max_tokens"] == 8_192
+        assert kwargs["max_tokens"] == 1024
 
-    def test_default_max_tokens_unknown_model_uses_highest(self):
-        """Unknown future models should get the highest known limit."""
+    def test_default_max_tokens_unknown_model_uses_policy(self):
+        """Unknown future models still use Hermes' default request policy."""
         kwargs = build_anthropic_kwargs(
             model="claude-ultra-5-20260101",
             messages=[{"role": "user", "content": "Hi"}],
@@ -1313,7 +1313,7 @@ class TestBuildAnthropicKwargs:
             max_tokens=None,
             reasoning_config=None,
         )
-        assert kwargs["max_tokens"] == 128_000
+        assert kwargs["max_tokens"] == 1024
 
     def test_explicit_max_tokens_overrides_default(self):
         """User-specified max_tokens should be respected."""
@@ -1326,20 +1326,20 @@ class TestBuildAnthropicKwargs:
         )
         assert kwargs["max_tokens"] == 4096
 
-    def test_context_length_clamp(self):
-        """max_tokens should be clamped to context_length if it's smaller."""
+    def test_context_length_clamp_for_explicit_large_budget(self):
+        """Explicit max_tokens should be clamped to context_length if needed."""
         kwargs = build_anthropic_kwargs(
             model="claude-opus-4-6",  # 128K output
             messages=[{"role": "user", "content": "Hi"}],
             tools=None,
-            max_tokens=None,
+            max_tokens=128_000,
             reasoning_config=None,
             context_length=50000,
         )
         assert kwargs["max_tokens"] == 49999  # context_length - 1
 
-    def test_context_length_no_clamp_when_larger(self):
-        """No clamping when context_length exceeds output limit."""
+    def test_context_length_no_clamp_when_policy_budget_fits(self):
+        """No clamping when the inferred policy budget fits the window."""
         kwargs = build_anthropic_kwargs(
             model="claude-sonnet-4-6",  # 64K output
             messages=[{"role": "user", "content": "Hi"}],
@@ -1348,7 +1348,7 @@ class TestBuildAnthropicKwargs:
             reasoning_config=None,
             context_length=200000,
         )
-        assert kwargs["max_tokens"] == 64_000
+        assert kwargs["max_tokens"] == 1024
 
 
 # ---------------------------------------------------------------------------
@@ -1947,6 +1947,8 @@ class TestResolveMessagesMaxTokens:
         assert result > 0
 
     def test_none_falls_back_to_model_default(self):
+        # The low-level resolver still exposes native provider ceilings; the
+        # request builders apply Hermes' compact token policy before calling it.
         result = _resolve_anthropic_messages_max_tokens(None, "claude-opus-4-6")
         assert result > 0
 
