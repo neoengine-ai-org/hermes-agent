@@ -714,6 +714,10 @@ DEFAULT_CONFIG = {
         # plausible-looking output when a real path is blocked.  Costs ~80
         # tokens in the cached system prompt.  Set False to disable globally.
         "task_completion_guidance": True,
+        # Low-token mode for verbose behavioral/system guidance. False keeps
+        # the full high-recall instructions; True keeps the same intent in
+        # shorter checklist form and omits model-family extra prose.
+        "compact_system_guidance": False,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP
@@ -952,8 +956,8 @@ DEFAULT_CONFIG = {
 
     # Maximum characters returned by a single read_file call.  Reads that
     # exceed this are rejected with guidance to use offset+limit.
-    # 100K chars ≈ 25–35K tokens across typical tokenisers.
-    "file_read_max_chars": 100_000,
+    # 50K chars ≈ 12–18K tokens across typical tokenisers.
+    "file_read_max_chars": 50_000,
 
     # Tool-output truncation thresholds. When terminal output or a
     # single read_file page exceeds these limits, Hermes truncates the
@@ -963,15 +967,15 @@ DEFAULT_CONFIG = {
     # shot. Ported from anomalyco/opencode PR #23770.
     #
     # - max_bytes:       terminal_tool output cap, in chars
-    #                    (default 50_000 ≈ 12-15K tokens).
+    #                    (default 24_000 ≈ 6-8K tokens).
     # - max_lines:       read_file pagination cap — the maximum `limit`
     #                    a single read_file call can request before
-    #                    being clamped (default 2000).
+    #                    being clamped (default 1000).
     # - max_line_length: per-line cap applied when read_file emits a
     #                    line-numbered view (default 2000 chars).
     "tool_output": {
-        "max_bytes": 50_000,
-        "max_lines": 2000,
+        "max_bytes": 24_000,
+        "max_lines": 1000,
         "max_line_length": 2000,
     },
 
@@ -1458,6 +1462,11 @@ DEFAULT_CONFIG = {
         "user_profile_enabled": True,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
+        # Optional prompt-injection caps for low-token profiles. 0 means inject
+        # the full bounded store; positive values preserve the underlying store
+        # but truncate the frozen prompt snapshot with a marker.
+        "memory_prompt_max_chars": 0,
+        "user_prompt_max_chars": 0,
         # External memory provider plugin (empty = built-in only).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
@@ -1535,6 +1544,11 @@ DEFAULT_CONFIG = {
     # always goes to ~/.hermes/skills/.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # System-prompt skill catalog mode. False (default) lists
+        # category/skill descriptions for discoverability. True lists only
+        # category + skill names and relies on skill_view for full instructions
+        # on demand — useful for large skill libraries / low-token profiles.
+        "compact_index": False,
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id
         # before the agent sees it.  Lets skill authors reference bundled
@@ -1848,6 +1862,7 @@ DEFAULT_CONFIG = {
         # Env scrubbing (strips *_API_KEY, *_TOKEN, *_SECRET, ...) and the
         # tool whitelist apply identically in both modes.
         "mode": "project",
+        "max_stdout_bytes": 24_000,
     },
 
     # Tool Search (progressive disclosure for large tool surfaces).

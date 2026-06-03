@@ -67,8 +67,12 @@ model:
   #   Unrelated to how long your conversation history can be.
   #   The OpenAI-standard name "max_tokens" is a misnomer; Anthropic's native
   #   API has since renamed it "max_output_tokens" for clarity.
-  #   Leave unset to use the model's native output ceiling (recommended).
-  #   Set only if you want to deliberately limit individual response length.
+  #   Leave unset to use Hermes' budget-aware defaults: 1024 for routine
+  #   replies, with automatic escalation for tool, review, evidence, security,
+  #   governance, schema, and other deep-work prompts. Override only when a
+  #   specific workflow truly needs a larger fixed response cap.
+  #   Env overrides for inferred defaults:
+  #   HERMES_LLM_DEFAULT_MAX_TOKENS, HERMES_LLM_ESCALATION_MAX_TOKENS.
   #
 # max_tokens: 8192
 

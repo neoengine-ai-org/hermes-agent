@@ -393,6 +393,29 @@ class TestMemoryStoreSnapshot:
     def test_empty_snapshot_returns_none(self, store):
         assert store.format_for_system_prompt("memory") is None
 
+    def test_prompt_snapshot_cap_truncates_without_changing_store(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        memory_dir = hermes_home / "memories"
+        memory_dir.mkdir()
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: memory_dir)
+        (hermes_home / "config.yaml").write_text(
+            "memory:\n  memory_prompt_max_chars: 120\n",
+            encoding="utf-8",
+        )
+        long_entry = "start-" + ("x" * 400) + "-end"
+        (memory_dir / "MEMORY.md").write_text(long_entry, encoding="utf-8")
+
+        store = MemoryStore(memory_char_limit=1000, user_char_limit=1000)
+        store.load_from_disk()
+        snapshot = store.format_for_system_prompt("memory")
+
+        assert long_entry in store.memory_entries
+        assert snapshot is not None
+        assert "truncated memory prompt snapshot" in snapshot
+        assert len(snapshot) < len(long_entry)
+
 
 # =========================================================================
 # memory_tool() dispatcher
