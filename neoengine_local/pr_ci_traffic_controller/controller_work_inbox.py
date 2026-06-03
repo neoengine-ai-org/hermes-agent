@@ -85,7 +85,7 @@ def atomic_write_json(path: pathlib.Path, data: dict[str, Any]) -> None:
             os.fsync(tmp.fileno())
         os.replace(tmp_name, path)
         try:
-            reread = json.loads(path.read_text())
+            reread = json.loads(path.read_text(encoding="utf-8"))
         except Exception as exc:
             raise RuntimeError(f"atomic write readback parse failed for {path}: {exc}") from exc
         if reread != data:
@@ -166,7 +166,7 @@ def load_inbox(path: pathlib.Path, org: str, *, create: bool = False) -> dict[st
                 return {"ok": False, "error": str(exc), "data": None}
         return {"ok": True, "error": None, "data": data}
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
         return {"ok": False, "error": f"malformed controller inbox: {exc}", "data": None}
     errors = validate_inbox(data, org)
