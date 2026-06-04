@@ -3,7 +3,7 @@ import json, os, subprocess, sys
 from pathlib import Path
 BAD=("node_modules/",".uv-cache/",".venv/","__pycache__/",".pytest_cache/","dist/","build/","neoengine_local/agent-state/")
 tracked=subprocess.check_output(["git","ls-files"],text=True).splitlines()
-baseline=set(json.loads(Path('.repo-hygiene-baseline.json').read_text()).get('allowlist',[])) if Path('.repo-hygiene-baseline.json').exists() else set()
+baseline=set(json.loads(Path('.repo-hygiene-baseline.json').read_text(encoding='utf-8')).get('allowlist',[])) if Path('.repo-hygiene-baseline.json').exists() else set()
 errors=[]; warnings=[]
 for f in tracked:
     if f in baseline: continue
