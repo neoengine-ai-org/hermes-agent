@@ -1,0 +1,276 @@
+{
+  "policy_version": "0.1.0",
+  "path_rules": [
+    {
+      "rule_id": "protected.oauth.requires-security",
+      "pattern": "(oauth|auth/provider|identity/provider|account-connection)",
+      "risk_class": "R3",
+      "complexity_class": "C3",
+      "required_ci_lanes": [
+        "security",
+        "unit"
+      ],
+      "required_reviews": [
+        "security"
+      ],
+      "required_non_claims": [
+        "no live OAuth/banking/account-connection behavior"
+      ],
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "protected.token-vault.requires-security",
+      "pattern": "(token|secret|vault|credential)",
+      "risk_class": "R3",
+      "complexity_class": "C3",
+      "required_ci_lanes": [
+        "security",
+        "repo-hygiene",
+        "unit"
+      ],
+      "required_reviews": [
+        "security"
+      ],
+      "required_non_claims": [
+        "no production readiness"
+      ],
+      "requires_repo_hygiene_check": true,
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "protected.webhook.requires-security",
+      "pattern": "(webhook|callback|ingress)",
+      "risk_class": "R3",
+      "complexity_class": "C2",
+      "required_ci_lanes": [
+        "security",
+        "contract",
+        "unit"
+      ],
+      "required_reviews": [
+        "security"
+      ],
+      "required_non_claims": [
+        "no production readiness"
+      ],
+      "requires_contract_tests": true,
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "protected.banking.requires-security",
+      "pattern": "(bank|banking|plaid|ach|account[-_]?connection|connector)",
+      "risk_class": "R4",
+      "complexity_class": "C4",
+      "required_ci_lanes": [
+        "security",
+        "policy",
+        "adversarial",
+        "contract"
+      ],
+      "required_reviews": [
+        "security",
+        "policy",
+        "finance"
+      ],
+      "required_non_claims": [
+        "no live-bank readiness",
+        "no money-movement authority",
+        "no live OAuth/banking/account-connection behavior"
+      ],
+      "requires_contract_tests": true,
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "protected.customer-data.requires-security",
+      "pattern": "(customer|pii|personal[-_]?data|privacy|tenant)",
+      "risk_class": "R4",
+      "complexity_class": "C4",
+      "required_ci_lanes": [
+        "security",
+        "privacy",
+        "policy",
+        "adversarial"
+      ],
+      "required_reviews": [
+        "security",
+        "privacy",
+        "policy"
+      ],
+      "required_non_claims": [
+        "no customer-data readiness"
+      ],
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "protected.money-movement.requires-nonclaim",
+      "pattern": "(money[-_ ]?movement|payment|transfer|payout|settlement)",
+      "risk_class": "R4",
+      "complexity_class": "C4",
+      "required_ci_lanes": [
+        "security",
+        "policy",
+        "finance",
+        "adversarial"
+      ],
+      "required_reviews": [
+        "security",
+        "policy",
+        "finance"
+      ],
+      "required_non_claims": [
+        "no money-movement authority"
+      ],
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "protected.approval-state.requires-governance",
+      "pattern": "(approval|approved|authority|(^|[/_.-])gate([/_.-]|$))",
+      "risk_class": "R3",
+      "complexity_class": "C2",
+      "required_ci_lanes": [
+        "governance",
+        "unit"
+      ],
+      "required_reviews": [
+        "governance"
+      ],
+      "required_non_claims": [
+        "no protected approval"
+      ]
+    },
+    {
+      "rule_id": "generated.requires-generated-check",
+      "pattern": "(^|/)(generated|dist|build|coverage|\\.next|\\.artifacts)/|\\.generated\\.",
+      "risk_class": "R2",
+      "complexity_class": "C1",
+      "required_ci_lanes": [
+        "generated-artifact"
+      ],
+      "required_reviews": [
+        "owner"
+      ],
+      "requires_generated_artifact_check": true,
+      "requires_repo_hygiene_check": true
+    },
+    {
+      "rule_id": "artifact.screenshot.requires-pointer",
+      "pattern": "\\.(png|jpg|jpeg|webp|gif)$|screenshots?/",
+      "risk_class": "R2",
+      "complexity_class": "C1",
+      "required_ci_lanes": [
+        "artifact-diet"
+      ],
+      "required_reviews": [
+        "owner"
+      ],
+      "requires_artifact_pointer_check": true,
+      "requires_repo_hygiene_check": true
+    },
+    {
+      "rule_id": "artifact.proof-blob.requires-pointer",
+      "pattern": "(proof|evidence).*(blob|artifact)|\\.(zip|tar|gz|mp4|mov|pdf)$",
+      "risk_class": "R2",
+      "complexity_class": "C1",
+      "required_ci_lanes": [
+        "artifact-diet"
+      ],
+      "required_reviews": [
+        "owner"
+      ],
+      "requires_artifact_pointer_check": true,
+      "requires_repo_hygiene_check": true
+    },
+    {
+      "rule_id": "contract.requires-contract-tests",
+      "pattern": "(^|/)(schema|schemas|contracts?)/|contract|policy-decision|\\.schema\\.json$",
+      "risk_class": "R2",
+      "complexity_class": "C2",
+      "required_ci_lanes": [
+        "contract",
+        "unit"
+      ],
+      "required_reviews": [
+        "owner"
+      ],
+      "requires_runtime_payload_contract": true,
+      "requires_contract_tests": true
+    },
+    {
+      "rule_id": "product-org-registry.requires-boundary-check",
+      "pattern": "(product-org|product_org).*registr|registr.*product-org|ORG_DOCTRINE|orgs/.*/registry",
+      "risk_class": "R3",
+      "complexity_class": "C2",
+      "required_ci_lanes": [
+        "product-org-boundary",
+        "contract",
+        "unit"
+      ],
+      "required_reviews": [
+        "governance",
+        "product-org-boundary"
+      ],
+      "required_non_claims": [
+        "no launch readiness",
+        "no customer-data readiness"
+      ],
+      "requires_contract_tests": true,
+      "requires_adversarial_review": true
+    },
+    {
+      "rule_id": "hermes.gateway-seam.requires-invariant-test",
+      "pattern": "(^|/)gateway/(run|runtime|platform|telegram|message|delivery|redaction|session|provider)",
+      "risk_class": "R3",
+      "complexity_class": "C3",
+      "required_ci_lanes": [
+        "gateway-invariant",
+        "unit"
+      ],
+      "required_reviews": [
+        "owner"
+      ],
+      "required_non_claims": [
+        "no runtime behavior change outside policy classification"
+      ],
+      "requires_contract_tests": true
+    }
+  ],
+  "claim_rules": [
+    {
+      "rule_id": "claim.production-readiness.blocked",
+      "pattern": "\\bproduction[-_ ]?read(?:y|iness)\\b|\\bprod(?:uction)? ready\\b",
+      "message": "Production readiness claims are blocked for org-rails policy changes.",
+      "required_non_claim": "no production readiness"
+    },
+    {
+      "rule_id": "claim.launch-readiness.blocked",
+      "pattern": "\\blaunch[-_ ]?read(?:y|iness)\\b|\\bready to launch\\b",
+      "message": "Launch readiness claims are blocked for org-rails policy changes.",
+      "required_non_claim": "no launch readiness"
+    },
+    {
+      "rule_id": "claim.live-bank-readiness.blocked",
+      "pattern": "\\blive[-_ ]?bank(?:ing)?[-_ ]?read(?:y|iness)\\b|\\blive bank\\b",
+      "message": "Live-bank readiness claims are blocked.",
+      "required_non_claim": "no live-bank readiness"
+    },
+    {
+      "rule_id": "claim.customer-data-readiness.blocked",
+      "pattern": "\\bcustomer[-_ ]?data[-_ ]?read(?:y|iness)\\b",
+      "message": "Customer-data readiness claims are blocked.",
+      "required_non_claim": "no customer-data readiness"
+    },
+    {
+      "rule_id": "claim.money-movement-authority.blocked",
+      "pattern": "\\bmoney[-_ ]?movement[-_ ]?authorit(?:y|ative)\\b|\\bauthorized money movement\\b",
+      "message": "Money-movement authority claims are blocked.",
+      "required_non_claim": "no money-movement authority"
+    },
+    {
+      "rule_id": "claim.branch-protection-bypass.blocked",
+      "pattern": "\\bbranch[-_ ]?protection[-_ ]?bypass\\b|\\bbypass\\w* branch protection\\b",
+      "message": "Branch protection bypass claims are blocked.",
+      "required_non_claim": "no branch protection bypass"
+    }
+  ],
+  "ruleset_hash": "sha256:447010f4fc71c86e6a8ee93b17004d13430cea95d547afb1dedec650450312eb"
+}

@@ -1,1 +1,27 @@
-{"risk_class":"R2","complexity_class":"C2","required_ci_lanes":["unit","security"],"required_reviews":["owner"],"required_non_claims":["No protected readiness claim."],"requires_runtime_payload_contract":false,"requires_contract_tests":false,"requires_generated_artifact_check":false,"requires_artifact_pointer_check":false,"requires_repo_hygiene_check":true,"merge_blockers":[],"warnings":[]}
+{
+  "risk_class": "R2",
+  "complexity_class": "C2",
+  "required_ci_lanes": [
+    "unit",
+    "security"
+  ],
+  "required_reviews": [
+    "owner"
+  ],
+  "required_non_claims": [
+    "No protected readiness claim."
+  ],
+  "requires_runtime_payload_contract": false,
+  "requires_contract_tests": false,
+  "requires_generated_artifact_check": false,
+  "requires_artifact_pointer_check": false,
+  "requires_repo_hygiene_check": true,
+  "merge_blockers": [],
+  "warnings": [],
+  "policy_version": "0.1.0",
+  "ruleset_hash": "sha256:447010f4fc71c86e6a8ee93b17004d13430cea95d547afb1dedec650450312eb",
+  "requires_adversarial_review": false,
+  "matched_rules": [
+    "protected.token-vault.requires-security"
+  ]
+}

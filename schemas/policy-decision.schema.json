@@ -1,1 +1,26 @@
-{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"PolicyDecision","type":"object","required":["risk_class","complexity_class","required_ci_lanes","required_reviews","required_non_claims","requires_runtime_payload_contract","requires_contract_tests","requires_generated_artifact_check","requires_artifact_pointer_check","requires_repo_hygiene_check","merge_blockers","warnings"],"properties":{"risk_class":{"enum":["R0","R1","R2","R3","R4"]},"complexity_class":{"enum":["C0","C1","C2","C3","C4"]},"required_ci_lanes":{"type":"array","items":{"type":"string"}},"required_reviews":{"type":"array","items":{"type":"string"}},"required_non_claims":{"type":"array","items":{"type":"string"}},"requires_runtime_payload_contract":{"type":"boolean"},"requires_contract_tests":{"type":"boolean"},"requires_generated_artifact_check":{"type":"boolean"},"requires_artifact_pointer_check":{"type":"boolean"},"requires_repo_hygiene_check":{"type":"boolean"},"merge_blockers":{"type":"array","items":{"type":"string"}},"warnings":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neoengine.ai/schemas/policy-decision.schema.json",
+  "title": "Org Rails Policy Decision",
+  "type": "object",
+  "required": ["policy_version", "ruleset_hash", "risk_class", "complexity_class", "required_ci_lanes", "required_reviews", "required_non_claims", "requires_runtime_payload_contract", "requires_contract_tests", "requires_generated_artifact_check", "requires_artifact_pointer_check", "requires_repo_hygiene_check", "requires_adversarial_review", "merge_blockers", "warnings", "matched_rules"],
+  "properties": {
+    "policy_version": { "type": "string" },
+    "ruleset_hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "risk_class": { "enum": ["R0", "R1", "R2", "R3", "R4"] },
+    "complexity_class": { "enum": ["C0", "C1", "C2", "C3", "C4"] },
+    "required_ci_lanes": { "type": "array", "items": { "type": "string" } },
+    "required_reviews": { "type": "array", "items": { "type": "string" } },
+    "required_non_claims": { "type": "array", "items": { "type": "string" } },
+    "requires_runtime_payload_contract": { "type": "boolean" },
+    "requires_contract_tests": { "type": "boolean" },
+    "requires_generated_artifact_check": { "type": "boolean" },
+    "requires_artifact_pointer_check": { "type": "boolean" },
+    "requires_repo_hygiene_check": { "type": "boolean" },
+    "requires_adversarial_review": { "type": "boolean" },
+    "merge_blockers": { "type": "array", "items": { "type": "object", "required": ["rule_id", "message", "severity"], "properties": { "rule_id": { "type": "string" }, "message": { "type": "string" }, "severity": { "enum": ["error", "warning"] } }, "additionalProperties": false } },
+    "warnings": { "type": "array", "items": { "type": "object", "required": ["rule_id", "message"], "properties": { "rule_id": { "type": "string" }, "message": { "type": "string" } }, "additionalProperties": false } },
+    "matched_rules": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": false
+}
