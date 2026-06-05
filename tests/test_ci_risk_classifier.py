@@ -306,3 +306,17 @@ def test_readiness_split_and_downstream_matrix_are_dry_run_only() -> None:
     assert "not_downstream_ci_matrix_enforced" in matrix["non_claims"]
     assert "not_cross_repo_propagated" in matrix["non_claims"]
     assert "not_support_or_marketing_classifier_implemented" in matrix["non_claims"]
+
+
+def test_pull_request_template_contains_classifier_policy_and_non_claim_blocks() -> None:
+    template = (Path(__file__).resolve().parents[1] / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text(encoding="utf-8")
+
+    assert "## Risk, Complexity, Review, and CI Classification" in template
+    assert "- Risk class:" in template
+    assert "- Complexity class:" in template
+    assert "- Required CI lanes:" in template
+    assert "## Policy decision output" in template
+    assert "## Non-claims" in template
+    assert "does not claim production readiness" in template
+    assert "does not claim launch readiness" in template
+    assert "does not bypass branch protection" in template

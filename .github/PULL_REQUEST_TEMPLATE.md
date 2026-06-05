@@ -54,6 +54,31 @@ Fixes #
 - Expected state change:
 - Stop condition:
 
+
+## Policy decision output
+
+<!-- Paste `python3 scripts/ci/org_enablement_policy_check.py --changed-files <changed-files> --repo hermes-agent --json` output or the PR Risk Classifier summary. If stronger than the manual declaration above, the classifier output is authoritative. -->
+
+- policy_version:
+- ruleset_hash:
+- risk_class:
+- complexity_class:
+- required_ci_lanes:
+- required_reviews:
+- merge_blockers:
+
+## Non-claims
+
+- This PR does not claim production readiness.
+- This PR does not claim launch readiness.
+- This PR does not claim live-bank readiness.
+- This PR does not claim customer-data readiness.
+- This PR does not claim money-movement authority.
+- This PR does not claim protected approval.
+- This PR does not bypass branch protection.
+- This PR does not add live OAuth/banking/account-connection behavior unless explicitly scoped and gated.
+- This PR does not rewrite history.
+
 ## Review Receipt
 
 <!-- Optional until review receipt validation is enforced. Repeat this section for each review receipt. -->
