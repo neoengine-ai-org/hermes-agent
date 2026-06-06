@@ -99,7 +99,7 @@ escalation reason.
 
 ## Review Receipt
 
-<!-- Tier-4 classification is merge-blocking: CI success alone is insufficient. Tier 4 requires a completed opposite_frontier receipt, tier4_authority_waiver, or tier4_break_glass receipt. Failed review attempts/auth failures, Codex-only review, same-family review, same-provider review, or comments saying review was attempted do not satisfy Tier 4. opposite_frontier must prove opposite frontier family, not merely a different provider label. Repeat this section for each review receipt. -->
+<!-- Tier-4 classification is merge-blocking: CI success alone is insufficient. Tier 4 requires a completed opposite_frontier receipt, tier4_authority_waiver, or tier4_break_glass receipt. Failed review attempts/auth failures, Codex-only review, same-family review, same-provider review, or comments saying review was attempted do not satisfy Tier 4. opposite_frontier must prove opposite frontier family, not merely a different provider label. Repeat this section for each review receipt. For the proven Copilot Anthropic route, see docs/runbooks/tier4-opposite-frontier-review-route.md; do not use OpenAI/Codex as opposite-frontier for OpenAI-built work, do not fabricate receipts, and repeat review whenever the head SHA changes. -->
 
 - review_type: codex_engineering/secondary/adversarial/opposite_provider_adversarial/opposite_frontier/tier4_authority_waiver/tier4_break_glass/human_protected/founder/security/finance_sensitive
 - provider:
