@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Validate required review receipts in advisory/dry-run mode.
+"""Validate required review receipts and Tier-4 merge satisfaction.
 
 Consumes the trusted PR risk classifier artifact and review receipts from PR-body
-Markdown and emits review-receipts.json / review-receipts.md. This script never
-exits non-zero for missing review evidence; PR #9 is dry-run reporting only.
+Markdown and emits review-receipts.json / review-receipts.md. By default the
+script reports readiness without failing so historical dry-run jobs can inspect
+artifacts; pass --enforce to make missing/invalid required review receipts a
+merge-blocking check failure.
 """
 
 from __future__ import annotations
@@ -15,15 +17,19 @@ from typing import Any, cast
 
 SCHEMA_VERSION = "review-receipts-dry-run.v1"
 RECEIPT_TYPES = {
+    "codex_engineering",
     "secondary",
     "adversarial",
     "opposite_provider_adversarial",
+    "opposite_frontier",
+    "tier4_authority_waiver",
+    "tier4_break_glass",
     "human_protected",
     "founder",
     "security",
     "finance_sensitive",
 }
-PASSING_VERDICTS = {"PASS", "PASS_WITH_CAVEATS"}
+PASSING_VERDICTS = {"PASS", "PASS_WITH_CAVEATS", "ACCEPTED_WITH_FINDINGS", "WAIVED_BY_AUTHORITY", "BREAK_GLASS"}
 BLOCKING_VERDICTS = {
     "REQUEST_CHANGES",
     "PARK",
@@ -70,6 +76,14 @@ def _bool_value(value: object) -> bool:
 def _required_review_types(classification: dict[str, object]) -> list[str]:
     required = set()
     required_reviews = set(_list_value(classification.get("required_reviews", [])))
+    try:
+        model_tier = int(str(classification.get("model_tier_required", 0)))
+    except (TypeError, ValueError):
+        model_tier = 0
+    if model_tier == 3 or "codex_engineering_review_required" in required_reviews:
+        required.add("codex_engineering")
+    if model_tier >= 4 or classification.get("opposite_frontier_required") or "opposite_frontier_cc_review_required" in required_reviews:
+        required.add("opposite_frontier")
     if classification.get("secondary_review_required") or "secondary_review_required" in required_reviews:
         required.add("secondary")
     if classification.get("adversarial_review_required") or "adversarial_review_required" in required_reviews:
@@ -181,10 +195,29 @@ def _receipt_invalid_reasons(
             reasons.append(f"same_provider_fallback_without_reason:{review_type}")
         if not _fallback_allowed_for_risk(risk_class):
             reasons.append(f"same_provider_fallback_not_allowed_for_risk:{risk_class}:{review_type}")
-    elif review_type == "opposite_provider_adversarial" and primary_provider:
+    elif review_type in {"opposite_provider_adversarial", "opposite_frontier"} and primary_provider:
         if str(receipt.get("provider", "")).strip().lower() == primary_provider.strip().lower():
             reasons.append(f"same_provider_without_fallback:{review_type}")
+    if review_type == "opposite_frontier" and receipt.get("same_provider_fallback") == "yes":
+        reasons.append("same_provider_fallback_not_allowed_for_opposite_frontier")
+    if review_type == "tier4_authority_waiver" and verdict != "WAIVED_BY_AUTHORITY":
+        reasons.append(f"authority_waiver_requires_waived_by_authority:{verdict or 'missing'}")
+    if review_type == "tier4_break_glass" and verdict != "BREAK_GLASS":
+        reasons.append(f"break_glass_requires_break_glass_verdict:{verdict or 'missing'}")
     return reasons
+
+
+def _tier4_required(classification: dict[str, object]) -> bool:
+    required_reviews = set(_list_value(classification.get("required_reviews", [])))
+    try:
+        model_tier = int(str(classification.get("model_tier_required", 0)))
+    except (TypeError, ValueError):
+        model_tier = 0
+    return bool(
+        model_tier >= 4
+        or classification.get("opposite_frontier_required")
+        or "opposite_frontier_cc_review_required" in required_reviews
+    )
 
 
 def validate_review_receipts(
@@ -194,6 +227,7 @@ def validate_review_receipts(
     current_head_sha: str,
     current_base_sha: str = "unknown",
     primary_provider: str = "",
+    enforced: bool = False,
 ) -> dict[str, object]:
     normalized_receipts = [_normalize_receipt(receipt) for receipt in receipts]
     required = _required_review_types(classification)
@@ -216,15 +250,32 @@ def validate_review_receipts(
             review_type = str(receipt["review_type"])
             valid_by_type.setdefault(review_type, []).append(receipt)
 
+    tier4_required = _tier4_required(classification)
+    tier4_waiver_satisfied = bool(valid_by_type.get("tier4_authority_waiver") or valid_by_type.get("tier4_break_glass"))
+    if tier4_required and tier4_waiver_satisfied:
+        waiver_receipts = valid_by_type.get("tier4_authority_waiver", []) + valid_by_type.get("tier4_break_glass", [])
+        for review_type in required:
+            valid_by_type.setdefault(review_type, []).extend(waiver_receipts)
+
     missing = sorted(review_type for review_type in required if not valid_by_type.get(review_type))
     satisfied = sorted(review_type for review_type in required if valid_by_type.get(review_type))
     review_ready = not missing and not invalid_reasons
     body_ready = bool(classification.get("body_and_classification_ready", False))
     merge_blockers = _list_value(classification.get("merge_blocking_conditions", []))
     merge_ready = body_ready and review_ready and not merge_blockers
+    if tier4_required and not valid_by_type.get("opposite_frontier"):
+        merge_ready = False
+        merge_satisfaction_reason = "tier4_opposite_frontier_review_not_satisfied"
+    elif tier4_required and tier4_waiver_satisfied:
+        merge_satisfaction_reason = "tier4_authority_waiver_satisfied"
+    elif tier4_required:
+        merge_satisfaction_reason = "tier4_opposite_frontier_review_satisfied"
+    elif merge_ready:
+        merge_satisfaction_reason = "review_requirements_satisfied"
+    else:
+        merge_satisfaction_reason = "review_requirements_not_satisfied"
 
     non_claims = [
-        "dry_run_only",
         "not_dispatcher_enforced",
         "not_downstream_matrix_enforced",
         "not_cross_repo_propagated",
@@ -233,13 +284,15 @@ def validate_review_receipts(
         "not_provider_authenticated",
         "not_evidence_url_verified",
     ]
+    if not enforced:
+        non_claims.insert(0, "dry_run_only")
     return {
         "schema_version": SCHEMA_VERSION,
         "repo": classification.get("repo", "unknown"),
         "pr_number": classification.get("pr_number", "unknown"),
         "risk_class": risk_class,
         "complexity_class": classification.get("complexity_class", "unknown"),
-        "enforced": False,
+        "enforced": enforced,
         "evidence_verification_mode": "self_attested_pr_body_or_json",
         "non_claims": non_claims,
         "current_head_sha": current_head_sha,
@@ -253,6 +306,7 @@ def validate_review_receipts(
         "body_and_classification_ready": body_ready,
         "review_ready": review_ready,
         "merge_ready": merge_ready,
+        "merge_satisfaction_reason": merge_satisfaction_reason,
     }
 
 
@@ -269,6 +323,7 @@ def markdown_report(data: dict[str, object]) -> str:
         "body_and_classification_ready",
         "review_ready",
         "merge_ready",
+        "merge_satisfaction_reason",
     ):
         value = data.get(key)
         rendered = str(value).lower() if isinstance(value, bool) else str(value)
@@ -302,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-sha", default="unknown")
     parser.add_argument("--primary-provider", default="codex")
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--enforce", action="store_true", help="Exit non-zero when review requirements are not merge-satisfied")
     args = parser.parse_args(argv)
 
     classification = json.loads(Path(args.classification).read_text(encoding="utf-8"))
@@ -321,13 +377,14 @@ def main(argv: list[str] | None = None) -> int:
         current_head_sha=args.head_sha,
         current_base_sha=args.base_sha,
         primary_provider=args.primary_provider,
+        enforced=args.enforce,
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "review-receipts.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     (out_dir / "review-receipts.md").write_text(markdown_report(result), encoding="utf-8")
     print(json.dumps(result, indent=2, sort_keys=True))
-    return 0
+    return 0 if (not args.enforce or result["merge_ready"]) else 1
 
 
 if __name__ == "__main__":
