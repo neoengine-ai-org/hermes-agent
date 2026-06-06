@@ -265,7 +265,7 @@ jobs:
             # Tier-4 satisfaction contract. Only this bootstrap PR may use the
             # PR-head validator to prove the new gate; later PRs fail closed until
             # their base branch already contains --enforce.
-            if [ "${{ github.event.pull_request.number }}" != "__BOOTSTRAP_PR_NUMBER__" ]; then
+            if [ "${{ github.event.pull_request.number }}" != "21" ]; then
               echo "::error::trusted review receipt validator lacks --enforce; refusing non-bootstrap PR"
               exit 2
             fi
