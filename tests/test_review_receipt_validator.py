@@ -316,13 +316,24 @@ def test_tier4_authority_waiver_satisfies_merge_gate() -> None:
             model_tier_required=4,
             cc_review_required=True,
             opposite_frontier_required=True,
-            required_reviews=["opposite_frontier_cc_review_required"],
+            secondary_review_required=True,
+            adversarial_review_required=True,
+            opposite_provider_required=True,
+            human_gate_required=True,
+            required_reviews=[
+                "secondary_review_required",
+                "adversarial_review_required",
+                "opposite_provider_adversarial_required",
+                "protected_human_review_required",
+                "opposite_frontier_cc_review_required",
+            ],
         ),
         [receipt("tier4_authority_waiver", provider="human", verdict="WAIVED_BY_AUTHORITY")],
     )
 
     assert result["review_ready"] is True
     assert result["merge_ready"] is True
+    assert result["missing_required_review_types"] == []
     assert result["merge_satisfaction_reason"] == "tier4_authority_waiver_satisfied"
 
 

@@ -252,10 +252,10 @@ def validate_review_receipts(
 
     tier4_required = _tier4_required(classification)
     tier4_waiver_satisfied = bool(valid_by_type.get("tier4_authority_waiver") or valid_by_type.get("tier4_break_glass"))
-    if tier4_required and tier4_waiver_satisfied and "opposite_frontier" in required:
-        valid_by_type.setdefault("opposite_frontier", []).extend(
-            valid_by_type.get("tier4_authority_waiver", []) + valid_by_type.get("tier4_break_glass", [])
-        )
+    if tier4_required and tier4_waiver_satisfied:
+        waiver_receipts = valid_by_type.get("tier4_authority_waiver", []) + valid_by_type.get("tier4_break_glass", [])
+        for review_type in required:
+            valid_by_type.setdefault(review_type, []).extend(waiver_receipts)
 
     missing = sorted(review_type for review_type in required if not valid_by_type.get(review_type))
     satisfied = sorted(review_type for review_type in required if valid_by_type.get(review_type))
