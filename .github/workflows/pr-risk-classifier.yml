@@ -240,7 +240,7 @@ jobs:
           Path('downstream-matrix.json').write_text(json.dumps(matrix, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
 
-      - name: Validate review receipts dry-run
+      - name: Enforce tier review satisfaction
         if: always()
         run: |
           if [ ! -f ci-classification.json ]; then
@@ -257,13 +257,30 @@ jobs:
             VALIDATOR=pr-head/scripts/review_receipt_validator.py
             echo pr-head-bootstrap-telemetry > review-receipt-validator-source.txt
           fi
+          if python "$VALIDATOR" --help | grep -q -- '--enforce'; then
+            ENFORCE_ARGS=(--enforce)
+          else
+            # Bootstrap compatibility for cc-review-tier4-merge-gate-v1. Before
+            # this PR lands, the trusted base validator cannot enforce the new
+            # Tier-4 satisfaction contract. Only this bootstrap PR may use the
+            # PR-head validator to prove the new gate; later PRs fail closed until
+            # their base branch already contains --enforce.
+            if [ "${{ github.event.pull_request.number }}" != "__BOOTSTRAP_PR_NUMBER__" ]; then
+              echo "::error::trusted review receipt validator lacks --enforce; refusing non-bootstrap PR"
+              exit 2
+            fi
+            VALIDATOR=pr-head/scripts/review_receipt_validator.py
+            echo pr-head-bootstrap-enforcement > review-receipt-validator-source.txt
+            ENFORCE_ARGS=(--enforce)
+          fi
           python "$VALIDATOR" \
             --classification ci-classification.json \
             --pr-body pr-body.md \
             --head-sha "${{ github.event.pull_request.head.sha }}" \
             --base-sha "${{ github.event.pull_request.base.sha }}" \
             --primary-provider codex \
-            --output-dir .
+            --output-dir . \
+            "${ENFORCE_ARGS[@]}"
 
       - name: Backfill dry-run review readiness outputs
         if: always()
@@ -290,7 +307,7 @@ jobs:
           classification['merge_ready'] = body_ready and review_ready and not merge_blockers
           classification['review_receipt_validation'] = {
               'schema_version': receipts.get('schema_version'),
-              'enforced': False,
+              'enforced': receipts.get('enforced', False),
               'evidence_verification_mode': receipts.get('evidence_verification_mode'),
               'non_claims': receipts.get('non_claims', []),
               'review_ready_dry_run': review_ready,

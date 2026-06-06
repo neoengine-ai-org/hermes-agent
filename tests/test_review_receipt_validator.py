@@ -243,6 +243,137 @@ def test_security_and_finance_receipts_are_required_from_required_reviews() -> N
     assert result["required_review_types"] == ["finance_sensitive", "security"]
 
 
+def test_tier4_pr_cannot_merge_with_failed_opposite_frontier_attempt() -> None:
+    result = validate(
+        classification(
+            risk_class="R4",
+            complexity_class="C4",
+            model_tier_required=4,
+            cc_review_required=True,
+            opposite_frontier_required=True,
+            required_reviews=["opposite_frontier_cc_review_required"],
+        ),
+        [
+            receipt(
+                "opposite_frontier",
+                provider="claude",
+                verdict="FAILED_AUTH",
+                evidence_url_or_path="401 Invalid authentication credentials",
+            )
+        ],
+    )
+
+    assert result["merge_ready"] is False
+    assert result["merge_satisfaction_reason"] == "tier4_opposite_frontier_review_not_satisfied"
+    assert "opposite_frontier" in result["missing_required_review_types"]
+    assert "blocking_verdict:opposite_frontier:FAILED_AUTH" in result["invalid_receipt_reasons"]
+
+
+def test_tier4_pr_cannot_merge_with_codex_only_review() -> None:
+    result = review_receipt_validator.validate_review_receipts(
+        classification(
+            risk_class="R4",
+            complexity_class="C4",
+            model_tier_required=4,
+            cc_review_required=True,
+            opposite_frontier_required=True,
+            required_reviews=["opposite_frontier_cc_review_required"],
+        ),
+        [receipt("opposite_frontier", provider="codex")],
+        current_head_sha=HEAD_SHA,
+        current_base_sha=BASE_SHA,
+        primary_provider="codex",
+    )
+
+    assert result["merge_ready"] is False
+    assert result["merge_satisfaction_reason"] == "tier4_opposite_frontier_review_not_satisfied"
+    assert "same_provider_without_fallback:opposite_frontier" in result["invalid_receipt_reasons"]
+
+
+def test_tier3_pr_can_merge_with_codex_engineering_review() -> None:
+    result = validate(
+        classification(
+            risk_class="R3",
+            complexity_class="C3",
+            model_tier_required=3,
+            cc_review_required=True,
+            opposite_frontier_required=False,
+            required_reviews=["codex_engineering_review_required"],
+        ),
+        [receipt("codex_engineering", provider="codex")],
+    )
+
+    assert result["review_ready"] is True
+    assert result["merge_ready"] is True
+    assert result["required_review_types"] == ["codex_engineering"]
+
+
+def test_tier4_authority_waiver_satisfies_merge_gate() -> None:
+    result = validate(
+        classification(
+            risk_class="R4",
+            complexity_class="C4",
+            model_tier_required=4,
+            cc_review_required=True,
+            opposite_frontier_required=True,
+            required_reviews=["opposite_frontier_cc_review_required"],
+        ),
+        [receipt("tier4_authority_waiver", provider="human", verdict="WAIVED_BY_AUTHORITY")],
+    )
+
+    assert result["review_ready"] is True
+    assert result["merge_ready"] is True
+    assert result["merge_satisfaction_reason"] == "tier4_authority_waiver_satisfied"
+
+
+def test_cli_enforce_fails_when_tier4_review_is_not_satisfied(tmp_path: Path) -> None:
+    classification_path = tmp_path / "ci-classification.json"
+    classification_path.write_text(
+        json.dumps(
+            classification(
+                risk_class="R4",
+                complexity_class="C4",
+                model_tier_required=4,
+                cc_review_required=True,
+                opposite_frontier_required=True,
+                required_reviews=["opposite_frontier_cc_review_required"],
+            )
+        ),
+        encoding="utf-8",
+    )
+    body_path = tmp_path / "body.md"
+    body_path.write_text("No review receipts here\n", encoding="utf-8")
+    output_dir = tmp_path / "out"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(MODULE_PATH),
+            "--classification",
+            str(classification_path),
+            "--pr-body",
+            str(body_path),
+            "--head-sha",
+            HEAD_SHA,
+            "--base-sha",
+            BASE_SHA,
+            "--output-dir",
+            str(output_dir),
+            "--enforce",
+        ],
+        cwd=ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    data = json.loads((output_dir / "review-receipts.json").read_text(encoding="utf-8"))
+    assert data["enforced"] is True
+    assert data["merge_ready"] is False
+    assert data["merge_satisfaction_reason"] == "tier4_opposite_frontier_review_not_satisfied"
+
+
 def test_parse_review_receipts_from_markdown() -> None:
     markdown = f"""
 ## Review Receipt: secondary

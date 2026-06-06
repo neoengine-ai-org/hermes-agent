@@ -99,9 +99,9 @@ escalation reason.
 
 ## Review Receipt
 
-<!-- Optional until review receipt validation is enforced. Repeat this section for each review receipt. -->
+<!-- Tier-4 classification is merge-blocking: CI success alone is insufficient. Tier 4 requires a completed opposite_frontier receipt, tier4_authority_waiver, or tier4_break_glass receipt. Failed review attempts/auth failures, Codex-only review, same-family review, or comments saying review was attempted do not satisfy Tier 4. Repeat this section for each review receipt. -->
 
-- review_type: secondary/adversarial/opposite_provider_adversarial/human_protected/founder/security/finance_sensitive
+- review_type: codex_engineering/secondary/adversarial/opposite_provider_adversarial/opposite_frontier/tier4_authority_waiver/tier4_break_glass/human_protected/founder/security/finance_sensitive
 - provider:
 - reviewer_identity:
 - same_provider_fallback: yes/no
@@ -109,7 +109,7 @@ escalation reason.
 - pr_reviewed:
 - head_sha_reviewed:
 - base_sha_reviewed:
-- verdict: PASS/PASS_WITH_CAVEATS/REQUEST_CHANGES/PARK/SUPERSEDE/PROTECTED_GATE_REQUIRED/MERGE_REPAIR_REQUIRED
+- verdict: PASS/PASS_WITH_CAVEATS/ACCEPTED_WITH_FINDINGS/WAIVED_BY_AUTHORITY/BREAK_GLASS/REQUEST_CHANGES/PARK/SUPERSEDE/PROTECTED_GATE_REQUIRED/MERGE_REPAIR_REQUIRED
 - material_findings:
 - unresolved_blockers:
 - protected_claims_checked:
