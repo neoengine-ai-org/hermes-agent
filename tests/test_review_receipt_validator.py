@@ -46,6 +46,11 @@ def receipt(review_type: str, **overrides: object) -> dict[str, object]:
     data: dict[str, object] = {
         "review_type": review_type,
         "provider": "codex",
+        "model": "",
+        "provider_family": "",
+        "reviewer_family": "",
+        "primary_builder_family": "",
+        "family_relation": "",
         "reviewer_identity": f"{review_type}-reviewer",
         "same_provider_fallback": "no",
         "fallback_reason": "",
@@ -288,6 +293,62 @@ def test_tier4_pr_cannot_merge_with_codex_only_review() -> None:
     assert result["merge_ready"] is False
     assert result["merge_satisfaction_reason"] == "tier4_opposite_frontier_review_not_satisfied"
     assert "same_provider_without_fallback:opposite_frontier" in result["invalid_receipt_reasons"]
+
+
+def test_tier4_opposite_frontier_rejects_same_frontier_family_even_when_provider_differs() -> None:
+    result = validate(
+        classification(
+            risk_class="R4",
+            complexity_class="C4",
+            model_tier_required=4,
+            cc_review_required=True,
+            opposite_frontier_required=True,
+            required_reviews=["opposite_frontier_cc_review_required"],
+        ),
+        [
+            receipt(
+                "opposite_frontier",
+                provider="gpt-5.5",
+                model="gpt-5.5",
+                provider_family="openai",
+                reviewer_family="openai",
+                primary_builder_family="openai",
+                family_relation="opposite_frontier",
+            )
+        ],
+    )
+
+    assert result["merge_ready"] is False
+    assert result["merge_satisfaction_reason"] == "tier4_opposite_frontier_review_not_satisfied"
+    assert "same_frontier_family_not_allowed_for_opposite_frontier" in result["invalid_receipt_reasons"]
+
+
+def test_tier4_opposite_frontier_accepts_explicit_opposite_frontier_family() -> None:
+    result = validate(
+        classification(
+            risk_class="R4",
+            complexity_class="C4",
+            model_tier_required=4,
+            cc_review_required=True,
+            opposite_frontier_required=True,
+            required_reviews=["opposite_frontier_cc_review_required"],
+        ),
+        [
+            receipt(
+                "opposite_frontier",
+                provider="anthropic",
+                model="claude-opus-4.5",
+                provider_family="anthropic",
+                reviewer_family="anthropic",
+                primary_builder_family="openai",
+                family_relation="opposite_frontier",
+            )
+        ],
+    )
+
+    assert result["review_ready"] is True
+    assert result["merge_ready"] is True
+    assert result["merge_satisfaction_reason"] == "tier4_opposite_frontier_review_satisfied"
 
 
 def test_tier3_pr_can_merge_with_codex_engineering_review() -> None:

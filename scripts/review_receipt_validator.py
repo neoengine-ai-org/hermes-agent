@@ -40,6 +40,11 @@ BLOCKING_VERDICTS = {
 RECEIPT_FIELDS = [
     "review_type",
     "provider",
+    "model",
+    "provider_family",
+    "reviewer_family",
+    "primary_builder_family",
+    "family_relation",
     "reviewer_identity",
     "same_provider_fallback",
     "fallback_reason",
@@ -111,6 +116,11 @@ def _normalize_receipt(receipt: dict[str, object]) -> dict[str, object]:
     normalized = {field: receipt.get(field, "") for field in RECEIPT_FIELDS}
     normalized["review_type"] = str(normalized["review_type"]).strip()
     normalized["provider"] = str(normalized["provider"]).strip()
+    normalized["model"] = str(normalized["model"]).strip()
+    normalized["provider_family"] = str(normalized["provider_family"]).strip().lower()
+    normalized["reviewer_family"] = str(normalized["reviewer_family"]).strip().lower()
+    normalized["primary_builder_family"] = str(normalized["primary_builder_family"]).strip().lower()
+    normalized["family_relation"] = str(normalized["family_relation"]).strip().lower()
     normalized["reviewer_identity"] = str(normalized["reviewer_identity"]).strip()
     normalized["same_provider_fallback"] = "yes" if _bool_value(normalized["same_provider_fallback"]) else "no"
     normalized["fallback_reason"] = str(normalized["fallback_reason"]).strip()
@@ -200,6 +210,20 @@ def _receipt_invalid_reasons(
             reasons.append(f"same_provider_without_fallback:{review_type}")
     if review_type == "opposite_frontier" and receipt.get("same_provider_fallback") == "yes":
         reasons.append("same_provider_fallback_not_allowed_for_opposite_frontier")
+    if review_type == "opposite_frontier":
+        for field in ("model", "provider_family", "reviewer_family", "primary_builder_family", "family_relation"):
+            if not receipt.get(field):
+                reasons.append(f"missing_receipt_field:{review_type}:{field}")
+        provider_family = str(receipt.get("provider_family", "")).strip().lower()
+        reviewer_family = str(receipt.get("reviewer_family", "")).strip().lower()
+        primary_builder_family = str(receipt.get("primary_builder_family", "")).strip().lower()
+        family_relation = str(receipt.get("family_relation", "")).strip().lower()
+        if provider_family and reviewer_family and provider_family != reviewer_family:
+            reasons.append("provider_family_reviewer_family_mismatch_for_opposite_frontier")
+        if family_relation and family_relation != "opposite_frontier":
+            reasons.append(f"invalid_family_relation_for_opposite_frontier:{family_relation}")
+        if reviewer_family and primary_builder_family and reviewer_family == primary_builder_family:
+            reasons.append("same_frontier_family_not_allowed_for_opposite_frontier")
     if review_type == "tier4_authority_waiver" and verdict != "WAIVED_BY_AUTHORITY":
         reasons.append(f"authority_waiver_requires_waived_by_authority:{verdict or 'missing'}")
     if review_type == "tier4_break_glass" and verdict != "BREAK_GLASS":
