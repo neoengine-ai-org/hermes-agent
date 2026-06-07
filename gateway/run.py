@@ -7254,6 +7254,12 @@ class GatewayRunner:
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            if qcmd.get("pass_args"):
+                                import shlex
+
+                                raw_args = event.get_command_args().strip()
+                                if raw_args:
+                                    exec_cmd = f"{exec_cmd} {shlex.quote(raw_args)}"
                             # Sanitize env to prevent credential leakage —
                             # quick commands run in the gateway process which
                             # has all API keys in os.environ.
