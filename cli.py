@@ -8412,9 +8412,14 @@ class HermesCLI:
                 qcmd = quick_commands[base_cmd.lstrip("/")]
                 if qcmd.get("type") == "exec":
                     import subprocess
+                    import shlex
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
                         try:
+                            if qcmd.get("pass_args"):
+                                user_args = cmd_original[len(base_cmd):].strip()
+                                if user_args:
+                                    exec_cmd = f"{exec_cmd} {shlex.quote(user_args)}"
                             # shell=True is intentional: quick_commands are user-defined
                             # shell snippets from config.yaml — not agent/LLM controlled.
                             result = subprocess.run(
