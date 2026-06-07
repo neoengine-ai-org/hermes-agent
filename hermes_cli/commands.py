@@ -1127,8 +1127,6 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         "provider",
         "set-home",
         "fork",
-        "approve",
-        "deny",
     ]
 
     def _norm_menu(name: str) -> str:
