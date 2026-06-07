@@ -1119,7 +1119,6 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         "qwen-ops",
         "qwen",
         "qwenops",
-        "qwen_ops",
         "memory-status",
         "memory-search",
         "memory-write",
