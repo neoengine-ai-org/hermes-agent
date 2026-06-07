@@ -1084,22 +1084,33 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # First pass: canonical names (so they win slots if we hit the cap).
+    def _add_command_variant(name: str) -> None:
+        for cmd in COMMAND_REGISTRY:
+            if not _is_gateway_available(cmd, overrides):
+                continue
+            if name == cmd.name:
+                _add(cmd.name, cmd.description, cmd.args_hint or "")
+                return
+            if name in cmd.aliases:
+                _add(name, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+                return
+
+    for priority_name in ("btw", "stop", "model", "help"):
+        _add_command_variant(priority_name)
+
+    # Add each canonical command with its aliases immediately after it.  This
+    # keeps high-value aliases such as /btw and /q from being pushed past
+    # Slack's 50-command clamp as the registry grows.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
-
-    # Second pass: aliases.
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation
             # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
 
-    # Third pass: plugin commands.
+    # Second pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
 
