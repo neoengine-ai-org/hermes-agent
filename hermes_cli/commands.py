@@ -509,8 +509,8 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
-        if cmd.gateway_only:
-            # Gateway-only helper surfaces remain routable when typed, but
+        if cmd.gateway_only and cmd.name.startswith("memory-"):
+            # Mac-memory helper surfaces remain routable when typed, but
             # do not consume Telegram BotCommand menu slots.  Telegram and
             # Slack both have finite native-command menus; keep them focused
             # on cross-platform commands and use /help for helper discovery.
