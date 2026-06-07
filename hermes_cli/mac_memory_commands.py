@@ -7,6 +7,8 @@ import shlex
 from pathlib import Path
 
 HELPER_DIR = Path(os.environ.get("ORG_MEMORY_HELPER_DIR", "/srv/conductors/bin"))
+REMOTE_HELPER_HOST = os.environ.get("ORG_MEMORY_REMOTE_HELPER_HOST", "qwen-ops-01").strip()
+REMOTE_HELPER_DIR = os.environ.get("ORG_MEMORY_REMOTE_HELPER_DIR", "/srv/conductors/bin").strip()
 SCRIPT_TIMEOUT_SECONDS = 20
 OUTPUT_LIMIT = 3500
 
@@ -22,9 +24,21 @@ def _compact(text: str) -> str:
 
 async def _run_helper(name: str, args: list[str] | None = None, stdin: str | None = None) -> str:
     helper = HELPER_DIR / name
-    if not helper.exists() or not os.access(helper, os.X_OK):
-        return f"WARN {name.replace('mac-', '').replace('-', '-')} helper_missing=true path={helper}"
     argv = [str(helper), *(args or [])]
+    if not helper.exists() or not os.access(helper, os.X_OK):
+        if not REMOTE_HELPER_HOST or not REMOTE_HELPER_DIR:
+            return f"WARN {name.replace('mac-', '').replace('-', '-')} helper_missing=true path={helper}"
+        remote_helper = f"{REMOTE_HELPER_DIR.rstrip('/')}/{name}"
+        remote_cmd = " ".join(shlex.quote(part) for part in [remote_helper, *(args or [])])
+        argv = [
+            "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "StrictHostKeyChecking=yes",
+            REMOTE_HELPER_HOST,
+            remote_cmd,
+        ]
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,

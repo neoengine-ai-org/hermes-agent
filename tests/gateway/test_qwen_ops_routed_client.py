@@ -1,5 +1,6 @@
 """Tests for qwen-ops as a routed Hermes gateway client."""
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +14,7 @@ from gateway.qwen_ops import (
     QWEN_OPS_MODEL_COMMAND_TEXT,
     build_qwen_ops_escalation_packet,
 )
+from gateway.run import _record_qwen_ops_memory_ingress
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from hermes_cli.commands import (
     GATEWAY_KNOWN_COMMANDS,
@@ -76,6 +78,23 @@ def _make_session_entry(source: SessionSource | None = None) -> SessionEntry:
         chat_type=source.chat_type,
         total_tokens=0,
     )
+
+
+def test_qwen_ops_memory_ingress_receipt_records_actual_telegram_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("QWEN_OPS_TELEGRAM_INGRESS_LOG_DIR", str(tmp_path))
+    event = _make_event("/memory-status", _make_source(platform=Platform.TELEGRAM, chat_id="8686503732"))
+
+    _record_qwen_ops_memory_ingress(event, "memory-status", "PASS memory-status remote=mac-memory")
+
+    receipts = list(tmp_path.glob("telegram-memory-ingress-*.jsonl"))
+    assert len(receipts) == 1
+    payload = json.loads(receipts[0].read_text().strip())
+    assert payload["event_type"] == "TELEGRAM_MEMORY_COMMAND"
+    assert payload["command"] == "/memory-status"
+    assert payload["chat_source"] == "actual Telegram"
+    assert payload["bridge_invoked"] is True
+    assert payload["response_sent"] is True
+    assert payload["not_merge_evidence"] is True
 
 
 def _make_runner(

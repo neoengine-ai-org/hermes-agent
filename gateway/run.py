@@ -68,6 +68,47 @@ _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_QWEN_OPS_MEMORY_COMMANDS = {
+    "memory-status",
+    "memory-search",
+    "memory-write",
+    "memory-publish-drain",
+    "memory-publish-health",
+    "memory-latest",
+}
+
+
+def _record_qwen_ops_memory_ingress(event: Any, command: str, response: str) -> None:
+    """Record actual Telegram memory-command handling without exposing payloads."""
+    try:
+        source = getattr(event, "source", None)
+        platform = getattr(getattr(source, "platform", ""), "value", str(getattr(source, "platform", "")))
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        log_dir = Path(
+            os.environ.get(
+                "QWEN_OPS_TELEGRAM_INGRESS_LOG_DIR",
+                str(Path.home() / ".hermes" / "profiles" / "qwen-ops-runner-conductor" / "logs"),
+            )
+        )
+        log_dir.mkdir(parents=True, exist_ok=True)
+        bridge_invoked = bool(response.strip()) and "helper_missing=true" not in response and "error=TIMEOUT" not in response
+        payload = {
+            "event_type": "TELEGRAM_MEMORY_COMMAND",
+            "command": f"/{command}",
+            "chat_source": "actual Telegram" if platform == "telegram" else platform,
+            "received_at": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "runner": "qwen-ops-runner-conductor",
+            "chat_id": chat_id,
+            "bridge_invoked": bridge_invoked,
+            "response_sent": True,
+            "result": "handled" if bridge_invoked else "failed",
+            "not_merge_evidence": True,
+        }
+        stamp = datetime.utcnow().strftime("%Y%m%d")
+        with (log_dir / f"telegram-memory-ingress-{stamp}.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    except Exception as exc:  # pragma: no cover - receipt logging must never break chat
+        logger.warning("Failed to record qwen-ops memory ingress receipt: %s", exc)
 
 from gateway.runtime import status_message_filter as _status_message_filter
 from gateway.runtime.delivery_redaction import redact_gateway_user_facing_secrets
@@ -7151,9 +7192,11 @@ class GatewayRunner:
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
 
-        if canonical in {"memory-status", "memory-search", "memory-write", "memory-publish-drain", "memory-publish-health", "memory-latest"}:
+        if canonical in _QWEN_OPS_MEMORY_COMMANDS:
             from hermes_cli.mac_memory_commands import handle_memory_command
-            return await handle_memory_command(canonical, event.get_command_args())
+            _memory_response = await handle_memory_command(canonical, event.get_command_args())
+            _record_qwen_ops_memory_ingress(event, canonical, _memory_response)
+            return _memory_response
 
         if canonical == "retry":
             return await self._handle_retry_command(event)
