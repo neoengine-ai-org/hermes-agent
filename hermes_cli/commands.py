@@ -1111,6 +1111,46 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
 
+    # Keep Telegram's menu commands reachable as native Slack slashes when the
+    # 50-command cap forces curation.  Prefer dropping redundant aliases/helper
+    # conveniences over silently starving cross-platform menu commands; /hermes
+    # remains the escape hatch for anything omitted.
+    low_priority = [
+        "qwen-ops",
+        "qwen",
+        "qwenops",
+        "qwen_ops",
+        "memory-status",
+        "memory-search",
+        "memory-write",
+        "tasks",
+        "provider",
+        "set-home",
+        "fork",
+        "approve",
+        "deny",
+    ]
+
+    def _norm_menu(name: str) -> str:
+        return name.replace("-", "_").replace("__", "_").strip("_")
+
+    by_norm = {_norm_menu(name): (name, desc) for name, desc in telegram_bot_commands()}
+    reserved_norm = {_norm_menu(name) for name in _SLACK_RESERVED_COMMANDS}
+    for norm_name, (tg_name, tg_desc) in by_norm.items():
+        if norm_name in reserved_norm:
+            continue
+        if any(_norm_menu(name) == norm_name for name, _desc, _hint in entries):
+            continue
+        while len(entries) >= _SLACK_MAX_SLASH_COMMANDS:
+            victim_idx = next(
+                (idx for idx, (name, _desc, _hint) in enumerate(entries) if name in low_priority),
+                None,
+            )
+            if victim_idx is None:
+                break
+            entries.pop(victim_idx)
+        _add(tg_name.replace("_", "-"), tg_desc, "")
+
     return entries
 
 
