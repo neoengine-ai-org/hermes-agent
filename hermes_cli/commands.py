@@ -55,6 +55,7 @@ class CommandDef:
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+    telegram_bot_menu: bool = True     # whether to expose in Telegram setMyCommands menu
 
 
 # ---------------------------------------------------------------------------
@@ -185,18 +186,22 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc")),
     CommandDef("memory-status", "Check qwen-ops Mac shared memory bridge", "Tools & Skills",
-               gateway_only=True, args_hint="[--ensure-dirs]"),
+               gateway_only=True, args_hint="[--ensure-dirs]",
+               telegram_bot_menu=False),
     CommandDef("memory-search", "Search approved Mac shared memory roots", "Tools & Skills",
-               gateway_only=True, args_hint="<term>"),
+               gateway_only=True, args_hint="<term>",
+               telegram_bot_menu=False),
     CommandDef("memory-write", "Write a proposed advisory note to Mac shared memory inbox", "Tools & Skills",
-               gateway_only=True, args_hint="<note>"),
+               gateway_only=True, args_hint="<note>",
+               telegram_bot_menu=False),
     CommandDef("memory-publish-drain", "Publish latest qwen-ops drain artifacts to Mac memory", "Tools & Skills",
-               gateway_only=True),
+               gateway_only=True, telegram_bot_menu=False),
     CommandDef("memory-publish-health", "Publish qwen-ops runner/Qwen health to Mac memory", "Tools & Skills",
-               gateway_only=True),
+               gateway_only=True, telegram_bot_menu=False),
     CommandDef("memory-latest", "Read compact latest qwen-ops memory record", "Tools & Skills",
                gateway_only=True, args_hint="<hourly|cycle|runner-health|qwen-health|inbox>",
-               subcommands=("hourly", "cycle", "runner-health", "qwen-health", "inbox")),
+               subcommands=("hourly", "cycle", "runner-health", "qwen-health", "inbox"),
+               telegram_bot_menu=False),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -508,6 +513,8 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
+            continue
+        if not cmd.telegram_bot_menu:
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -1085,17 +1092,31 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         seen.add(slack_name)
 
     def _add_command_variant(name: str) -> None:
+        requested = name.strip().lstrip("/")
+        requested_tg = _sanitize_telegram_name(requested)
         for cmd in COMMAND_REGISTRY:
             if not _is_gateway_available(cmd, overrides):
                 continue
-            if name == cmd.name:
+            if requested == cmd.name or requested_tg == _sanitize_telegram_name(cmd.name):
                 _add(cmd.name, cmd.description, cmd.args_hint or "")
                 return
             if name in cmd.aliases:
                 _add(name, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
                 return
+            for alias in cmd.aliases:
+                if requested == alias or requested_tg == _sanitize_telegram_name(alias):
+                    _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+                    return
 
-    for priority_name in ("btw", "stop", "model", "help"):
+    # Seed Slack native slashes from Telegram's visible BotCommand menu first.
+    # Typed qwen-only routes such as /memory-latest remain dispatchable through
+    # the shared gateway, but are intentionally omitted from Telegram's global
+    # setMyCommands menu so the Slack/Telegram native-menu parity contract can
+    # stay inside Slack's 50-command cap.
+    for priority_name, _description in telegram_bot_commands():
+        _add_command_variant(priority_name)
+
+    for priority_name in ("btw", "bg", "reset", "q"):
         _add_command_variant(priority_name)
 
     # Add each canonical command with its aliases immediately after it.  This
