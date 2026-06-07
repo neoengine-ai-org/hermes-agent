@@ -1071,6 +1071,10 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     # Reserve /hermes as the catch-all top-level command.
     entries.append(("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]"))
     seen.add("hermes")
+    # /help is a core gateway command and a Slack test invariant; keep it out
+    # of the later 50-command cap competition with aliases/plugins.
+    entries.append(("help", "Show help and available commands", ""))
+    seen.add("help")
 
     def _add(name: str, desc: str, hint: str) -> None:
         slack_name = _sanitize_slack_name(name)
@@ -1084,16 +1088,14 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # First pass: canonical names (so they win slots if we hit the cap).
+    # Add each gateway command with its aliases while registry order is still
+    # respected.  Aliases for early/core commands (notably /btw for
+    # /background) must not be starved by later canonical entries when Slack's
+    # 50-command cap is reached.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
-
-    # Second pass: aliases.
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation
             # normalization (already covered by _add dedup).
