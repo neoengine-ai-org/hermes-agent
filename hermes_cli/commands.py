@@ -184,6 +184,19 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "archive", "tail", "dispatch", "stats", "notify-subscribe",
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc")),
+    CommandDef("memory-status", "Check qwen-ops Mac shared memory bridge", "Tools & Skills",
+               gateway_only=True, args_hint="[--ensure-dirs]"),
+    CommandDef("memory-search", "Search approved Mac shared memory roots", "Tools & Skills",
+               gateway_only=True, args_hint="<term>"),
+    CommandDef("memory-write", "Write a proposed advisory note to Mac shared memory inbox", "Tools & Skills",
+               gateway_only=True, args_hint="<note>"),
+    CommandDef("memory-publish-drain", "Publish latest qwen-ops drain artifacts to Mac memory", "Tools & Skills",
+               gateway_only=True),
+    CommandDef("memory-publish-health", "Publish qwen-ops runner/Qwen health to Mac memory", "Tools & Skills",
+               gateway_only=True),
+    CommandDef("memory-latest", "Read compact latest qwen-ops memory record", "Tools & Skills",
+               gateway_only=True, args_hint="<hourly|cycle|runner-health|qwen-health|inbox>",
+               subcommands=("hourly", "cycle", "runner-health", "qwen-health", "inbox")),
     CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
                cli_only=True),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
@@ -495,6 +508,12 @@ def telegram_bot_commands() -> list[tuple[str, str]]:
     result: list[tuple[str, str]] = []
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
+            continue
+        if cmd.gateway_only and cmd.name.startswith("memory-"):
+            # Mac-memory helper surfaces remain routable when typed, but
+            # do not consume Telegram BotCommand menu slots.  Telegram and
+            # Slack both have finite native-command menus; keep them focused
+            # on cross-platform commands and use /help for helper discovery.
             continue
         # Built-in arg-taking commands are included — their handlers show
         # usage text when invoked without arguments, and hiding them from
@@ -1058,6 +1077,10 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     # Reserve /hermes as the catch-all top-level command.
     entries.append(("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]"))
     seen.add("hermes")
+    # /help is a core gateway command and a Slack test invariant; keep it out
+    # of the later 50-command cap competition with aliases/plugins.
+    entries.append(("help", "Show help and available commands", ""))
+    seen.add("help")
 
     def _add(name: str, desc: str, hint: str) -> None:
         slack_name = _sanitize_slack_name(name)
@@ -1071,16 +1094,14 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # First pass: canonical names (so they win slots if we hit the cap).
+    # Add each gateway command with its aliases while registry order is still
+    # respected.  Aliases for early/core commands (notably /btw for
+    # /background) must not be starved by later canonical entries when Slack's
+    # 50-command cap is reached.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
-
-    # Second pass: aliases.
-    for cmd in COMMAND_REGISTRY:
-        if not _is_gateway_available(cmd, overrides):
-            continue
         for alias in cmd.aliases:
             # Skip aliases that only differ from canonical by case/punctuation
             # normalization (already covered by _add dedup).
@@ -1089,6 +1110,43 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     # Third pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
+
+    # Keep Telegram's menu commands reachable as native Slack slashes when the
+    # 50-command cap forces curation.  Prefer dropping redundant aliases/helper
+    # conveniences over silently starving cross-platform menu commands; /hermes
+    # remains the escape hatch for anything omitted.
+    low_priority = [
+        "qwen-ops",
+        "qwen",
+        "qwenops",
+        "memory-status",
+        "memory-search",
+        "memory-write",
+        "tasks",
+        "provider",
+        "set-home",
+        "fork",
+    ]
+
+    def _norm_menu(name: str) -> str:
+        return name.replace("-", "_").replace("__", "_").strip("_")
+
+    by_norm = {_norm_menu(name): (name, desc) for name, desc in telegram_bot_commands()}
+    reserved_norm = {_norm_menu(name) for name in _SLACK_RESERVED_COMMANDS}
+    for norm_name, (tg_name, tg_desc) in by_norm.items():
+        if norm_name in reserved_norm:
+            continue
+        if any(_norm_menu(name) == norm_name for name, _desc, _hint in entries):
+            continue
+        while len(entries) >= _SLACK_MAX_SLASH_COMMANDS:
+            victim_idx = next(
+                (idx for idx, (name, _desc, _hint) in enumerate(entries) if name in low_priority),
+                None,
+            )
+            if victim_idx is None:
+                break
+            entries.pop(victim_idx)
+        _add(tg_name.replace("_", "-"), tg_desc, "")
 
     return entries
 
