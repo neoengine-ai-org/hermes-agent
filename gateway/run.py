@@ -7151,6 +7151,10 @@ class GatewayRunner:
         if canonical == "kanban":
             return await self._handle_kanban_command(event)
 
+        if canonical in {"memory-status", "memory-search", "memory-write", "memory-publish-drain", "memory-publish-health", "memory-latest"}:
+            from hermes_cli.mac_memory_commands import handle_memory_command
+            return await handle_memory_command(canonical, event.get_command_args())
+
         if canonical == "retry":
             return await self._handle_retry_command(event)
         
