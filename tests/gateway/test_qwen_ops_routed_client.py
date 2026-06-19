@@ -1,5 +1,6 @@
 """Tests for qwen-ops as a routed Hermes gateway client."""
 
+import json
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +14,7 @@ from gateway.qwen_ops import (
     QWEN_OPS_MODEL_COMMAND_TEXT,
     build_qwen_ops_escalation_packet,
 )
+from gateway.run import _record_qwen_ops_memory_ingress
 from gateway.session import SessionEntry, SessionSource, build_session_key
 from hermes_cli.commands import (
     GATEWAY_KNOWN_COMMANDS,
@@ -76,6 +78,25 @@ def _make_session_entry(source: SessionSource | None = None) -> SessionEntry:
         chat_type=source.chat_type,
         total_tokens=0,
     )
+
+
+def test_qwen_ops_memory_ingress_receipt_records_actual_telegram_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("QWEN_OPS_TELEGRAM_INGRESS_LOG_DIR", str(tmp_path))
+    event = _make_event("/memory-status", _make_source(platform=Platform.TELEGRAM, chat_id="8686503732"))
+
+    _record_qwen_ops_memory_ingress(event, "memory-status", "PASS memory-status remote=mac-memory")
+
+    receipts = list(tmp_path.glob("telegram-memory-ingress-*.jsonl"))
+    assert len(receipts) == 1
+    payload = json.loads(receipts[0].read_text().strip())
+    assert payload["event_type"] == "TELEGRAM_MEMORY_COMMAND"
+    assert payload["command"] == "/memory-status"
+    assert payload["chat_source"] == "actual Telegram"
+    assert payload["bridge_invoked"] is True
+    assert payload["response_generated"] is True
+    assert payload["response_delivery_verified"] is False
+    assert "response_sent" not in payload
+    assert payload["not_merge_evidence"] is True
 
 
 def _make_runner(
@@ -328,3 +349,79 @@ def test_qwen_ops_has_no_extra_write_authority():
     packet = build_qwen_ops_escalation_packet("escalate codex fix failing test")
     assert "no qwen-ops execution" in packet
     assert "qwen-ops does not execute" in packet
+
+def test_qwen_ops_memory_ingress_marks_pre_helper_failures_not_invoked(tmp_path, monkeypatch):
+    monkeypatch.setenv("QWEN_OPS_TELEGRAM_INGRESS_LOG_DIR", str(tmp_path))
+    event = _make_event("/memory-search", _make_source(platform=Platform.TELEGRAM, chat_id="8686503732"))
+
+    _record_qwen_ops_memory_ingress(event, "memory-search", "FAIL memory-search error=MISSING_TERM")
+
+    payload = json.loads(next(tmp_path.glob("telegram-memory-ingress-*.jsonl")).read_text().strip())
+    assert payload["bridge_invoked"] is False
+    assert payload["result"] == "failed"
+
+
+def test_qwen_ops_memory_commands_are_hidden_from_native_menus_but_routable():
+    telegram_names = {name for name, _desc in telegram_bot_commands()}
+    for command in (
+        "memory-status",
+        "memory-search",
+        "memory-write",
+        "memory-publish-drain",
+        "memory-publish-health",
+        "memory-latest",
+    ):
+        assert command.replace("-", "_") not in telegram_names
+        assert command in GATEWAY_KNOWN_COMMANDS
+        assert resolve_command(command).name == command
+
+
+@pytest.mark.asyncio
+async def test_qwen_ops_memory_command_requires_explicit_telegram_chat_allowlist(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *args, **kwargs: [],
+        raising=False,
+    )
+    monkeypatch.delenv("QWEN_OPS_MEMORY_ALLOWED_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+    source = _make_source(platform=Platform.SLACK, chat_id="slack-room")
+    runner = _make_runner(_make_session_entry(source), platform=Platform.SLACK)
+
+    result = await runner._handle_message(_make_event("/memory-status", source))
+
+    assert "admin-only qwen-ops Telegram memory bridge" in result
+
+
+@pytest.mark.asyncio
+async def test_qwen_ops_memory_command_ignores_general_telegram_home_channel(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *args, **kwargs: [],
+        raising=False,
+    )
+    monkeypatch.delenv("QWEN_OPS_MEMORY_ALLOWED_CHATS", raising=False)
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "8686503732")
+    source = _make_source(platform=Platform.TELEGRAM, chat_id="8686503732")
+    runner = _make_runner(_make_session_entry(source), platform=Platform.TELEGRAM)
+
+    result = await runner._handle_message(_make_event("/memory-status", source))
+
+    assert "admin-only qwen-ops Telegram memory bridge" in result
+
+
+@pytest.mark.asyncio
+async def test_qwen_ops_memory_command_runs_for_allowlisted_telegram_chat(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda *args, **kwargs: [],
+        raising=False,
+    )
+    monkeypatch.setenv("QWEN_OPS_MEMORY_ALLOWED_CHATS", "8686503732")
+    monkeypatch.setattr("hermes_cli.mac_memory_commands.handle_memory_command", AsyncMock(return_value="PASS memory-status"))
+    source = _make_source(platform=Platform.TELEGRAM, chat_id="8686503732")
+    runner = _make_runner(_make_session_entry(source), platform=Platform.TELEGRAM)
+
+    result = await runner._handle_message(_make_event("/memory-status", source))
+
+    assert result == "PASS memory-status"

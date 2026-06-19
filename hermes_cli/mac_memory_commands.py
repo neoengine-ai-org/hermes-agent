@@ -7,6 +7,8 @@ import shlex
 from pathlib import Path
 
 HELPER_DIR = Path(os.environ.get("ORG_MEMORY_HELPER_DIR", "/srv/conductors/bin"))
+REMOTE_HELPER_HOST = os.environ.get("ORG_MEMORY_REMOTE_HELPER_HOST", "qwen-ops-01").strip()
+REMOTE_HELPER_DIR = os.environ.get("ORG_MEMORY_REMOTE_HELPER_DIR", "/srv/conductors/bin").strip()
 SCRIPT_TIMEOUT_SECONDS = 20
 OUTPUT_LIMIT = 3500
 
@@ -20,11 +22,36 @@ def _compact(text: str) -> str:
     return text
 
 
+def _safe_remote_helper_host(host: str) -> bool:
+    if not host or host.startswith("-"):
+        return False
+    return all(part and not part.startswith("-") for part in host.split("@", 1))
+
+
+def _remote_helper_argv(name: str, args: list[str] | None = None) -> list[str] | None:
+    if not REMOTE_HELPER_HOST or not REMOTE_HELPER_DIR or not _safe_remote_helper_host(REMOTE_HELPER_HOST):
+        return None
+    remote_helper = f"{REMOTE_HELPER_DIR.rstrip('/')}/{name}"
+    remote_cmd = " ".join(shlex.quote(part) for part in [remote_helper, *(args or [])])
+    return [
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        REMOTE_HELPER_HOST,
+        remote_cmd,
+    ]
+
+
 async def _run_helper(name: str, args: list[str] | None = None, stdin: str | None = None) -> str:
     helper = HELPER_DIR / name
-    if not helper.exists() or not os.access(helper, os.X_OK):
-        return f"WARN {name.replace('mac-', '').replace('-', '-')} helper_missing=true path={helper}"
     argv = [str(helper), *(args or [])]
+    if not helper.exists() or not os.access(helper, os.X_OK):
+        remote_argv = _remote_helper_argv(name, args or [])
+        if remote_argv is None:
+            return f"WARN {name.replace('mac-', '').replace('-', '-')} helper_missing=true path={helper}"
+        argv = remote_argv
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdin=asyncio.subprocess.PIPE if stdin is not None else None,
@@ -45,6 +72,8 @@ async def _run_helper(name: str, args: list[str] | None = None, stdin: str | Non
         await proc.wait()
         return f"FAIL {name.replace('mac-', '')} error=TIMEOUT"
     text = (out + err).decode(errors="replace")
+    if proc.returncode:
+        return _compact(f"FAIL {name} error=EXIT_{proc.returncode} {text}".strip())
     return _compact(text)
 
 

@@ -47,3 +47,115 @@ async def test_memory_search_passes_fixed_arg_without_shell_expansion(tmp_path: 
 
     assert result == "ok"
     assert output.read_text() == "['--fixed', 'alpha; echo should-not-run']"
+
+
+@pytest.mark.asyncio
+async def test_missing_local_helper_falls_back_to_qwen_ssh(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self, stdin=None):
+            captured["stdin"] = stdin
+            return b"PASS remote helper\n", b""
+
+        def kill(self):
+            captured["killed"] = True
+
+        async def wait(self):
+            return 0
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(mac_memory_commands, "HELPER_DIR", tmp_path / "missing")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_HOST", "qwen-ops-01")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_DIR", "/srv/conductors/bin")
+    monkeypatch.setattr(mac_memory_commands.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await mac_memory_commands.handle_memory_command("memory-search", "alpha; echo should-not-run")
+
+    assert result == "PASS remote helper"
+    argv = captured["argv"]
+    assert argv[:5] == (
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=yes",
+    )
+    assert argv[5] == "qwen-ops-01"
+    assert argv[6] == "/srv/conductors/bin/mac-memory-search --fixed 'alpha; echo should-not-run'"
+
+
+@pytest.mark.asyncio
+async def test_memory_write_sends_stdin_over_remote_ssh(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self, stdin=None):
+            captured["stdin"] = stdin
+            return b"PASS note written\n", b""
+
+        def kill(self):
+            captured["killed"] = True
+
+        async def wait(self):
+            return 0
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        captured["argv"] = argv
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr(mac_memory_commands, "HELPER_DIR", tmp_path / "missing")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_HOST", "qwen-ops-01")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_DIR", "/srv/conductors/bin")
+    monkeypatch.setattr(mac_memory_commands.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await mac_memory_commands.handle_memory_command("memory-write", "Title\nBody line")
+
+    assert result == "PASS note written"
+    assert captured["stdin"] == b"Body line"
+    assert captured["argv"][6] == "/srv/conductors/bin/mac-memory-write-note --stdin Title"
+
+@pytest.mark.asyncio
+async def test_remote_ssh_transport_failure_reports_fail_and_exit_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeProc:
+        returncode = 255
+
+        async def communicate(self, stdin=None):
+            return b"", b"ssh: connect to host qwen-ops-01 port 22: Connection refused\n"
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return 0
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(mac_memory_commands, "HELPER_DIR", tmp_path / "missing")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_HOST", "qwen-ops-01")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_DIR", "/srv/conductors/bin")
+    monkeypatch.setattr(mac_memory_commands.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await mac_memory_commands.handle_memory_command("memory-status", "")
+
+    assert result.startswith("FAIL mac-memory-status error=EXIT_255")
+    assert "Connection refused" in result
+
+
+def test_remote_helper_host_rejects_ssh_option_injection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(mac_memory_commands, "HELPER_DIR", tmp_path / "missing")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_HOST", "-oProxyCommand=sh")
+
+    result = mac_memory_commands._remote_helper_argv("mac-memory-status", [])
+
+    assert result is None
