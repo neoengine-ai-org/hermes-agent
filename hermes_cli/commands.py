@@ -1078,6 +1078,10 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     # Reserve /hermes as the catch-all top-level command.
     entries.append(("hermes", "Talk to Hermes or run a subcommand", "[subcommand] [args]"))
     seen.add("hermes")
+    # /help is a core gateway command and a Slack test invariant; keep it out
+    # of the later 50-command cap competition with aliases/plugins.
+    entries.append(("help", "Show help and available commands", ""))
+    seen.add("help")
 
     def _add(name: str, desc: str, hint: str) -> None:
         slack_name = _sanitize_slack_name(name)
@@ -1119,9 +1123,9 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     for priority_name in ("btw", "bg", "reset", "q"):
         _add_command_variant(priority_name)
 
-    # Add each canonical command with its aliases immediately after it.  This
-    # keeps high-value aliases such as /btw and /q from being pushed past
-    # Slack's 50-command clamp as the registry grows.
+    # Add each gateway command with aliases while registry order is still
+    # respected. Aliases for early/core commands must not be starved by later
+    # canonical entries when Slack's 50-command cap is reached.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
@@ -1134,6 +1138,43 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     # Second pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
+
+    # Keep Telegram's menu commands reachable as native Slack slashes when the
+    # 50-command cap forces curation.  Prefer dropping redundant aliases/helper
+    # conveniences over silently starving cross-platform menu commands; /hermes
+    # remains the escape hatch for anything omitted.
+    low_priority = [
+        "qwen-ops",
+        "qwen",
+        "qwenops",
+        "memory-status",
+        "memory-search",
+        "memory-write",
+        "tasks",
+        "provider",
+        "set-home",
+        "fork",
+    ]
+
+    def _norm_menu(name: str) -> str:
+        return name.replace("-", "_").replace("__", "_").strip("_")
+
+    by_norm = {_norm_menu(name): (name, desc) for name, desc in telegram_bot_commands()}
+    reserved_norm = {_norm_menu(name) for name in _SLACK_RESERVED_COMMANDS}
+    for norm_name, (tg_name, tg_desc) in by_norm.items():
+        if norm_name in reserved_norm:
+            continue
+        if any(_norm_menu(name) == norm_name for name, _desc, _hint in entries):
+            continue
+        while len(entries) >= _SLACK_MAX_SLASH_COMMANDS:
+            victim_idx = next(
+                (idx for idx, (name, _desc, _hint) in enumerate(entries) if name in low_priority),
+                None,
+            )
+            if victim_idx is None:
+                break
+            entries.pop(victim_idx)
+        _add(tg_name.replace("_", "-"), tg_desc, "")
 
     return entries
 
