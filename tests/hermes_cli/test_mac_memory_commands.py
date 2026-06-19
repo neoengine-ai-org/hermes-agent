@@ -123,3 +123,39 @@ async def test_memory_write_sends_stdin_over_remote_ssh(monkeypatch: pytest.Monk
     assert result == "PASS note written"
     assert captured["stdin"] == b"Body line"
     assert captured["argv"][6] == "/srv/conductors/bin/mac-memory-write-note --stdin Title"
+
+@pytest.mark.asyncio
+async def test_remote_ssh_transport_failure_reports_fail_and_exit_code(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FakeProc:
+        returncode = 255
+
+        async def communicate(self, stdin=None):
+            return b"", b"ssh: connect to host qwen-ops-01 port 22: Connection refused\n"
+
+        def kill(self):
+            pass
+
+        async def wait(self):
+            return 0
+
+    async def fake_create_subprocess_exec(*argv, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(mac_memory_commands, "HELPER_DIR", tmp_path / "missing")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_HOST", "qwen-ops-01")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_DIR", "/srv/conductors/bin")
+    monkeypatch.setattr(mac_memory_commands.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    result = await mac_memory_commands.handle_memory_command("memory-status", "")
+
+    assert result.startswith("FAIL mac-memory-status error=EXIT_255")
+    assert "Connection refused" in result
+
+
+def test_remote_helper_host_rejects_ssh_option_injection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(mac_memory_commands, "HELPER_DIR", tmp_path / "missing")
+    monkeypatch.setattr(mac_memory_commands, "REMOTE_HELPER_HOST", "-oProxyCommand=sh")
+
+    result = mac_memory_commands._remote_helper_argv("mac-memory-status", [])
+
+    assert result is None
