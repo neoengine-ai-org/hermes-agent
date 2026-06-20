@@ -996,6 +996,7 @@ class ManagedFilesPolicy:
     locked_root: Path | None
     can_change_path: bool
 
+
 _FS_READDIR_HIDDEN = {
     ".git",
     ".hg",
@@ -1765,6 +1766,7 @@ async def get_status(profile: Optional[str] = None):
         gateway_exit_reason = None
         gateway_updated_at = None
         gateway_liveness = classify_gateway_transport_liveness(None)
+        gateway_recovery: dict[str, Any] | None = None
         configured_gateway_platforms: set[str] | None = None
         try:
             from gateway.config import load_gateway_config
@@ -1817,6 +1819,23 @@ async def get_status(profile: Optional[str] = None):
                 **runtime,
                 "platforms": gateway_platforms,
             })
+            try:
+                from gateway.recovery import evaluate_gateway_recovery, load_recovery_state
+                from hermes_cli.profiles import get_active_profile_name
+
+                recovery_profile = (
+                    requested_profile
+                    if requested_profile and requested_profile.lower() != "current"
+                    else get_active_profile_name()
+                )
+                gateway_recovery = evaluate_gateway_recovery(
+                    gateway_liveness,
+                    profile=recovery_profile,
+                    state=load_recovery_state(),
+                )
+            except Exception:
+                _log.warning("Failed to evaluate gateway recovery state", exc_info=True)
+                gateway_recovery = None
 
         # If there was no runtime info at all but the health probe confirmed alive,
         # ensure we still report the gateway as running (no shared volume scenario).
@@ -1869,6 +1888,9 @@ async def get_status(profile: Optional[str] = None):
             "gateway_exit_reason": gateway_exit_reason,
             "gateway_updated_at": gateway_updated_at,
             "gateway_liveness": gateway_liveness,
+            "gateway_liveness_severity": gateway_liveness.get("severity"),
+            "gateway_liveness_headline": gateway_liveness.get("headline"),
+            "gateway_recovery": gateway_recovery,
             "active_sessions": active_sessions,
             "auth_required": auth_required,
             "auth_providers": auth_providers,
@@ -2222,6 +2244,7 @@ _ACTION_LOG_DIR: Path = get_hermes_home() / "logs"
 
 # Short ``name`` (from the URL) → absolute log file path.
 _ACTION_LOG_FILES: Dict[str, str] = {
+    "gateway-recover": "gateway-recover.log",
     "gateway-restart": "gateway-restart.log",
     "gateway-start": "gateway-start.log",
     "gateway-stop": "gateway-stop.log",
@@ -2266,6 +2289,17 @@ def _record_completed_action(name: str, message: str, exit_code: int = 1) -> Non
     _ACTION_PROCS.pop(name, None)
     _ACTION_COMMANDS.pop(name, None)
     _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": None}
+
+
+class GatewayRecoverBody(BaseModel):
+    dry_run: bool = False
+    profile: Optional[str] = None
+    max_restarts: int = 3
+    window_seconds: int = 900
+
+
+_GATEWAY_RECOVER_DASHBOARD_MAX_RESTARTS = 3
+_GATEWAY_RECOVER_DASHBOARD_MIN_WINDOW_SECONDS = 15 * 60
 
 
 def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
@@ -2426,6 +2460,121 @@ async def restart_gateway(profile: Optional[str] = None):
         "ok": True,
         "pid": proc.pid,
         "name": "gateway-restart",
+    }
+
+
+def _gateway_recover_profile(profile: Optional[str]) -> str:
+    requested = (profile or "").strip()
+    if requested and requested.lower() != "current":
+        return requested
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        return get_active_profile_name()
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not resolve active dashboard profile for gateway recovery",
+        ) from exc
+
+
+def _gateway_recover_max_restarts(value: int) -> int:
+    return min(
+        _GATEWAY_RECOVER_DASHBOARD_MAX_RESTARTS,
+        max(1, int(value or _GATEWAY_RECOVER_DASHBOARD_MAX_RESTARTS)),
+    )
+
+
+def _gateway_recover_window_seconds(value: int) -> int:
+    return max(
+        _GATEWAY_RECOVER_DASHBOARD_MIN_WINDOW_SECONDS,
+        int(value or _GATEWAY_RECOVER_DASHBOARD_MIN_WINDOW_SECONDS),
+    )
+
+
+def _gateway_recover_subcommand(body: GatewayRecoverBody, *, dry_run: bool) -> List[str]:
+    profile = _gateway_recover_profile(body.profile)
+    subcommand: List[str] = []
+    if profile and profile != "default":
+        subcommand.extend(["--profile", profile])
+    subcommand.extend([
+        "gateway",
+        "recover",
+        "--max-restarts",
+        str(_gateway_recover_max_restarts(body.max_restarts)),
+        "--window-seconds",
+        str(_gateway_recover_window_seconds(body.window_seconds)),
+    ])
+    if dry_run:
+        subcommand.extend(["--dry-run", "--json"])
+    return subcommand
+
+
+@app.post("/api/gateway/recover")
+async def recover_gateway(body: GatewayRecoverBody):
+    """Run supervised, profile-scoped gateway recovery.
+
+    Dry-run returns the decision payload immediately. Non-dry-run is spawned
+    in the background so a dashboard request cannot hang while the gateway
+    restarts itself.
+    """
+    if body.dry_run:
+        cmd = [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            *_gateway_recover_subcommand(body, dry_run=True),
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                env={**os.environ, "HERMES_NONINTERACTIVE": "1"},
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise HTTPException(
+                status_code=504,
+                detail=f"Gateway recovery dry-run timed out: {exc}",
+            )
+        except Exception as exc:
+            _log.exception("Failed to run gateway recovery dry-run")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to evaluate gateway recovery: {exc}",
+            )
+        # The CLI exits 1 for operator-intervention decisions (cooldown/corrupt
+        # state). Those are valid decision payloads for a dashboard dry-run.
+        if result.returncode not in {0, 1}:
+            detail = (result.stderr or result.stdout or "").strip()
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway recovery dry-run failed: {detail or result.returncode}",
+            )
+        try:
+            decision = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            raise HTTPException(
+                status_code=500,
+                detail="Gateway recovery dry-run did not return JSON",
+            )
+        return {"ok": True, "dry_run": True, "decision": decision}
+
+    try:
+        proc = _spawn_hermes_action(
+            _gateway_recover_subcommand(body, dry_run=False),
+            "gateway-recover",
+        )
+    except Exception as exc:
+        _log.exception("Failed to spawn gateway recovery")
+        raise HTTPException(status_code=500, detail=f"Failed to recover gateway: {exc}")
+    return {
+        "ok": True,
+        "pid": proc.pid,
+        "name": "gateway-recover",
     }
 
 

@@ -1,0 +1,60 @@
+{
+  "id": "HARDENING-HERMES-TELEGRAM-SUPERVISED-RECOVERY-2026-06-20",
+  "depends_on": [
+    "HARDENING-HERMES-TELEGRAM-PAUSED-LIVENESS-2026-06-20"
+  ],
+  "source_finding": {
+    "status": "restored",
+    "severity": "operational_reliability_incident",
+    "root_cause_class": "gateway_transport_liveness_failure",
+    "incident_pattern": [
+      "Telegram reconnect failures accumulated until polling paused.",
+      "Hermes process and PID metadata remained alive.",
+      "Qwen tunnel, Ollama, Postgres, NeoEngine API, Cockpit, and tunnel health were separate from the failing Hermes transport.",
+      "Affected Hermes oneshot failed before restart and passed after a profile-scoped Hermes gateway restart.",
+      "Fresh logs showed Connected to Telegram (polling mode) after restart."
+    ]
+  },
+  "fix_packet": {
+    "recovery_module": "gateway.recovery",
+    "cli_surface": "hermes gateway recover",
+    "dashboard_surface": "/api/gateway/recover plus /api/status.gateway_recovery",
+    "action_scope": "restart only the affected Hermes gateway profile",
+    "profile_awareness": "default profile uses hermes gateway recover/restart; named profiles use hermes --profile <name> gateway recover/restart",
+    "cooldown_guard": {
+      "max_restarts": 3,
+      "window_seconds": 900,
+      "scope": "per_profile",
+      "blocked_action": "operator_intervention_required"
+    },
+    "forbidden_targets": [
+      "qwen_tunnel",
+      "ollama",
+      "postgres",
+      "neoengine_api",
+      "cockpit",
+      "unrelated_hermes_profiles"
+    ]
+  },
+  "exit_criteria": [
+    "HERMES_TELEGRAM_PAUSED and HERMES_TELEGRAM_STALE produce restart_profile decisions when cooldown permits.",
+    "Default and qwen-ops-runner-conductor profiles produce distinct command shapes.",
+    "Cooldown blocks a fourth supervised restart within 15 minutes for the affected profile only.",
+    "Corrupt or unreadable recovery-state ledger blocks supervised restart and routes to operator intervention.",
+    "Failed restart attempts are recorded in the cooldown ledger so broken restarts cannot loop unbounded.",
+    "Old restart events are pruned across all profiles to keep the cooldown ledger bounded.",
+    "Dashboard status exposes unhealthy process-alive / transport-dead severity and gateway_recovery.",
+    "Dashboard recovery endpoint supports dry-run decision rendering and profile-scoped background recovery.",
+    "Runbook includes status, doctor, PID lookup, profile-specific recovery, manual fallback, and post-restart oneshot verification commands."
+  ],
+  "recheck": {
+    "commands": [
+      "python -m py_compile gateway/recovery.py gateway/status.py hermes_cli/gateway.py hermes_cli/main.py hermes_cli/web_server.py",
+      "scripts/run_tests.sh tests/gateway/test_recovery_decision.py tests/gateway/test_status_transport_liveness.py tests/docs/test_transport_liveness_runbook.py tests/hermes_cli/test_gateway_runtime_health.py tests/gateway/test_telegram_network_reconnect.py",
+      ".venv/bin/python -m pytest tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_gateway_recover_dry_run_uses_profile_scoped_cli tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_gateway_recover_spawns_profile_scoped_background_action tests/hermes_cli/test_web_server.py::TestWebServerEndpoints::test_get_status -q",
+      ".venv/bin/python -m pytest tests/hermes_cli/test_doctor.py::test_check_gateway_transport_liveness_fails_paused_telegram -q"
+    ],
+    "status": "rechecked_pass",
+    "note": "Full tests/hermes_cli/test_web_server.py was not used as Wave 2 acceptance because TestPtyWebSocket websocket PTY tests fail in isolation in this environment; the new gateway recovery and status endpoint nodeids pass."
+  }
+}

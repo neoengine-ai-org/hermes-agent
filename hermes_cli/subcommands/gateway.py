@@ -133,6 +133,34 @@ def build_gateway_parser(
     )
     _add_compat_platform_flag(gateway_restart)
 
+    # gateway recover
+    gateway_recover = gateway_subparsers.add_parser(
+        "recover",
+        help="Restart this profile's gateway only when transport liveness is failed",
+    )
+    gateway_recover.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the recovery decision without running the restart command",
+    )
+    gateway_recover.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the recovery decision as JSON",
+    )
+    gateway_recover.add_argument(
+        "--max-restarts",
+        type=int,
+        default=3,
+        help="Maximum supervised restarts allowed in the cooldown window",
+    )
+    gateway_recover.add_argument(
+        "--window-seconds",
+        type=int,
+        default=900,
+        help="Cooldown window in seconds (default: 900)",
+    )
+
     # gateway status
     gateway_status = gateway_subparsers.add_parser("status", help="Show gateway status")
     gateway_status.add_argument("--deep", action="store_true", help="Deep status check")

@@ -1231,6 +1231,58 @@ class TestWebServerEndpoints:
         assert resp.json()["gateway_state"] == "startup_failed"
         assert resp.json()["gateway_platforms"] == {}
 
+    def test_get_status_recovery_uses_requested_profile(self, monkeypatch):
+        import contextlib
+
+        import gateway.config as gateway_config
+        from gateway import recovery as gateway_recovery
+        from hermes_cli import profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+
+        class _Platform:
+            value = "telegram"
+
+        class _GatewayConfig:
+            def get_connected_platforms(self):
+                return [_Platform()]
+
+        seen = {}
+
+        def fake_evaluate(liveness, *, profile, state):
+            seen["profile"] = profile
+            return {"action": "restart_profile", "profile": profile}
+
+        monkeypatch.setattr(web_server, "_config_profile_scope", lambda profile: contextlib.nullcontext())
+        monkeypatch.setattr(web_server, "get_running_pid", lambda: 12345)
+        monkeypatch.setattr(
+            web_server,
+            "read_runtime_status",
+            lambda: {
+                "gateway_state": "running",
+                "platforms": {
+                    "telegram": {
+                        "state": "paused",
+                        "error_message": "auto-paused after 10 consecutive reconnect failures",
+                    }
+                },
+            },
+        )
+        monkeypatch.setattr(web_server, "check_config_version", lambda: (1, 1))
+        monkeypatch.setattr(gateway_config, "load_gateway_config", lambda: _GatewayConfig())
+        monkeypatch.setattr(gateway_recovery, "load_recovery_state", lambda: {"profiles": {}})
+        monkeypatch.setattr(gateway_recovery, "evaluate_gateway_recovery", fake_evaluate)
+        monkeypatch.setattr(
+            profiles_mod,
+            "get_active_profile_name",
+            lambda: pytest.fail("requested profile should be used"),
+        )
+
+        resp = self.client.get("/api/status?profile=qwen-ops-runner-conductor")
+
+        assert resp.status_code == 200
+        assert seen["profile"] == "qwen-ops-runner-conductor"
+        assert resp.json()["gateway_recovery"]["profile"] == "qwen-ops-runner-conductor"
+
     def test_cron_delivery_targets_lists_configured_platforms(self, monkeypatch):
         """The cron dropdown endpoint returns Local + configured platforms dynamically."""
         import gateway.config as gateway_config
@@ -1258,6 +1310,132 @@ class TestWebServerEndpoints:
         assert targets["matrix"]["home_target_set"] is True
         # No hardcoded telegram/discord/slack/email when they aren't configured.
         assert "telegram" not in targets
+
+    def test_gateway_recover_dry_run_uses_profile_scoped_cli(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _Result:
+            returncode = 0
+            stdout = json.dumps({
+                "action": "restart_profile",
+                "profile": "qwen-ops-runner-conductor",
+            })
+            stderr = ""
+
+        def fake_run(command, **kwargs):
+            calls.append((list(command), kwargs))
+            return _Result()
+
+        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+
+        resp = self.client.post(
+            "/api/gateway/recover",
+            json={
+                "dry_run": True,
+                "profile": "qwen-ops-runner-conductor",
+                "max_restarts": 3,
+                "window_seconds": 900,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["decision"]["profile"] == "qwen-ops-runner-conductor"
+        command = calls[0][0]
+        assert "--profile" in command, command
+        assert "qwen-ops-runner-conductor" in command, command
+        assert command[-2:] == ["--dry-run", "--json"], command
+        assert "gateway" in command and "recover" in command, command
+
+    def test_gateway_recover_dry_run_resolves_current_profile(self, monkeypatch):
+        from hermes_cli import profiles as profiles_mod
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _Result:
+            returncode = 0
+            stdout = json.dumps({
+                "action": "restart_profile",
+                "profile": "qwen-ops-runner-conductor",
+            })
+            stderr = ""
+
+        def fake_run(command, **kwargs):
+            calls.append((list(command), kwargs))
+            return _Result()
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "qwen-ops-runner-conductor")
+        monkeypatch.setattr(web_server.subprocess, "run", fake_run)
+
+        resp = self.client.post(
+            "/api/gateway/recover",
+            json={
+                "dry_run": True,
+                "max_restarts": 10000,
+                "window_seconds": 1,
+            },
+        )
+
+        assert resp.status_code == 200
+        command = calls[0][0]
+        assert command[3:5] == ["--profile", "qwen-ops-runner-conductor"], command
+        assert command[7:9] == ["--max-restarts", "3"], command
+        assert command[9:11] == ["--window-seconds", "900"], command
+        assert command[-2:] == ["--dry-run", "--json"], command
+
+    def test_gateway_recover_fails_closed_when_current_profile_unresolved(self, monkeypatch):
+        from hermes_cli import profiles as profiles_mod
+
+        def fail_active_profile():
+            raise RuntimeError("profile context unavailable")
+
+        monkeypatch.setattr(profiles_mod, "get_active_profile_name", fail_active_profile)
+
+        resp = self.client.post(
+            "/api/gateway/recover",
+            json={
+                "dry_run": True,
+                "max_restarts": 3,
+                "window_seconds": 900,
+            },
+        )
+
+        assert resp.status_code == 500
+        assert "Could not resolve active dashboard profile" in resp.json()["detail"]
+
+    def test_gateway_recover_spawns_profile_scoped_background_action(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        calls = []
+
+        class _Proc:
+            pid = 4321
+
+        def fake_spawn(subcommand, name):
+            calls.append((list(subcommand), name))
+            return _Proc()
+
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+
+        resp = self.client.post(
+            "/api/gateway/recover",
+            json={
+                "dry_run": False,
+                "profile": "qwen-ops-runner-conductor",
+                "max_restarts": 3,
+                "window_seconds": 900,
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "pid": 4321, "name": "gateway-recover"}
+        subcommand, action_name = calls[0]
+        assert action_name == "gateway-recover"
+        assert subcommand[:2] == ["--profile", "qwen-ops-runner-conductor"], subcommand
+        assert subcommand[2:4] == ["gateway", "recover"], subcommand
+        assert "--max-restarts" in subcommand and "--window-seconds" in subcommand
 
     def test_get_config_schema(self):
         resp = self.client.get("/api/config/schema")

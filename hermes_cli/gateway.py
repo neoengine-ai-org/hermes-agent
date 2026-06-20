@@ -5,6 +5,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
+import json
 import logging
 import os
 import shlex
@@ -7116,6 +7117,41 @@ def _gateway_command_inner(args):
             # Start fresh
             print("Starting gateway...")
             run_gateway(verbose=0)
+
+    elif subcmd == "recover":
+        from gateway.recovery import execute_gateway_recovery
+        from hermes_cli.profiles import get_active_profile_name
+
+        result = execute_gateway_recovery(
+            profile=get_active_profile_name(),
+            dry_run=getattr(args, "dry_run", False),
+            max_restarts=max(1, int(getattr(args, "max_restarts", 3) or 3)),
+            window_seconds=max(1, int(getattr(args, "window_seconds", 900) or 900)),
+        )
+        if getattr(args, "json", False):
+            print(json.dumps(result, indent=2))
+        else:
+            action = result.get("action")
+            profile = result.get("profile")
+            if action == "restart_profile":
+                if result.get("executed"):
+                    print(f"✓ Restarted Hermes gateway profile '{profile}'")
+                else:
+                    print(f"↻ Would restart Hermes gateway profile '{profile}'")
+                print(f"  Command: {result.get('restart_command_display')}")
+            elif action == "operator_intervention_required":
+                print("✗ Gateway recovery cooldown exceeded")
+                print(f"  Profile: {profile}")
+                print(f"  Code: {result.get('code')}")
+                if result.get("cooldown_remaining_seconds"):
+                    print(f"  Retry after: {result.get('cooldown_remaining_seconds')}s")
+                print("  Operator intervention required before another restart.")
+            else:
+                print("✓ No supervised gateway recovery needed")
+        if result.get("operator_intervention_required") or (
+            result.get("executed") and not result.get("ok", False)
+        ):
+            sys.exit(1)
 
     elif subcmd == "status":
         deep = getattr(args, "deep", False)

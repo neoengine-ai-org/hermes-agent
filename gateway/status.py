@@ -234,9 +234,25 @@ def classify_gateway_transport_liveness(
                         ))
 
     first_issue = issues[0] if issues else None
+    process_alive = False
+    if isinstance(state, dict):
+        process_alive = bool(state.get("pid")) or state.get("gateway_state") in {
+            "running",
+            "degraded",
+        }
+    headline = "Gateway transports healthy"
+    if first_issue is not None:
+        headline = (
+            "transport dead / process alive"
+            if process_alive
+            else "gateway transport unhealthy"
+        )
     return {
         "healthy": not issues,
         "status": "healthy" if not issues else "unhealthy",
+        "severity": "healthy" if not issues else "unhealthy",
+        "headline": headline,
+        "process_alive": process_alive,
         "code": None if first_issue is None else first_issue["code"],
         "summary": "Gateway transports healthy" if first_issue is None else first_issue["summary"],
         "recommended_repair": None if first_issue is None else first_issue["recommended_repair"],
