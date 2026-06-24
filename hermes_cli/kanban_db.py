@@ -71,7 +71,10 @@ new locking.
 from __future__ import annotations
 
 import contextlib
-import fcntl
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - fcntl is unavailable on Windows.
+    fcntl = None  # type: ignore[assignment]
 import json
 import os
 import re
@@ -1218,6 +1221,11 @@ def _cross_process_init_lock(path: Path):
     """
     lock_path = path.with_name(f"{path.name}.init.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None:
+        # Windows lacks fcntl/flock; keep module importable and fall back to the
+        # process-local _INIT_LOCK held by get_conn().
+        yield
+        return
     with lock_path.open("a+") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -1724,16 +1732,23 @@ def claim_lane_work_item(
         ).fetchone()
         if existing is not None:
             return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing)}
-        cur = conn.execute(
-            """
-            INSERT INTO lane_claims(
-                work_item_id, lane_id, claim_owner, claim_started_at,
-                claim_expires_at, claim_status, claim_evidence_path,
-                recovery_of_claim_id
-            ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
-            """,
-            (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, recovery_of_claim_id),
-        )
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO lane_claims(
+                    work_item_id, lane_id, claim_owner, claim_started_at,
+                    claim_expires_at, claim_status, claim_evidence_path,
+                    recovery_of_claim_id
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, recovery_of_claim_id),
+            )
+        except sqlite3.IntegrityError:
+            existing = conn.execute(
+                "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
+                (work_item_id,),
+            ).fetchone()
+            return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing) if existing else None}
     return {"claimed": True, "claim_id": cur.lastrowid, "claim_expires_at": expires}
 
 
@@ -1766,6 +1781,19 @@ def recover_stale_lane_claims(conn: sqlite3.Connection, *, now: Optional[int] = 
             conn.execute(
                 "UPDATE lane_claims SET claim_status='expired/recovered', claim_evidence_path=?, closed_at=?, close_message=? WHERE id=?",
                 (evidence_path, ts, "expired claim recovered by control loop", row["id"]),
+            )
+            conn.execute(
+                """
+                UPDATE lane_work_items
+                   SET status='open', updated_at=?
+                 WHERE work_item_id=?
+                   AND status='claimed'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM lane_claims
+                        WHERE work_item_id=? AND claim_status='active'
+                   )
+                """,
+                (ts, row["work_item_id"], row["work_item_id"]),
             )
             recovered.append(row["work_item_id"])
     return recovered

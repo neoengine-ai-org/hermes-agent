@@ -58,12 +58,35 @@ def test_duplicate_active_claims_are_rejected(tmp_path, monkeypatch):
 def test_stale_claims_can_be_recovered_with_evidence(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
-        kb.claim_lane_work_item(conn, "W1", lane_id="dev-a", claim_owner="s1", ttl_seconds=1, evidence_path="old.md", now=int(time.time()) - 10)
-        recovered = kb.recover_stale_lane_claims(conn, now=int(time.time()), evidence_path="receipts/recovered.md")
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", priority=1, now=900)
+        first = kb.pickup_next_lane_work(
+            conn,
+            lane_id="dev-a",
+            agent_session_id="s1",
+            authorized_scopes=["repo"],
+            ttl_seconds=1,
+            evidence_path="old.md",
+            now=1000,
+        )
+        recovered = kb.recover_stale_lane_claims(conn, now=1005, evidence_path="receipts/recovered.md")
         rows = conn.execute("SELECT claim_status, claim_evidence_path FROM lane_claims WHERE work_item_id='W1' ORDER BY id").fetchall()
+        item = conn.execute("SELECT status FROM lane_work_items WHERE work_item_id='W1'").fetchone()
+        second = kb.pickup_next_lane_work(
+            conn,
+            lane_id="dev-b",
+            agent_session_id="s2",
+            authorized_scopes=["repo"],
+            ttl_seconds=300,
+            evidence_path="second.md",
+            now=1006,
+        )
+    assert first is not None and first["work_item_id"] == "W1"
     assert recovered == ["W1"]
     assert rows[0]["claim_status"] == "expired/recovered"
     assert rows[0]["claim_evidence_path"] == "receipts/recovered.md"
+    assert item["status"] == "open"
+    assert second is not None and second["work_item_id"] == "W1"
+    assert second["claim"]["claimed"] is True
 
 
 def test_idle_lanes_back_off_rather_than_spin(tmp_path, monkeypatch):
@@ -119,3 +142,36 @@ def test_no_governance_bypass_cases_are_preserved(tmp_path, monkeypatch):
         kb.upsert_lane_work_item(conn, work_item_id="H1", repo_scope="repo", priority=98, governance_state="awaiting-human")
         picked = kb.pickup_next_lane_work(conn, lane_id="dev-a", agent_session_id="s1", authorized_scopes=["repo"])
     assert picked is None
+
+
+def test_claim_race_integrity_error_returns_structured_duplicate(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        conn.execute(
+            """
+            CREATE TEMP TRIGGER simulate_lane_claim_race
+            BEFORE INSERT ON lane_claims
+            WHEN NEW.claim_owner='race-session'
+            BEGIN
+                INSERT INTO lane_claims(
+                    work_item_id, lane_id, claim_owner, claim_started_at,
+                    claim_expires_at, claim_status, claim_evidence_path
+                ) VALUES (NEW.work_item_id, 'dev-other', 'other-session', NEW.claim_started_at,
+                          NEW.claim_expires_at, 'active', 'other.md');
+            END
+            """
+        )
+        result = kb.claim_lane_work_item(
+            conn,
+            "W-race",
+            lane_id="dev-a",
+            claim_owner="race-session",
+            ttl_seconds=300,
+            evidence_path="race.md",
+            now=1000,
+        )
+        rows = conn.execute("SELECT lane_id, claim_owner FROM lane_claims WHERE work_item_id='W-race'").fetchall()
+    assert result["claimed"] is False
+    assert result["reason"] == "active_claim_exists"
+    assert result["active_claim"] is None
+    assert rows == []
