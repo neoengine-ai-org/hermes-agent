@@ -1918,8 +1918,19 @@ def pickup_next_lane_work(
         evidence = evidence_path or f"lane-claims/{lane_id}/{row['work_item_id']}-{ts}.json"
         claim = claim_lane_work_item(conn, row["work_item_id"], lane_id=lane_id, claim_owner=agent_session_id, ttl_seconds=ttl_seconds, evidence_path=evidence, now=ts)
         if claim.get("claimed"):
+            wake_event = conn.execute(
+                """
+                SELECT * FROM lane_events
+                WHERE (lane_id=? OR lane_id IS NULL) AND (work_item_id=? OR work_item_id IS NULL) AND consumed_at IS NULL
+                ORDER BY id LIMIT 1
+                """,
+                (lane_id, row["work_item_id"]),
+            ).fetchone()
+            wake_event_id = wake_event["id"] if wake_event is not None else None
+            if wake_event_id is not None:
+                conn.execute("UPDATE lane_events SET consumed_at=? WHERE id=?", (ts, wake_event_id))
             conn.execute("UPDATE lane_work_items SET status='claimed', updated_at=? WHERE work_item_id=?", (ts, row["work_item_id"]))
-            hb = record_lane_heartbeat(conn, lane_id=lane_id, agent_session_id=agent_session_id, repo_scope=row["repo_scope"], state="working", claimed_work_item_id=row["work_item_id"], evidence_path=evidence, now=ts)
+            hb = record_lane_heartbeat(conn, lane_id=lane_id, agent_session_id=agent_session_id, repo_scope=row["repo_scope"], state="working", claimed_work_item_id=row["work_item_id"], evidence_path=evidence, last_event_id=wake_event_id, now=ts)
             item = dict(row)
             item.update({"claim": claim, "heartbeat": hb})
             return item

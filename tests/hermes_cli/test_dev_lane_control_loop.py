@@ -175,3 +175,23 @@ def test_claim_race_integrity_error_returns_structured_duplicate(tmp_path, monke
     assert result["reason"] == "active_claim_exists"
     assert result["active_claim"] is None
     assert rows == []
+
+
+def test_pickup_consumes_event_wake_once(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-event", repo_scope="repo", priority=10, now=900)
+        kb.record_lane_event(conn, lane_id="dev-a", event_type="explicit_operator_command", work_item_id="W-event", evidence_path="events/w-event.json", now=950)
+        picked = kb.pickup_next_lane_work(
+            conn,
+            lane_id="dev-a",
+            agent_session_id="s1",
+            authorized_scopes=["repo"],
+            evidence_path="claims/w-event.json",
+            now=1000,
+        )
+        event = conn.execute("SELECT consumed_at FROM lane_events WHERE work_item_id='W-event'").fetchone()
+        wake = kb.next_lane_wake(conn, "dev-a", now=1001)
+    assert picked is not None and picked["work_item_id"] == "W-event"
+    assert event["consumed_at"] == 1000
+    assert wake["eligible_now"] is False
