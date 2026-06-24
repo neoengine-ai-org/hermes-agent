@@ -1732,6 +1732,18 @@ def claim_lane_work_item(
         ).fetchone()
         if existing is not None:
             return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing)}
+        work_item = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
+        if work_item is None:
+            return {"claimed": False, "reason": "work_item_missing"}
+        if work_item["status"] not in {"open", "blocked"}:
+            return {"claimed": False, "reason": "work_item_not_claimable"}
+        if work_item["governance_state"] in {"do-not-merge", "awaiting-human", "held", "human-review"}:
+            return {"claimed": False, "reason": "governance_held"}
+        if work_item["status"] == "blocked" and not (
+            work_item["last_event_id"]
+            and (work_item["blocked_event_id"] is None or work_item["last_event_id"] != work_item["blocked_event_id"])
+        ):
+            return {"claimed": False, "reason": "blocked_without_new_event"}
         try:
             cur = conn.execute(
                 """
@@ -1743,6 +1755,17 @@ def claim_lane_work_item(
                 """,
                 (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, recovery_of_claim_id),
             )
+            update = conn.execute(
+                """
+                UPDATE lane_work_items
+                   SET status='claimed', updated_at=?
+                 WHERE work_item_id=?
+                   AND status IN ('open', 'blocked')
+                """,
+                (ts, work_item_id),
+            )
+            if update.rowcount != 1:
+                raise sqlite3.IntegrityError("work item claim status update failed")
         except sqlite3.IntegrityError:
             existing = conn.execute(
                 "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
@@ -1758,12 +1781,26 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
     if not evidence_path:
         raise ValueError("close evidence_path is required")
     ts = _now(now)
+    status_by_close = {
+        "completed": "completed",
+        "blocked": "blocked",
+        "refused": "refused",
+        "superseded": "superseded",
+        "no-op with evidence": "completed",
+        "expired/recovered": "open",
+    }
     with write_txn(conn):
+        row = conn.execute("SELECT work_item_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
         res = conn.execute(
             "UPDATE lane_claims SET claim_status=?, claim_evidence_path=?, closed_at=?, close_message=? "
             "WHERE id=? AND claim_status='active'",
             (status, evidence_path, ts, message, claim_id),
         )
+        if res.rowcount == 1 and row is not None:
+            conn.execute(
+                "UPDATE lane_work_items SET status=?, updated_at=? WHERE work_item_id=? AND status='claimed'",
+                (status_by_close[status], ts, row["work_item_id"]),
+            )
     return res.rowcount == 1
 
 

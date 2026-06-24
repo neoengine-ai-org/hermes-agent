@@ -48,6 +48,7 @@ def test_new_session_resumes_from_heartbeat_and_continuity_state(tmp_path, monke
 def test_duplicate_active_claims_are_rejected(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", status="open")
         first = kb.claim_lane_work_item(conn, "W1", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="r1.md")
         second = kb.claim_lane_work_item(conn, "W1", lane_id="dev-b", claim_owner="s2", ttl_seconds=300, evidence_path="r2.md")
     assert first["claimed"] is True
@@ -89,6 +90,66 @@ def test_stale_claims_can_be_recovered_with_evidence(tmp_path, monkeypatch):
     assert second["claim"]["claimed"] is True
 
 
+def test_claim_lane_work_item_marks_work_item_claimed_immediately(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", priority=1, status="open", now=900)
+        result = kb.claim_lane_work_item(
+            conn,
+            "W1",
+            lane_id="dev-a",
+            claim_owner="s1",
+            ttl_seconds=300,
+            evidence_path="claim.md",
+            now=1000,
+        )
+        item = conn.execute("SELECT status, updated_at FROM lane_work_items WHERE work_item_id='W1'").fetchone()
+    assert result["claimed"] is True
+    assert item["status"] == "claimed"
+    assert item["updated_at"] == 1000
+
+
+def test_direct_claim_requires_existing_pickable_non_governance_held_work(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        missing = kb.claim_lane_work_item(conn, "missing", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="missing.md")
+        kb.upsert_lane_work_item(conn, work_item_id="done", repo_scope="repo", status="completed")
+        terminal = kb.claim_lane_work_item(conn, "done", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="done.md")
+        kb.upsert_lane_work_item(conn, work_item_id="held", repo_scope="repo", status="open", governance_state="do-not-merge")
+        held = kb.claim_lane_work_item(conn, "held", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="held.md")
+        active_claims = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE claim_status='active'").fetchone()["n"]
+    assert missing == {"claimed": False, "reason": "work_item_missing"}
+    assert terminal == {"claimed": False, "reason": "work_item_not_claimable"}
+    assert held == {"claimed": False, "reason": "governance_held"}
+    assert active_claims == 0
+
+
+def test_direct_claim_rejects_blocked_work_without_new_event(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="blocked", repo_scope="repo", status="blocked", blocked_event_id=5, now=900)
+        result = kb.claim_lane_work_item(conn, "blocked", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="blocked.md", now=1000)
+        item = conn.execute("SELECT status FROM lane_work_items WHERE work_item_id='blocked'").fetchone()
+        active_claims = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE work_item_id='blocked' AND claim_status='active'").fetchone()["n"]
+    assert result == {"claimed": False, "reason": "blocked_without_new_event"}
+    assert item["status"] == "blocked"
+    assert active_claims == 0
+
+
+def test_close_lane_claim_updates_work_item_status(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", status="open", now=900)
+        claim = kb.claim_lane_work_item(conn, "W1", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="claim.md", now=1000)
+        closed = kb.close_lane_claim(conn, claim["claim_id"], status="completed", evidence_path="done.md", now=1100)
+        item = conn.execute("SELECT status, updated_at FROM lane_work_items WHERE work_item_id='W1'").fetchone()
+        active_claims = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE work_item_id='W1' AND claim_status='active'").fetchone()["n"]
+    assert closed is True
+    assert active_claims == 0
+    assert item["status"] == "completed"
+    assert item["updated_at"] == 1100
+
+
 def test_idle_lanes_back_off_rather_than_spin(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     now = 1000
@@ -125,6 +186,7 @@ def test_lane_status_report_classifies_states(tmp_path, monkeypatch):
     now = 2000
     with kb.connect() as conn:
         kb.record_lane_heartbeat(conn, lane_id="working", agent_session_id="s1", repo_scope="repo", state="working", claimed_work_item_id="W1", now=now)
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", status="open", now=now)
         kb.claim_lane_work_item(conn, "W1", lane_id="working", claim_owner="s1", ttl_seconds=300, evidence_path="w.md", now=now)
         kb.record_lane_heartbeat(conn, lane_id="idle", agent_session_id="s2", repo_scope="repo", state="idle-no-work", now=now)
         kb.record_lane_heartbeat(conn, lane_id="stale", agent_session_id="s3", repo_scope="repo", state="working", now=now - 7200)
@@ -147,6 +209,7 @@ def test_no_governance_bypass_cases_are_preserved(tmp_path, monkeypatch):
 def test_claim_race_integrity_error_returns_structured_duplicate(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-race", repo_scope="repo", status="open", now=900)
         conn.execute(
             """
             CREATE TEMP TRIGGER simulate_lane_claim_race

@@ -33,6 +33,7 @@ def test_new_session_resumes_from_heartbeat_and_continuity_state(tmp_path: Path)
             "operator_approvals_relied_on": [],
         },
     )
+    store.add_work_item({"work_item_id": "work-1", "repo_scope": "neoengine-ai-org/neowealth", "authorized_scopes": ["repo/app/page.tsx"], "status": "open"})
     store.claim_work(
         work_item_id="work-1",
         lane_id="lane-a",
@@ -52,10 +53,54 @@ def test_new_session_resumes_from_heartbeat_and_continuity_state(tmp_path: Path)
 
 def test_duplicate_active_claims_are_rejected(tmp_path: Path) -> None:
     store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-1", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
     store.claim_work("work-1", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/a.json")
 
     with pytest.raises(ValueError, match="active claim already exists"):
         store.claim_work("work-1", "lane-b", "session-b", "2026-06-24T00:01:00Z", 3600, "claims/b.json")
+
+
+def test_reserved_history_work_item_id_does_not_overwrite_claim_history(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    original_history = [{"work_item_id": "prior", "claim_status": "completed"}]
+    store.write_json("claims/history.json", original_history)
+
+    with pytest.raises(ValueError, match="reserved or unsafe"):
+        store.claim_work("history", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/history.json")
+
+    assert store.read_json("claims/history.json") == original_history
+
+
+@pytest.mark.parametrize("lane_id", ["../lane-a", "lane/a", ".hidden"])
+def test_unsafe_lane_ids_are_rejected_before_writing_lane_files(tmp_path: Path, lane_id: str) -> None:
+    store = DevLaneStore(tmp_path)
+
+    with pytest.raises(ValueError, match="lane_id must be a safe slug"):
+        store.emit_heartbeat(
+            lane_id=lane_id,
+            agent_session_id="session-a",
+            repo_scope="repo",
+            current_state="idle-no-work",
+            claimed_work_item_id=None,
+            last_successful_activity_at="2026-06-24T00:00:00Z",
+            next_eligible_wake_at="2026-06-24T00:10:00Z",
+            evidence_pointer="receipts/idle.md",
+        )
+
+    assert list((tmp_path / "heartbeats").iterdir()) == []
+
+
+def test_claim_file_paths_are_collision_resistant_for_sanitized_work_item_ids(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "PR_36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("PR:36", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/colon.json")
+
+    assert store.active_claim_for_work("PR_36", now="2026-06-24T00:01:00Z") is None
+    store.claim_work("PR_36", "lane-b", "session-b", "2026-06-24T00:01:00Z", 3600, "claims/underscore.json")
+
+    claim_files = sorted(path.name for path in (tmp_path / "claims").glob("*.json"))
+    assert claim_files == ["PR%3A36.json", "PR_36.json"]
 
 
 def test_stale_claims_can_be_recovered_with_evidence(tmp_path: Path) -> None:
@@ -91,6 +136,42 @@ def test_stale_claims_can_be_recovered_with_evidence(tmp_path: Path) -> None:
     items = store.read_json("work/items.json")
     assert items["work-1"]["status"] == "claimed"
     assert items["work-1"]["updated_at"]
+
+
+def test_file_backed_direct_claim_requires_existing_non_governance_held_work(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+
+    with pytest.raises(ValueError, match="work item does not exist"):
+        store.claim_work("missing", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/missing.json")
+
+    store.add_work_item({"work_item_id": "held", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open", "labels": ["do-not-merge"]})
+    with pytest.raises(ValueError, match="work item is not claimable: held_by_do_not_merge"):
+        store.claim_work("held", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/held.json")
+
+    assert store.claim_for_work("missing") is None
+    assert store.claim_for_work("held") is None
+
+
+def test_file_backed_close_claim_refuses_duplicate_terminal_close(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-1", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("work-1", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/work-1.json")
+    store.close_claim("work-1", "completed", "receipts/done.md", "2026-06-24T00:10:00Z")
+
+    with pytest.raises(ValueError, match="claim is not active"):
+        store.close_claim("work-1", "blocked", "receipts/blocked.md", "2026-06-24T00:11:00Z")
+
+    assert store.read_json("work/items.json")["work-1"]["status"] == "completed"
+
+
+def test_file_backed_close_claim_updates_work_item_status(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-1", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("work-1", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/work-1.json")
+
+    store.close_claim("work-1", "completed", "receipts/done.md", "2026-06-24T00:10:00Z")
+
+    assert store.read_json("work/items.json")["work-1"]["status"] == "completed"
 
 
 def test_idle_lanes_back_off_rather_than_spin(tmp_path: Path) -> None:
@@ -169,6 +250,7 @@ def test_status_report_classifies_lane_states(tmp_path: Path) -> None:
     store.register_lane("human", repo_scope="r", authorized_scopes=["**"])
     store.register_lane("failed", repo_scope="r", authorized_scopes=["**"])
     store.emit_heartbeat("working", "s", "r", "working", "w", "2026-06-24T00:00:00Z", "2026-06-24T00:10:00Z", "e")
+    store.add_work_item({"work_item_id": "w", "repo_scope": "r", "authorized_scopes": ["**"], "status": "open"})
     store.claim_work("w", "working", "s", "2026-06-24T00:00:00Z", 10800, "claims/w.json")
     store.emit_heartbeat("idle", "s", "r", "idle-no-work", None, "2026-06-24T00:00:00Z", "2026-06-24T01:00:00Z", "e")
     store.emit_heartbeat("blocked", "s", "r", "blocked", None, "2026-06-24T00:00:00Z", "2026-06-24T00:20:00Z", "e")
