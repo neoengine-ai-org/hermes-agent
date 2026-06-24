@@ -4,6 +4,7 @@ import argparse
 import fnmatch
 import json
 import os
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -74,8 +75,24 @@ class DevLaneStore:
         self.write_json("lanes.json", lanes)
         return lanes[lane_id]
 
+    def _lane_path(self, dirname: str, lane_id: str) -> Path:
+        safe_lane = safe_id(lane_id)
+        if not safe_lane or safe_lane != lane_id or safe_lane.startswith("."):
+            raise ValueError(f"lane_id must be a safe slug: {lane_id!r}")
+        return Path(dirname) / f"{safe_lane}.json"
+
+    def _claim_path(self, work_item_id: str) -> Path:
+        safe_work_item = quote(work_item_id, safe="-_.")
+        if (
+            not safe_work_item
+            or safe_work_item.startswith(".")
+            or safe_work_item in {"history", "_history"}
+        ):
+            raise ValueError(f"work_item_id is reserved or unsafe for claim storage: {work_item_id!r}")
+        return Path("claims") / f"{safe_work_item}.json"
+
     def latest_heartbeat(self, lane_id: str) -> dict[str, Any] | None:
-        value = self.read_json(Path("heartbeats") / f"{lane_id}.json", None)
+        value = self.read_json(self._lane_path("heartbeats", lane_id), None)
         return value
 
     def emit_heartbeat(
@@ -107,7 +124,7 @@ class DevLaneStore:
             "last_event_consumed": last_event_consumed,
             "emitted_at": utc_now(),
         }
-        self.write_json(Path("heartbeats") / f"{lane_id}.json", heartbeat)
+        self.write_json(self._lane_path("heartbeats", lane_id), heartbeat)
         return heartbeat
 
     def write_continuity_packet(self, lane_id: str, packet: dict[str, Any]) -> dict[str, Any]:
@@ -125,14 +142,14 @@ class DevLaneStore:
         if missing:
             raise ValueError(f"continuity packet missing required fields: {', '.join(missing)}")
         document = {"schema_version": "dev_lane_continuity.v1", "lane_id": lane_id, **packet, "updated_at": utc_now()}
-        self.write_json(Path("continuity") / f"{lane_id}.json", document)
+        self.write_json(self._lane_path("continuity", lane_id), document)
         return document
 
     def continuity_packet(self, lane_id: str) -> dict[str, Any] | None:
-        return self.read_json(Path("continuity") / f"{lane_id}.json", None)
+        return self.read_json(self._lane_path("continuity", lane_id), None)
 
     def active_claim_for_work(self, work_item_id: str, *, now: str) -> dict[str, Any] | None:
-        claim = self.read_json(Path("claims") / f"{safe_id(work_item_id)}.json", None)
+        claim = self.read_json(self._claim_path(work_item_id), None)
         if not claim or claim.get("claim_status") != ACTIVE_CLAIM_STATUS:
             return None
         if utc_parse(claim["claim_expires_at"]) <= utc_parse(now):
@@ -140,7 +157,8 @@ class DevLaneStore:
         return claim
 
     def claim_for_work(self, work_item_id: str) -> dict[str, Any] | None:
-        return self.read_json(Path("claims") / f"{safe_id(work_item_id)}.json", None)
+        claim = self.read_json(self._claim_path(work_item_id), None)
+        return claim if isinstance(claim, dict) else None
 
     def claim_work(
         self,
@@ -174,6 +192,19 @@ class DevLaneStore:
             )
             self._append_history(recovered)
             self._set_work_item_status(work_item_id, "open")
+        items = self.read_json("work/items.json", {})
+        item = items.get(work_item_id)
+        if item is None:
+            raise ValueError(f"work item does not exist for claim: {work_item_id}")
+        lanes = self.read_json("lanes.json", {})
+        lane = lanes.get(lane_id) or {
+            "lane_id": lane_id,
+            "repo_scope": item.get("repo_scope"),
+            "authorized_scopes": item.get("authorized_scopes", ["**"]),
+        }
+        pickable, reason = self._is_item_pickable_for_lane(item, lane, now)
+        if not pickable:
+            raise ValueError(f"work item is not claimable: {reason}")
         expires_at = format_utc(now_dt + timedelta(seconds=ttl_seconds))
         claim = {
             "schema_version": "dev_lane_claim.v1",
@@ -185,7 +216,7 @@ class DevLaneStore:
             "claim_status": ACTIVE_CLAIM_STATUS,
             "claim_evidence_path": evidence_path,
         }
-        self.write_json(Path("claims") / f"{safe_id(work_item_id)}.json", claim)
+        self.write_json(self._claim_path(work_item_id), claim)
         self._set_work_item_status(work_item_id, "claimed")
         return claim
 
@@ -205,12 +236,23 @@ class DevLaneStore:
         claim = self.claim_for_work(work_item_id)
         if not claim:
             raise ValueError(f"no claim exists for {work_item_id}")
+        if claim.get("claim_status") != ACTIVE_CLAIM_STATUS:
+            raise ValueError(f"claim is not active for {work_item_id}: {claim.get('claim_status')}")
         closed = dict(claim)
         closed.update({"claim_status": status, "closed_at": now, "closeout_evidence_path": evidence_path})
         if message:
             closed["closeout_message"] = message
-        self.write_json(Path("claims") / f"{safe_id(work_item_id)}.json", closed)
+        self.write_json(self._claim_path(work_item_id), closed)
         self._append_history(closed)
+        status_by_close = {
+            "completed": "completed",
+            "blocked": "blocked",
+            "refused": "refused",
+            "superseded": "superseded",
+            "no-op with evidence": "completed",
+            "expired/recovered": "open",
+        }
+        self._set_work_item_status(work_item_id, status_by_close[status])
         return closed
 
     def add_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
