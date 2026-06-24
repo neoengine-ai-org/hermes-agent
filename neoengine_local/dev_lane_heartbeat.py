@@ -173,6 +173,7 @@ class DevLaneStore:
                 }
             )
             self._append_history(recovered)
+            self._set_work_item_status(work_item_id, "open")
         expires_at = format_utc(now_dt + timedelta(seconds=ttl_seconds))
         claim = {
             "schema_version": "dev_lane_claim.v1",
@@ -185,7 +186,18 @@ class DevLaneStore:
             "claim_evidence_path": evidence_path,
         }
         self.write_json(Path("claims") / f"{safe_id(work_item_id)}.json", claim)
+        self._set_work_item_status(work_item_id, "claimed")
         return claim
+
+    def _set_work_item_status(self, work_item_id: str, status: str) -> None:
+        items = self.read_json("work/items.json", {})
+        item = items.get(work_item_id)
+        if not item:
+            return
+        item["status"] = status
+        item["updated_at"] = utc_now()
+        items[work_item_id] = item
+        self.write_json("work/items.json", items)
 
     def close_claim(self, work_item_id: str, status: str, evidence_path: str, now: str, message: str | None = None) -> dict[str, Any]:
         if status not in TERMINAL_CLAIM_STATUSES:
