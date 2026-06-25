@@ -364,7 +364,9 @@ class DevLaneStore:
             blocked_event_id = None
             if status_by_close[status] == "blocked":
                 items = self.read_json("work/items.json", {})
-                blocked_event_id = claim.get("claimed_event_id") or latest_valid_event_id(items.get(work_item_id, {}))
+                blocked_event_id = claim.get("claimed_event_id") or latest_valid_event_id_at_or_before(
+                    items.get(work_item_id, {}), claim.get("claim_started_at")
+                )
             self._set_work_item_status(
                 work_item_id,
                 status_by_close[status],
@@ -430,13 +432,17 @@ class DevLaneStore:
                 raise ValueError(f"unknown work item: {work_item_id}")
             item = items[work_item_id]
             boundary_id = item.get("blocked_at_event_id") if item.get("status") == "blocked" else None
+            boundary_created_at = None
             if item.get("status") == "claimed":
                 claim = self.claim_for_work(work_item_id)
                 boundary_id = claim.get("claimed_event_id") if claim else boundary_id
+                if claim and not boundary_id:
+                    boundary_created_at = str(claim.get("claim_started_at", "")) or None
             if boundary_id:
                 boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == boundary_id), None)
-                boundary_created_at = str(boundary.get("created_at", "")) if boundary else None
-                if boundary_created_at is None or str(created_at) < boundary_created_at:
+                boundary_created_at = str(boundary.get("created_at", "")) if boundary else boundary_created_at
+            if boundary_created_at is not None:
+                if str(created_at) < boundary_created_at:
                     raise ValueError("event is older than blocked baseline or claim baseline")
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
             item.setdefault("events", []).append(event)
@@ -683,6 +689,19 @@ def latest_valid_event_id(item: dict[str, Any]) -> str | None:
             return event_id(event)
     return None
 
+
+
+def latest_valid_event_id_at_or_before(item: dict[str, Any], created_at: str | None) -> str | None:
+    if not created_at:
+        return None
+    candidates = [
+        event for event in item.get("events", [])
+        if event.get("event_type") in VALID_WAKE_EVENTS and str(event.get("created_at", "")) <= str(created_at)
+    ]
+    if not candidates:
+        return None
+    event = sorted(candidates, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
+    return event_id(event)
 
 def scopes_overlap(lane_scopes: list[str], item_scopes: list[str]) -> bool:
     if not lane_scopes or not item_scopes:

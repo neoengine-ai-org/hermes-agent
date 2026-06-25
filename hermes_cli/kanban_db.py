@@ -1857,7 +1857,7 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         "expired/recovered": "open",
     }
     with write_txn(conn):
-        row = conn.execute("SELECT work_item_id, lane_id, claimed_event_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
+        row = conn.execute("SELECT work_item_id, lane_id, claimed_event_id, claim_started_at FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
         res = conn.execute(
             "UPDATE lane_claims SET claim_status=?, claim_evidence_path=?, closed_at=?, close_message=? "
             "WHERE id=? AND claim_status='active'",
@@ -1866,11 +1866,23 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         if res.rowcount == 1 and row is not None:
             if status_by_close[status] == "blocked":
                 processed_event_id = row["claimed_event_id"] if row["claimed_event_id"] is not None else None
-                # Legacy active claims migrated before claimed_event_id existed do not
-                # have an immutable claim-time event baseline.  Do not fall back
-                # to mutable heartbeat/work-item latest-event fields here: a newer
-                # event may have arrived during the active claim and must remain
-                # available to wake a repair/retry lane after blocked closeout.
+                if processed_event_id is None:
+                    # Legacy active claims migrated before claimed_event_id existed
+                    # lack an immutable event-id boundary.  Reconstruct the safest
+                    # claim-time baseline from event timestamps rather than mutable
+                    # last_event_id, so newer events that arrived during the claim
+                    # remain available after blocked closeout.
+                    baseline = conn.execute(
+                        """
+                        SELECT id FROM lane_events
+                         WHERE work_item_id=?
+                           AND event_type IN ({})
+                           AND created_at <= ?
+                         ORDER BY created_at DESC, id DESC LIMIT 1
+                        """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                        (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["claim_started_at"]),
+                    ).fetchone()
+                    processed_event_id = baseline["id"] if baseline is not None else None
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, "
                     "blocked_event_id=COALESCE(?, blocked_event_id) "
@@ -1954,14 +1966,18 @@ def record_lane_event(
                     "reason": "work_item_not_found",
                 }
             boundary_event_id = None
+            boundary_created_at = None
             if item["status"] == "blocked" and item["blocked_event_id"] is not None:
                 boundary_event_id = item["blocked_event_id"]
             elif item["status"] == "claimed":
-                claim = conn.execute("SELECT claimed_event_id FROM lane_claims WHERE work_item_id=? AND claim_status='active' ORDER BY id DESC LIMIT 1", (work_item_id,)).fetchone()
+                claim = conn.execute("SELECT claimed_event_id, claim_started_at FROM lane_claims WHERE work_item_id=? AND claim_status='active' ORDER BY id DESC LIMIT 1", (work_item_id,)).fetchone()
                 boundary_event_id = claim["claimed_event_id"] if claim is not None else None
+                boundary_created_at = float(claim["claim_started_at"]) if claim is not None and boundary_event_id is None else None
             if boundary_event_id is not None:
                 boundary = conn.execute("SELECT created_at FROM lane_events WHERE id=? AND work_item_id=?", (boundary_event_id, work_item_id)).fetchone()
-                if boundary is not None and ts < float(boundary["created_at"]):
+                boundary_created_at = float(boundary["created_at"]) if boundary is not None else boundary_created_at
+            if boundary_created_at is not None:
+                if ts < boundary_created_at:
                     return {
                         "event_id": None,
                         "event_type": event_type,
@@ -1990,6 +2006,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
         SELECT e.*
           FROM lane_events e
           LEFT JOIN lane_work_items w ON w.work_item_id = e.work_item_id
+          LEFT JOIN lane_events b ON b.id = w.blocked_event_id AND b.work_item_id = w.work_item_id
          WHERE (e.lane_id=? OR e.lane_id IS NULL)
            AND e.id > ?
            AND e.consumed_at IS NULL
@@ -2002,7 +2019,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
                     AND NOT (
                         w.status='blocked'
                         AND w.blocked_event_id IS NOT NULL
-                        AND e.id <= w.blocked_event_id
+                        AND (e.id <= w.blocked_event_id OR (b.created_at IS NOT NULL AND e.created_at < b.created_at))
                     )
                  )
            )

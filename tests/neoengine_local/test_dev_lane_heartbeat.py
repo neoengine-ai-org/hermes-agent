@@ -708,3 +708,25 @@ def test_file_backed_record_event_rejects_backdated_active_claim_event(tmp_path:
     store.close_claim("work-claimed-backdated", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
     result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
     assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_legacy_claim_null_baseline_preserves_newer_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-legacy-null", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-legacy-null", "new_repair_packet", "2099-06-24T00:10:00Z", event_id="E1")
+    claim_result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    claim = store.claim_for_work("work-legacy-null")
+    claim.pop("claimed_event_id", None)
+    store.write_json(str(store._claim_path("work-legacy-null")), claim)
+    with pytest.raises(ValueError, match="older than"):
+        store.record_event("work-legacy-null", "governance_unblock", "2099-06-24T00:00:00Z", event_id="OLD")
+    store.record_event("work-legacy-null", "governance_unblock", "2099-06-24T00:12:00Z", event_id="E2")
+    store.close_claim("work-legacy-null", "blocked", "receipts/blocked.md", "2099-06-24T00:13:00Z")
+    item = store.read_json("work/items.json", {})["work-legacy-null"]
+    next_pick = store.pick_next_work("lane-b", "session-b", now="2099-06-24T00:14:00Z")
+    assert claim_result["claim"]["claimed_event_id"] == "E1"
+    assert item["blocked_at_event_id"] == "E1"
+    assert next_pick["action"] == "claimed"
+    assert next_pick["claim"]["claimed_event_id"] == "E2"

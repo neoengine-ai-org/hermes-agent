@@ -674,3 +674,39 @@ def test_sqlite_rejects_unknown_work_item_and_backdated_claimed_event(tmp_path: 
     assert claim_newer_wake["wake_reason"] == "timer"
     assert allowed is not None
     assert allowed["claim"]["claimed_event_id"] == newer["event_id"]
+
+
+def test_sqlite_next_lane_wake_skips_injected_backdated_blocked_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-stale", agent_session_id="session", repo_scope="repo", state="idle-no-work", last_event_id=0, now=90)
+        kb.upsert_lane_work_item(conn, work_item_id="W-injected-stale", repo_scope="repo", status="open", now=100)
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-injected-stale", event_type="failed_ci_transition", now=100)
+        picked = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="session-a", authorized_scopes=["repo"], now=101)
+        kb.close_lane_claim(conn, picked["claim"]["claim_id"], status="blocked", evidence_path="receipts/blocked.md", now=102)
+        conn.execute("INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (NULL, 'governance_unblock', 'W-injected-stale', NULL, 50)")
+        wake = kb.next_lane_wake(conn, "lane-stale", now=103)
+        denied = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="session-b", authorized_scopes=["repo"], now=104)
+    assert event["event_id"] is not None
+    assert wake["wake_reason"] == "timer"
+    assert denied is None
+
+
+def test_sqlite_legacy_claim_null_baseline_reconstructs_boundary_without_swallowing_newer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-legacy-null", repo_scope="repo", status="open", now=100)
+        e1 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-legacy-null", event_type="new_repair_packet", now=100)
+        picked = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="session-a", authorized_scopes=["repo"], now=101)
+        conn.execute("UPDATE lane_claims SET claimed_event_id=NULL WHERE id=?", (picked["claim"]["claim_id"],))
+        stale = kb.record_lane_event(conn, lane_id=None, work_item_id="W-legacy-null", event_type="governance_unblock", now=50)
+        newer = kb.record_lane_event(conn, lane_id=None, work_item_id="W-legacy-null", event_type="governance_unblock", now=104)
+        kb.close_lane_claim(conn, picked["claim"]["claim_id"], status="blocked", evidence_path="receipts/blocked.md", now=105)
+        row = conn.execute("SELECT blocked_event_id FROM lane_work_items WHERE work_item_id='W-legacy-null'").fetchone()
+        allowed = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="session-b", authorized_scopes=["repo"], now=106)
+    assert e1["event_id"] is not None
+    assert stale["recorded"] is False and stale["result"] == "STALE_EVENT"
+    assert newer["event_id"] is not None
+    assert row["blocked_event_id"] == e1["event_id"]
+    assert allowed is not None
+    assert allowed["claim"]["claimed_event_id"] == newer["event_id"]
