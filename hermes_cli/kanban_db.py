@@ -1847,12 +1847,23 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
                     (row["lane_id"], row["work_item_id"]),
                 ).fetchone()
                 processed_event_id = processed_event["last_event_id"] if processed_event else None
+                if processed_event_id is None:
+                    work_item_event = conn.execute(
+                        "SELECT last_event_id FROM lane_work_items WHERE work_item_id=?",
+                        (row["work_item_id"],),
+                    ).fetchone()
+                    processed_event_id = work_item_event["last_event_id"] if work_item_event else None
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, "
                     "blocked_event_id=COALESCE(?, blocked_event_id) "
                     "WHERE work_item_id=? AND status='claimed'",
                     (status_by_close[status], ts, processed_event_id, row["work_item_id"]),
                 )
+                if processed_event_id:
+                    conn.execute(
+                        "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+                        (ts, processed_event_id),
+                    )
             else:
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=? WHERE work_item_id=? AND status='claimed'",

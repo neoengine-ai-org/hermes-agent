@@ -425,3 +425,19 @@ def test_blocked_event_baseline_survives_work_item_refresh(tmp_path: Path, monke
 
         second = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1004)
         assert second is None
+
+
+def test_open_event_direct_claim_blocked_closeout_baselines_processed_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-open-direct-blocked", repo_scope="repo", status="open", now=900)
+        kb.record_lane_event(conn, lane_id=None, work_item_id="W-open-direct-blocked", event_type="new_repair_packet", now=1000)
+        first = kb.claim_lane_work_item(conn, "W-open-direct-blocked", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="direct.md", now=1001)
+        assert first["claimed"] is True
+        assert kb.close_lane_claim(conn, claim_id=first["claim_id"], status="blocked", evidence_path="blocked.md", now=1002) is True
+        blocked = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id='W-open-direct-blocked'").fetchone()
+        assert blocked["status"] == "blocked"
+        assert blocked["last_event_id"] == 1
+        assert blocked["blocked_event_id"] == 1
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1002.0
+        assert kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1003) is None
