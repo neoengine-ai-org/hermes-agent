@@ -740,3 +740,15 @@ def test_sqlite_blocked_missing_event_baseline_fails_closed(tmp_path: Path, monk
     assert event["result"] == "STALE_EVENT"
     assert claim["claimed"] is False
     assert wake["wake_reason"] == "timer"
+
+
+def test_sqlite_refresh_preserves_blocked_when_event_baseline_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-refresh-missing-baseline", repo_scope="repo", status="blocked", blocked_event_id=999, now=100)
+        conn.execute("INSERT INTO lane_events(event_type, work_item_id, created_at) VALUES ('governance_unblock','W-refresh-missing-baseline',200)")
+        conn.execute("UPDATE lane_work_items SET last_event_id=last_insert_rowid() WHERE work_item_id='W-refresh-missing-baseline'")
+        refreshed = kb.upsert_lane_work_item(conn, work_item_id="W-refresh-missing-baseline", repo_scope="repo", status="open", now=201)
+        claim = kb.claim_lane_work_item(conn, "W-refresh-missing-baseline", lane_id="lane", claim_owner="session", ttl_seconds=300, evidence_path="claim.md", now=202)
+    assert refreshed["status"] == "blocked"
+    assert claim["claimed"] is False

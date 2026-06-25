@@ -2114,6 +2114,19 @@ def upsert_lane_work_item(
                      AND EXISTS (SELECT 1 FROM lane_claims WHERE work_item_id=lane_work_items.work_item_id AND claim_status='active')
                     THEN lane_work_items.status
                     WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NOT NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                        LEFT JOIN lane_events b ON b.id=lane_work_items.blocked_event_id AND b.work_item_id=e.work_item_id
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ('new_repair_packet','governance_unblock','failed_ci_transition','followup_repair_packet')
+                           AND b.id IS NOT NULL
+                           AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
+                     )
+                    THEN lane_work_items.status
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NULL
                      AND (lane_work_items.last_event_id IS NULL OR lane_work_items.last_event_id=lane_work_items.blocked_event_id)
                     THEN lane_work_items.status
                     ELSE excluded.status

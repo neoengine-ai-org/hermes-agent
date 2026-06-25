@@ -411,8 +411,10 @@ class DevLaneStore:
                 if existing.get("blocked_at_event_id") and not incoming.get("blocked_at_event_id"):
                     incoming["blocked_at_event_id"] = existing.get("blocked_at_event_id")
                 if existing.get("status") == "blocked":
-                    latest_valid = latest_valid_event_id(incoming)
-                    if not latest_valid or latest_valid == incoming.get("blocked_at_event_id"):
+                    latest_valid = latest_valid_event(incoming)
+                    if boundary_event is None:
+                        incoming["status"] = "blocked"
+                    elif not latest_valid or not event_after_frontier(item=incoming, event=latest_valid, boundary=boundary_event):
                         incoming["status"] = "blocked"
                 active_claim = self.active_claim_for_work(work_item_id, now=utc_now())
                 if active_claim:
@@ -641,9 +643,7 @@ class DevLaneStore:
         new_events = [
             event for event in item.get("events", [])
             if not event.get("consumed_at")
-            and event_id(event) != consumed
             and f"{item.get('work_item_id')}:{event_id(event)}" != consumed
-            and not (isinstance(consumed, str) and not consumed.startswith(item_prefix) and event_id(event) == consumed)
         ]
         valid_events = [event for event in new_events if event.get("event_type") in VALID_WAKE_EVENTS]
         if valid_events:

@@ -757,3 +757,26 @@ def test_file_backed_blocked_missing_event_baseline_fails_closed(tmp_path: Path)
         store.record_event("work-missing-baseline", "governance_unblock", "2099-06-24T00:01:00Z", event_id="E2")
     result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:02:00Z")
     assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_refresh_preserves_blocked_when_event_baseline_missing(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-refresh-missing-baseline", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked", "blocked_at_event_id": "MISSING", "events": [{"event_id": "E2", "event_type": "governance_unblock", "created_at": "2099-06-24T00:01:00Z"}]})
+    refreshed = store.add_work_item({"work_item_id": "work-refresh-missing-baseline", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:02:00Z")
+    assert refreshed["status"] == "blocked"
+    assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_legacy_bare_consumed_event_id_does_not_hide_other_work(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "A", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "B", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("A", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    store.record_event("B", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    store.emit_heartbeat("lane-a", "session-a", "repo", "idle-no-work", None, "2099-06-24T00:01:00Z", "2099-06-24T00:06:00Z", "receipt.md", last_event_consumed="E1")
+    picked = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:02:00Z")
+    assert picked["action"] == "claimed"
+    assert picked["work_item_id"] in {"A", "B"}
