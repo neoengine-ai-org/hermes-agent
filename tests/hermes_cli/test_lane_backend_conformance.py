@@ -315,3 +315,25 @@ def test_file_future_event_refresh_does_not_reopen_without_refresh_frontier(tmp_
     assert refreshed["status"] == "blocked"
     assert early["action"] == "idle-no-work"
     assert late_refresh["status"] == "open"
+
+
+
+def test_sqlite_null_baseline_closeout_does_not_reconstruct_from_consumed_rows(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "sqlite-consumed-closeout-home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="SQL-null-reconstruct", repo_scope="repo", status="open", now=90)
+        conn.execute(
+            "INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at, consumed_at) VALUES(NULL, 'queue_priority_change', 'SQL-null-reconstruct', NULL, 100, 101)"
+        )
+        claim = kb.claim_lane_work_item(conn, "SQL-null-reconstruct", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=110)
+        assert claim["claimed"] is True
+        assert claim["claimed_event_id"] is None
+        assert kb.close_lane_claim(conn, claim_id=claim["claim_id"], status="blocked", evidence_path="blocked.md", now=120) is True
+        blocked = conn.execute("SELECT status, blocked_event_id, blocked_at FROM lane_work_items WHERE work_item_id='SQL-null-reconstruct'").fetchone()
+        stale = kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-null-reconstruct", event_type="review_request", now=116)
+        second = kb.claim_lane_work_item(conn, "SQL-null-reconstruct", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="second.md", now=117)
+    assert blocked["status"] == "blocked"
+    assert blocked["blocked_event_id"] is None
+    assert blocked["blocked_at"] == 120
+    assert stale["result"] == "STALE_EVENT"
+    assert second["claimed"] is False

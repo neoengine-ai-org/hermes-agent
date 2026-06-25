@@ -1900,36 +1900,12 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         )
         if res.rowcount == 1 and row is not None:
             if status_by_close[status] == "blocked":
-                processed_event_id = row["claimed_event_id"] if row["claimed_event_id"] is not None else None
-                if processed_event_id is None:
-                    # Legacy active claims migrated before claimed_event_id existed
-                    # lack an immutable event-id boundary.  Reconstruct the safest
-                    # claim-time baseline from event timestamps rather than mutable
-                    # last_event_id, so newer events that arrived during the claim
-                    # remain available after blocked closeout.
-                    baseline = conn.execute(
-                        """
-                        SELECT id FROM lane_events
-                         WHERE work_item_id=?
-                           AND event_type IN ({})
-                           AND consumed_at IS NOT NULL
-                           AND consumed_at <= ?
-                         ORDER BY created_at DESC, id DESC LIMIT 1
-                        """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                        (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["claim_started_at"]),
-                    ).fetchone()
-                    if baseline is None:
-                        baseline = conn.execute(
-                            """
-                            SELECT id FROM lane_events
-                             WHERE work_item_id=?
-                               AND event_type IN ({})
-                               AND created_at < ?
-                             ORDER BY created_at DESC, id DESC LIMIT 1
-                            """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                            (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["claim_started_at"]),
-                        ).fetchone()
-                    processed_event_id = baseline["id"] if baseline is not None else None
+                # A blocked closeout may only anchor to the immutable event
+                # captured when the claim was opened. If legacy/direct state has
+                # no claimed_event_id, keep a null baseline and use blocked_at as
+                # the closeout frontier; do not reconstruct authority from older
+                # consumed rows or backdated durable events.
+                processed_event_id = row["claimed_event_id"]
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, blocked_at=?, "
                     "blocked_event_id=COALESCE(?, blocked_event_id) "

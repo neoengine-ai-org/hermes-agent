@@ -698,7 +698,7 @@ def test_sqlite_next_lane_wake_skips_injected_backdated_blocked_event(tmp_path: 
     assert denied is None
 
 
-def test_sqlite_legacy_claim_null_baseline_reconstructs_boundary_without_swallowing_newer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_sqlite_legacy_claim_null_baseline_uses_closeout_frontier(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
         kb.upsert_lane_work_item(conn, work_item_id="W-legacy-null", repo_scope="repo", status="open", now=100)
@@ -713,9 +713,8 @@ def test_sqlite_legacy_claim_null_baseline_reconstructs_boundary_without_swallow
     assert e1["event_id"] is not None
     assert stale["recorded"] is False and stale["result"] == "STALE_EVENT"
     assert newer["event_id"] is not None
-    assert row["blocked_event_id"] == e1["event_id"]
-    assert allowed is not None
-    assert allowed["claim"]["claimed_event_id"] == newer["event_id"]
+    assert row["blocked_event_id"] is None
+    assert allowed is None
 
 
 def test_sqlite_next_lane_wake_does_not_hide_older_other_work_item_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
