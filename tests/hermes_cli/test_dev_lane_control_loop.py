@@ -328,3 +328,28 @@ def test_consumed_blocked_event_cannot_reclaim_same_blocked_work(tmp_path: Path,
         assert blocked["blocked_event_id"] == 1
         second = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-b", authorized_scopes=["repo"], ttl_seconds=300, now=1003)
         assert second is None
+
+
+def test_new_event_during_active_claim_remains_pickable_after_blocked_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-a", agent_session_id="sess-a", repo_scope="repo", state="idle-no-work", now=999)
+        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-race", repo_scope="repo", status="blocked", blocked_event_id=99)
+        first_event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-race", event_type="new_repair_packet", now=1000)
+        first = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-a", authorized_scopes=["repo"], ttl_seconds=300, now=1001)
+        assert first is not None and first["claim"]["claimed"] is True
+        assert first_event["event_id"] == 1
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1001.0
+
+        second_event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-race", event_type="followup_repair_packet", now=1002)
+        assert second_event["event_id"] == 2
+        assert kb.close_lane_claim(conn, claim_id=first["claim"]["claim_id"], status="blocked", evidence_path="receipts/blocked.md", now=1003) is True
+
+        blocked = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id='W-blocked-race'").fetchone()
+        assert blocked["blocked_event_id"] == 1
+        assert blocked["last_event_id"] == 2
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 2").fetchone()[0] is None
+
+        second = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-b", authorized_scopes=["repo"], ttl_seconds=300, now=1004)
+        assert second is not None and second["work_item_id"] == "W-blocked-race"
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 2").fetchone()[0] == 1004.0

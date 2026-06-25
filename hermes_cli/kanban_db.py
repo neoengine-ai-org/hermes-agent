@@ -1803,7 +1803,7 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         "expired/recovered": "open",
     }
     with write_txn(conn):
-        row = conn.execute("SELECT work_item_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
+        row = conn.execute("SELECT work_item_id, lane_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
         res = conn.execute(
             "UPDATE lane_claims SET claim_status=?, claim_evidence_path=?, closed_at=?, close_message=? "
             "WHERE id=? AND claim_status='active'",
@@ -1811,11 +1811,22 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         )
         if res.rowcount == 1 and row is not None:
             if status_by_close[status] == "blocked":
+                processed_event = conn.execute(
+                    """
+                    SELECT last_event_id
+                      FROM lane_heartbeats
+                     WHERE lane_id=?
+                       AND claimed_work_item_id=?
+                     LIMIT 1
+                    """,
+                    (row["lane_id"], row["work_item_id"]),
+                ).fetchone()
+                processed_event_id = processed_event["last_event_id"] if processed_event else None
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, "
-                    "blocked_event_id=COALESCE(last_event_id, blocked_event_id) "
+                    "blocked_event_id=COALESCE(?, blocked_event_id) "
                     "WHERE work_item_id=? AND status='claimed'",
-                    (status_by_close[status], ts, row["work_item_id"]),
+                    (status_by_close[status], ts, processed_event_id, row["work_item_id"]),
                 )
             else:
                 conn.execute(
