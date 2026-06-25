@@ -1451,10 +1451,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     lane_claim_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_claims)")}
-    if "claimed_event_id" not in lane_claim_cols:
+    if lane_claim_cols and "claimed_event_id" not in lane_claim_cols:
         _add_column_if_missing(conn, "lane_claims", "claimed_event_id", "claimed_event_id INTEGER")
     lane_work_item_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_work_items)")}
-    if "blocked_at" not in lane_work_item_cols:
+    if lane_work_item_cols and "blocked_at" not in lane_work_item_cols:
         _add_column_if_missing(conn, "lane_work_items", "blocked_at", "blocked_at INTEGER")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
