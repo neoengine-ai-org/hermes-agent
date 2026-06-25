@@ -2144,6 +2144,7 @@ def upsert_lane_work_item(
                          WHERE e.work_item_id=lane_work_items.work_item_id
                            AND e.consumed_at IS NULL
                            AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
                            AND b.id IS NOT NULL
                            AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
                      )
@@ -2155,6 +2156,7 @@ def upsert_lane_work_item(
                          WHERE e.work_item_id=lane_work_items.work_item_id
                            AND e.consumed_at IS NULL
                            AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
                            AND (lane_work_items.blocked_at IS NULL OR e.created_at > lane_work_items.blocked_at)
                      )
                     THEN lane_work_items.status
@@ -2183,6 +2185,7 @@ def upsert_lane_work_item(
                          WHERE e.work_item_id=lane_work_items.work_item_id
                            AND e.consumed_at IS NULL
                            AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
                            AND b.id IS NOT NULL
                            AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
                      )
@@ -2194,6 +2197,7 @@ def upsert_lane_work_item(
                          WHERE e.work_item_id=lane_work_items.work_item_id
                            AND e.consumed_at IS NULL
                            AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
                            AND (lane_work_items.blocked_at IS NULL OR e.created_at > lane_work_items.blocked_at)
                      )
                     THEN lane_work_items.updated_at

@@ -271,3 +271,47 @@ def test_sqlite_claim_baseline_ignores_preconsumed_direct_rows(tmp_path: Path, m
     assert base["event_id"]
     assert second["claimed"] is True
     assert second["claimed_event_id"] == unconsumed["event_id"]
+
+
+
+def test_sqlite_future_event_refresh_does_not_reopen_before_event_time(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "sqlite-future-refresh-home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="SQL-future-refresh", repo_scope="repo", status="open", now=100)
+        claim = kb.claim_lane_work_item(conn, "SQL-future-refresh", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=110)
+        assert kb.close_lane_claim(conn, claim_id=claim["claim_id"], status="blocked", evidence_path="blocked.md", now=120) is True
+        kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-future-refresh", event_type="queue_priority_change", now=180)
+        refreshed = kb.upsert_lane_work_item(conn, work_item_id="SQL-future-refresh", repo_scope="repo", status="open", now=150)
+        early = kb.claim_lane_work_item(conn, "SQL-future-refresh", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="early.md", now=150)
+        refreshed_late = kb.upsert_lane_work_item(conn, work_item_id="SQL-future-refresh", repo_scope="repo", status="open", now=180)
+    assert refreshed["status"] == "blocked"
+    assert early["claimed"] is False
+    assert refreshed_late["status"] == "open"
+
+
+def test_file_future_event_refresh_does_not_reopen_without_refresh_frontier(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path / "file-future-refresh-store")
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "FILE-future-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("FILE-future-refresh", "lane-a", "sess-a", "2099-01-01T00:01:00Z", 3600, "claims/a.json")
+    store.close_claim("FILE-future-refresh", "blocked", "receipts/blocked.md", "2099-01-01T00:02:00Z")
+    refreshed = store.add_work_item({
+        "work_item_id": "FILE-future-refresh",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "open",
+        "events": [{"event_id": "future", "event_type": "queue_priority_change", "created_at": "2099-01-01T00:03:00Z"}],
+    })
+    early = store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:02:30Z")
+    late_refresh = store.add_work_item({
+        "work_item_id": "FILE-future-refresh",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "open",
+        "updated_at": "2099-01-01T00:03:00Z",
+        "events": [{"event_id": "future", "event_type": "queue_priority_change", "created_at": "2099-01-01T00:03:00Z"}],
+    })
+    assert refreshed["status"] == "blocked"
+    assert early["action"] == "idle-no-work"
+    assert late_refresh["status"] == "open"

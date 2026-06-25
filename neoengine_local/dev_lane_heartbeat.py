@@ -418,13 +418,14 @@ class DevLaneStore:
                     seen.add(event_id(event))
                 incoming["events"] = merged_events
                 incoming.setdefault("created_at", existing.get("created_at") or utc_now())
+                refresh_at = incoming.get("updated_at")
                 if existing.get("status") == "blocked":
                     incoming["updated_at"] = existing.get("updated_at") or incoming.get("updated_at") or utc_now()
                     incoming["blocked_at"] = existing.get("blocked_at") or existing.get("updated_at") or incoming.get("blocked_at")
                 if existing.get("blocked_at_event_id") and not incoming.get("blocked_at_event_id"):
                     incoming["blocked_at_event_id"] = existing.get("blocked_at_event_id")
                 if existing.get("status") == "blocked":
-                    latest_valid = latest_unconsumed_valid_event(incoming)
+                    latest_valid = latest_unconsumed_valid_event(incoming, at_or_before=refresh_at) if refresh_at else None
                     if boundary_event is None:
                         if blocked_boundary:
                             incoming["status"] = "blocked"
