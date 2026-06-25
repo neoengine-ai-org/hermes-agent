@@ -386,16 +386,24 @@ class DevLaneStore:
             if existing:
                 merged_events = list(existing.get("events", []))
                 seen = {event_id(event) for event in merged_events}
+                blocked_boundary = existing.get("blocked_at_event_id") if existing.get("status") == "blocked" else None
+                boundary_event = next((event for event in merged_events if event_id(event) == blocked_boundary), None)
+                boundary_created_at = str(boundary_event.get("created_at", "")) if boundary_event else None
                 for event in incoming.get("events", []):
-                    if event_id(event) not in seen:
-                        merged_events.append(event)
-                        seen.add(event_id(event))
+                    if event_id(event) in seen:
+                        continue
+                    if blocked_boundary and boundary_created_at is not None and str(event.get("created_at", "")) <= boundary_created_at:
+                        continue
+                    merged_events.append(event)
+                    seen.add(event_id(event))
                 incoming["events"] = merged_events
                 incoming.setdefault("created_at", existing.get("created_at") or utc_now())
                 if existing.get("blocked_at_event_id") and not incoming.get("blocked_at_event_id"):
                     incoming["blocked_at_event_id"] = existing.get("blocked_at_event_id")
-                if existing.get("status") == "blocked" and latest_event_id(incoming) == incoming.get("blocked_at_event_id"):
-                    incoming["status"] = "blocked"
+                if existing.get("status") == "blocked":
+                    latest_valid = latest_valid_event_id(incoming)
+                    if not latest_valid or latest_valid == incoming.get("blocked_at_event_id"):
+                        incoming["status"] = "blocked"
                 active_claim = self.active_claim_for_work(work_item_id, now=utc_now())
                 if active_claim:
                     incoming["status"] = "claimed"
@@ -473,7 +481,7 @@ class DevLaneStore:
             )
             return {"action": "idle-no-work", "lane_id": lane_id, "next_eligible_wake_at": next_wake}
         _, item, wake_reason = sorted(candidates, key=lambda row: row[0])[0]
-        evidence_path = f"claims/{safe_id(item['work_item_id'])}.json"
+        evidence_path = str(self._claim_path(str(item["work_item_id"])))
         claim = self.claim_work(item["work_item_id"], lane_id, session_id, now, 3600, evidence_path)
         latest_event = latest_event_id(item)
         next_wake = format_utc(utc_parse(now) + timedelta(minutes=5))
@@ -583,8 +591,10 @@ class DevLaneStore:
             return False, "awaiting_human_review"
         if item.get("status") == "refused" and not item.get("sidecar_evidence_path"):
             return False, "refused_without_sidecar_evidence"
-        if item.get("status") == "blocked" and latest_valid_event_id(item) == item.get("blocked_at_event_id"):
-            return False, "blocked_without_new_event"
+        if item.get("status") == "blocked":
+            latest_valid = latest_valid_event_id(item)
+            if not latest_valid or latest_valid == item.get("blocked_at_event_id"):
+                return False, "blocked_without_new_event"
         if item.get("status") in {"completed", "superseded"}:
             return False, "terminal"
         return True, None
