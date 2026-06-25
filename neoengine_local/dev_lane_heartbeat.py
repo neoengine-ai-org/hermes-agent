@@ -400,9 +400,10 @@ class DevLaneStore:
                 continue
             candidates.append((self._rank_key(item), item, wake_reason))
         if skip_rows:
-            existing = self.read_json("receipts/skips.json", [])
-            existing.extend(skip_rows)
-            self.write_json("receipts/skips.json", existing)
+            with self._exclusive_store_lock():
+                existing = self.read_json("receipts/skips.json", [])
+                existing.extend(skip_rows)
+                self.write_json("receipts/skips.json", existing)
         if not candidates:
             next_wake = format_utc(utc_parse(now) + timedelta(minutes=30))
             self.emit_heartbeat(

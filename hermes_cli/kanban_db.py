@@ -1959,7 +1959,9 @@ def upsert_lane_work_item(
                 failed_required_ci=excluded.failed_required_ci, stale_open_pr=excluded.stale_open_pr,
                 governance_blocker=excluded.governance_blocker, review_gap=excluded.review_gap,
                 dependency_unblocked=excluded.dependency_unblocked, governance_state=excluded.governance_state,
-                capability=excluded.capability, blocked_event_id=excluded.blocked_event_id, updated_at=excluded.updated_at
+                capability=excluded.capability,
+                blocked_event_id=COALESCE(excluded.blocked_event_id, lane_work_items.blocked_event_id),
+                updated_at=excluded.updated_at
             """,
             (work_item_id, repo_scope, status, int(priority), int(failed_required_ci), int(stale_open_pr),
              int(governance_blocker), int(review_gap), int(dependency_unblocked), governance_state,

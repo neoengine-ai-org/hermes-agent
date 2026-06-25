@@ -407,3 +407,21 @@ def test_duplicate_active_legacy_claim_index_conflict_is_structured(tmp_path: Pa
     with pytest.raises(kb.LaneControlMigrationConflictError) as excinfo:
         kb.connect(db_path)
     assert not isinstance(excinfo.value, sqlite3.IntegrityError)
+
+
+def test_blocked_event_baseline_survives_work_item_refresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-refresh-blocked", repo_scope="repo", status="blocked", blocked_event_id=99, now=900)
+        kb.record_lane_event(conn, lane_id=None, work_item_id="W-refresh-blocked", event_type="governance_unblock", now=1000)
+        first = kb.claim_lane_work_item(conn, "W-refresh-blocked", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="first.md", now=1001)
+        assert first["claimed"] is True
+        assert kb.close_lane_claim(conn, claim_id=first["claim_id"], status="blocked", evidence_path="blocked.md", now=1002) is True
+
+        kb.upsert_lane_work_item(conn, work_item_id="W-refresh-blocked", repo_scope="repo", status="blocked", priority=5, now=1003)
+        refreshed = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id='W-refresh-blocked'").fetchone()
+        assert refreshed["blocked_event_id"] == 1
+        assert refreshed["last_event_id"] == 1
+
+        second = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1004)
+        assert second is None
