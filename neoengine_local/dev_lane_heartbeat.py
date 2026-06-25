@@ -166,7 +166,7 @@ class DevLaneStore:
         return self.read_json(self._lane_path("continuity", lane_id), None)
 
     def active_claim_for_work(self, work_item_id: str, *, now: str) -> dict[str, Any] | None:
-        claim = self.read_json(self._claim_path(work_item_id), None)
+        claim = self.claim_for_work(work_item_id)
         if not claim or claim.get("claim_status") != ACTIVE_CLAIM_STATUS:
             return None
         if utc_parse(claim["claim_expires_at"]) <= utc_parse(now):
@@ -177,7 +177,15 @@ class DevLaneStore:
         return Path("claims") / f"{quote(work_item_id, safe='-_.')}.json"
 
     def claim_for_work(self, work_item_id: str) -> dict[str, Any] | None:
-        claim = self.read_json(self._claim_path(work_item_id), None)
+        claim = None
+        try:
+            claim = self.read_json(self._claim_path(work_item_id), None)
+        except ValueError:
+            # Legacy claim files may exist for IDs that are no longer admitted
+            # into the canonical namespaced claim path.  Read them only through
+            # the bounded legacy percent-encoded path so they can be closed or
+            # recovered without making new unsafe paths valid.
+            claim = None
         if not isinstance(claim, dict):
             legacy = self._legacy_claim_path(work_item_id)
             if (self.root / legacy).exists():
@@ -195,6 +203,8 @@ class DevLaneStore:
         recovery_evidence_path: str | None = None,
     ) -> dict[str, Any]:
         current = self.claim_for_work(work_item_id)
+        if current is None:
+            self._safe_storage_key(work_item_id, kind="work_item_id")
         now_dt = utc_parse(now)
         if current and current.get("claim_status") == ACTIVE_CLAIM_STATUS:
             expires = utc_parse(current["claim_expires_at"])
@@ -266,7 +276,17 @@ class DevLaneStore:
         closed.update({"claim_status": status, "closed_at": now, "closeout_evidence_path": evidence_path})
         if message:
             closed["closeout_message"] = message
-        self.write_json(self._claim_path(work_item_id), closed)
+        wrote_canonical = False
+        try:
+            self.write_json(self._claim_path(work_item_id), closed)
+            wrote_canonical = True
+        except ValueError:
+            wrote_canonical = False
+        legacy = self._legacy_claim_path(work_item_id)
+        if (self.root / legacy).exists():
+            self.write_json(legacy, closed)
+        elif not wrote_canonical:
+            raise ValueError(f"work_item_id is unsafe for canonical claim close and no legacy claim exists: {work_item_id!r}")
         self._append_history(closed)
         status_by_close = {
             "completed": "completed",
@@ -282,6 +302,7 @@ class DevLaneStore:
     def add_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
         if "work_item_id" not in item:
             raise ValueError("work item missing work_item_id")
+        self._safe_storage_key(str(item["work_item_id"]), kind="work_item_id")
         items = self.read_json("work/items.json", {})
         item = {"schema_version": "dev_lane_work_item.v1", **item}
         item.setdefault("events", [])
@@ -447,6 +468,10 @@ class DevLaneStore:
         return claims
 
     def _is_item_pickable_for_lane(self, item: dict[str, Any], lane: dict[str, Any], now: str) -> tuple[bool, str | None]:
+        try:
+            self._safe_storage_key(str(item.get("work_item_id", "")), kind="work_item_id")
+        except ValueError:
+            return False, "unsafe_work_item_id"
         if item.get("repo_scope") != lane.get("repo_scope"):
             return False, "outside_repo_scope"
         if not scopes_overlap(lane.get("authorized_scopes", []), item.get("authorized_scopes", [])):

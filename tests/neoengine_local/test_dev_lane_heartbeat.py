@@ -109,12 +109,56 @@ def test_unsafe_work_item_ids_are_rejected_without_mutating_history(tmp_path: Pa
     store = DevLaneStore(tmp_path)
     original_history = [{"work_item_id": "prior", "claim_status": "completed"}]
     store.write_json("claims/history.json", original_history)
-    store.add_work_item({"work_item_id": work_item_id, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
 
     with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
-        store.claim_work(work_item_id, "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/x.json")
+        store.add_work_item({"work_item_id": work_item_id, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
 
     assert store.read_json("claims/history.json") == original_history
+
+
+def test_legacy_active_claim_is_visible_and_closes_without_leaving_active_copy(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-1", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    legacy_claim = {
+        "schema_version": "dev_lane_claim.v1",
+        "work_item_id": "work-1",
+        "lane_id": "lane-a",
+        "claim_owner_session_id": "session-old",
+        "claim_started_at": "2026-06-24T00:00:00Z",
+        "claim_expires_at": "2026-06-24T01:00:00Z",
+        "claim_status": "active",
+        "claim_evidence_path": "claims/work-1.json",
+    }
+    store.write_json("claims/work-1.json", legacy_claim)
+
+    assert store.active_claim_for_work("work-1", now="2026-06-24T00:10:00Z") is not None
+    closed = store.close_claim("work-1", "completed", "receipts/done.md", "2026-06-24T00:20:00Z")
+    report = store.status_report(now="2026-06-24T00:21:00Z")
+
+    assert closed["claim_status"] == "completed"
+    assert store.read_json("claims/work-1.json")["claim_status"] == "completed"
+    assert report["lanes"][0]["active_claims"] == []
+
+
+def test_legacy_percent_encoded_claim_can_be_read_without_reopening_unsafe_id_admission(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    legacy_claim = {
+        "schema_version": "dev_lane_claim.v1",
+        "work_item_id": "PR:36",
+        "lane_id": "lane-a",
+        "claim_owner_session_id": "session-old",
+        "claim_started_at": "2026-06-24T00:00:00Z",
+        "claim_expires_at": "2026-06-24T01:00:00Z",
+        "claim_status": "active",
+        "claim_evidence_path": "claims/PR%3A36.json",
+    }
+    store.write_json("claims/PR%3A36.json", legacy_claim)
+
+    assert store.claim_for_work("PR:36") == legacy_claim
+    assert store.active_claim_for_work("PR:36", now="2026-06-24T00:10:00Z") == legacy_claim
+    with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
+        store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
 
 
 def test_stale_claims_can_be_recovered_with_evidence(tmp_path: Path) -> None:
