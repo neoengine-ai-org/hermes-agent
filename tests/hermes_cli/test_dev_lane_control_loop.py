@@ -604,3 +604,26 @@ def test_sqlite_next_lane_wake_ignores_injected_invalid_event_rows(tmp_path: Pat
     assert wake["eligible_now"] is True
     assert wake["event_id"] == valid["event_id"]
     assert wake["wake_reason"] == "event:new_repair_packet"
+
+
+def test_sqlite_upsert_refresh_preserves_blocked_status_without_new_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-refresh", repo_scope="repo", status="open", now=100)
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-refresh", event_type="failed_ci_transition", now=101)
+        picked = kb.pickup_next_lane_work(conn, lane_id="lane-blocked", agent_session_id="session-a", authorized_scopes=["repo"], now=102)
+        kb.close_lane_claim(conn, picked["claim"]["claim_id"], status="blocked", evidence_path="receipts/blocked.md", now=103)
+
+        refreshed = kb.upsert_lane_work_item(conn, work_item_id="W-blocked-refresh", repo_scope="repo", now=104)
+        denied = kb.pickup_next_lane_work(conn, lane_id="lane-blocked", agent_session_id="session-b", authorized_scopes=["repo"], now=105)
+        newer = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-refresh", event_type="governance_unblock", now=106)
+        refreshed_after_new = kb.upsert_lane_work_item(conn, work_item_id="W-blocked-refresh", repo_scope="repo", now=107)
+        allowed = kb.pickup_next_lane_work(conn, lane_id="lane-blocked", agent_session_id="session-c", authorized_scopes=["repo"], now=108)
+
+    assert picked["claim"]["claimed_event_id"] == event["event_id"]
+    assert refreshed["status"] == "blocked"
+    assert denied is None
+    assert newer["event_id"] != event["event_id"]
+    assert refreshed_after_new["status"] == "open"
+    assert allowed["work_item_id"] == "W-blocked-refresh"
+    assert allowed["claim"]["claimed_event_id"] == newer["event_id"]

@@ -2006,6 +2006,9 @@ def upsert_lane_work_item(
                     WHEN lane_work_items.status='claimed'
                      AND EXISTS (SELECT 1 FROM lane_claims WHERE work_item_id=lane_work_items.work_item_id AND claim_status='active')
                     THEN lane_work_items.status
+                    WHEN lane_work_items.status='blocked'
+                     AND (lane_work_items.last_event_id IS NULL OR lane_work_items.last_event_id=lane_work_items.blocked_event_id)
+                    THEN lane_work_items.status
                     ELSE excluded.status
                 END,
                 priority=excluded.priority,
