@@ -400,7 +400,7 @@ class DevLaneStore:
                     if event_id(event) in seen:
                         continue
                     if blocked_boundary:
-                        if boundary_created_at is None or str(event.get("created_at", "")) < boundary_created_at:
+                        if boundary_event is None or not event_after_frontier(event, boundary_event):
                             continue
                     merged_events.append(event)
                     seen.add(event_id(event))
@@ -442,10 +442,13 @@ class DevLaneStore:
             if boundary_id:
                 boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == boundary_id), None)
                 boundary_created_at = str(boundary.get("created_at", "")) if boundary else boundary_created_at
-            if boundary_created_at is not None:
-                if str(created_at) < boundary_created_at or (item.get("status") == "claimed" and claim and not boundary_id and str(created_at) == boundary_created_at):
-                    raise ValueError("event is older than blocked baseline or claim baseline")
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
+            if boundary_created_at is not None:
+                if item.get("status") == "claimed" and claim and not boundary_id:
+                    if str(created_at) <= boundary_created_at:
+                        raise ValueError("event is older than blocked baseline or claim baseline")
+                elif boundary and not event_after_frontier(event, boundary):
+                    raise ValueError("event is older than blocked baseline or claim baseline")
             item.setdefault("events", []).append(event)
             self.write_json("work/items.json", items)
             return event
@@ -619,10 +622,7 @@ class DevLaneStore:
                 return False, "blocked_without_new_event"
             blocked_boundary = item.get("blocked_at_event_id")
             boundary = next((event for event in item.get("events", []) if event_id(event) == blocked_boundary), None)
-            if boundary and (
-                event_id(latest_valid) == blocked_boundary
-                or str(latest_valid.get("created_at", "")) < str(boundary.get("created_at", ""))
-            ):
+            if boundary and not event_after_frontier(latest_valid, boundary):
                 return False, "blocked_without_new_event"
             if not boundary and blocked_boundary and event_id(latest_valid) == blocked_boundary:
                 return False, "blocked_without_new_event"
@@ -683,6 +683,14 @@ def safe_id(value: str) -> str:
 
 def event_id(event: dict[str, Any]) -> str:
     return str(event.get("event_id") or f"{event.get('event_type')}:{event.get('created_at')}")
+
+
+def event_after_frontier(event: dict[str, Any], boundary: dict[str, Any]) -> bool:
+    event_created = str(event.get("created_at", ""))
+    boundary_created = str(boundary.get("created_at", ""))
+    if event_created != boundary_created:
+        return event_created > boundary_created
+    return event_id(event) > event_id(boundary)
 
 
 def latest_event_id(item: dict[str, Any]) -> str | None:

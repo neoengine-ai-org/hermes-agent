@@ -1798,7 +1798,7 @@ def claim_lane_work_item(
                            AND e.consumed_at IS NULL
                            AND e.event_type IN ({})
                            AND (
-                                (b.id IS NOT NULL AND e.created_at > b.created_at)
+                                (b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id)))
                                 OR (b.id IS NULL AND e.id != ?)
                            )
                          ORDER BY e.created_at DESC, e.id DESC LIMIT 1
@@ -2047,7 +2047,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
                     AND NOT (
                         w.status='blocked'
                         AND w.blocked_event_id IS NOT NULL
-                        AND (e.id = w.blocked_event_id OR (b.created_at IS NOT NULL AND e.created_at < b.created_at))
+                        AND (e.id = w.blocked_event_id OR (b.created_at IS NOT NULL AND (e.created_at < b.created_at OR (e.created_at = b.created_at AND e.id <= b.id))))
                     )
                  )
            )
@@ -2136,7 +2136,7 @@ def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capa
                  WHERE e.work_item_id=?
                    AND e.consumed_at IS NULL
                    AND e.event_type IN ({})
-                   AND ((b.id IS NOT NULL AND e.created_at > b.created_at) OR (b.id IS NULL AND e.id != ?))
+                   AND ((b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))) OR (b.id IS NULL AND e.id != ?))
                  LIMIT 1
                 """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
                 (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["blocked_event_id"]),
