@@ -1903,11 +1903,23 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
                         SELECT id FROM lane_events
                          WHERE work_item_id=?
                            AND event_type IN ({})
-                           AND created_at < ?
+                           AND consumed_at IS NOT NULL
+                           AND consumed_at <= ?
                          ORDER BY created_at DESC, id DESC LIMIT 1
                         """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
                         (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["claim_started_at"]),
                     ).fetchone()
+                    if baseline is None:
+                        baseline = conn.execute(
+                            """
+                            SELECT id FROM lane_events
+                             WHERE work_item_id=?
+                               AND event_type IN ({})
+                               AND created_at < ?
+                             ORDER BY created_at DESC, id DESC LIMIT 1
+                            """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                            (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["claim_started_at"]),
+                        ).fetchone()
                     processed_event_id = baseline["id"] if baseline is not None else None
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, "

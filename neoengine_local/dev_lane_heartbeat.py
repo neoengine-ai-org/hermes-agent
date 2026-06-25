@@ -365,9 +365,10 @@ class DevLaneStore:
             blocked_event_id = None
             if status_by_close[status] == "blocked":
                 items = self.read_json("work/items.json", {})
-                blocked_event_id = claim.get("claimed_event_id") or latest_valid_event_id_before(
-                    items.get(work_item_id, {}), claim.get("claim_started_at")
-                )
+                item_for_baseline = items.get(work_item_id, {})
+                blocked_event_id = claim.get("claimed_event_id") or latest_consumed_valid_event_id_at_or_before(
+                    item_for_baseline, claim.get("claim_started_at")
+                ) or latest_valid_event_id_before(item_for_baseline, claim.get("claim_started_at"))
             self._set_work_item_status(
                 work_item_id,
                 status_by_close[status],
@@ -400,7 +401,7 @@ class DevLaneStore:
                     if event_id(event) in seen:
                         continue
                     if blocked_boundary:
-                        if boundary_event is None or not event_after_frontier(event, boundary_event):
+                        if boundary_event is None or not event_after_frontier(item={"events": merged_events + [event]}, event=event, boundary=boundary_event):
                             continue
                     merged_events.append(event)
                     seen.add(event_id(event))
@@ -447,7 +448,7 @@ class DevLaneStore:
                 if item.get("status") == "claimed" and claim and not boundary_id:
                     if str(created_at) <= boundary_created_at:
                         raise ValueError("event is older than blocked baseline or claim baseline")
-                elif boundary and not event_after_frontier(event, boundary):
+                elif boundary and not event_after_frontier(item={"events": item.get("events", []) + [event]}, event=event, boundary=boundary):
                     raise ValueError("event is older than blocked baseline or claim baseline")
             item.setdefault("events", []).append(event)
             self.write_json("work/items.json", items)
@@ -622,7 +623,7 @@ class DevLaneStore:
                 return False, "blocked_without_new_event"
             blocked_boundary = item.get("blocked_at_event_id")
             boundary = next((event for event in item.get("events", []) if event_id(event) == blocked_boundary), None)
-            if boundary and not event_after_frontier(latest_valid, boundary):
+            if boundary and not event_after_frontier(item=item, event=latest_valid, boundary=boundary):
                 return False, "blocked_without_new_event"
             if not boundary and blocked_boundary and event_id(latest_valid) == blocked_boundary:
                 return False, "blocked_without_new_event"
@@ -693,19 +694,37 @@ def event_after_frontier(event: dict[str, Any], boundary: dict[str, Any]) -> boo
     return event_id(event) > event_id(boundary)
 
 
+def _event_order(item: dict[str, Any], target: dict[str, Any]) -> int:
+    target_id = event_id(target)
+    for idx, candidate in enumerate(item.get("events", [])):
+        if event_id(candidate) == target_id:
+            return idx
+    return len(item.get("events", []))
+
+
+def event_after_frontier(*, item: dict[str, Any], event: dict[str, Any], boundary: dict[str, Any]) -> bool:
+    event_created = str(event.get("created_at", ""))
+    boundary_created = str(boundary.get("created_at", ""))
+    if event_created != boundary_created:
+        return event_created > boundary_created
+    return _event_order(item, event) > _event_order(item, boundary)
+
+
 def latest_event_id(item: dict[str, Any]) -> str | None:
     events = item.get("events", [])
     if not events:
         return None
-    event = sorted(events, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
+    indexed = list(enumerate(events))
+    _, event = sorted(indexed, key=lambda row: (row[1].get("created_at", ""), row[0]), reverse=True)[0]
     return event_id(event)
 
 
 def latest_valid_event(item: dict[str, Any]) -> dict[str, Any] | None:
-    candidates = [event for event in item.get("events", []) if event.get("event_type") in VALID_WAKE_EVENTS]
-    if not candidates:
+    indexed = [(idx, event) for idx, event in enumerate(item.get("events", [])) if event.get("event_type") in VALID_WAKE_EVENTS]
+    if not indexed:
         return None
-    return sorted(candidates, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
+    _, event = sorted(indexed, key=lambda row: (row[1].get("created_at", ""), row[0]), reverse=True)[0]
+    return event
 
 
 def latest_valid_event_id(item: dict[str, Any]) -> str | None:
@@ -713,16 +732,31 @@ def latest_valid_event_id(item: dict[str, Any]) -> str | None:
     return event_id(event) if event else None
 
 
+def latest_consumed_valid_event_id_at_or_before(item: dict[str, Any], consumed_at: str | None) -> str | None:
+    if not consumed_at:
+        return None
+    indexed = [
+        (idx, event) for idx, event in enumerate(item.get("events", []))
+        if event.get("event_type") in VALID_WAKE_EVENTS
+        and event.get("consumed_at")
+        and str(event.get("consumed_at")) <= str(consumed_at)
+    ]
+    if not indexed:
+        return None
+    _, event = sorted(indexed, key=lambda row: (row[1].get("created_at", ""), row[0]), reverse=True)[0]
+    return event_id(event)
+
+
 def latest_valid_event_id_before(item: dict[str, Any], created_at: str | None) -> str | None:
     if not created_at:
         return None
-    candidates = [
-        event for event in item.get("events", [])
+    indexed = [
+        (idx, event) for idx, event in enumerate(item.get("events", []))
         if event.get("event_type") in VALID_WAKE_EVENTS and str(event.get("created_at", "")) < str(created_at)
     ]
-    if not candidates:
+    if not indexed:
         return None
-    event = sorted(candidates, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
+    _, event = sorted(indexed, key=lambda row: (row[1].get("created_at", ""), row[0]), reverse=True)[0]
     return event_id(event)
 
 
