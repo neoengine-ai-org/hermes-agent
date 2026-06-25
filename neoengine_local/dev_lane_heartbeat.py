@@ -229,19 +229,15 @@ class DevLaneStore:
             return claim
         return legacy_claim if isinstance(legacy_claim, dict) else None
 
-    def _event_sort_key(self, event: dict[str, Any]) -> tuple[str, str]:
-        return (str(event.get("created_at", "")), event_id(event))
-
     def _consume_events_through(self, item: dict[str, Any], boundary_event_id: str | None, consumed_at: str) -> None:
         if not boundary_event_id:
             return
         events = item.setdefault("events", [])
-        boundary = next((event for event in events if event_id(event) == boundary_event_id), None)
-        if boundary is None:
+        boundary_index = next((idx for idx, event in enumerate(events) if event_id(event) == boundary_event_id), None)
+        if boundary_index is None:
             return
-        boundary_key = self._event_sort_key(boundary)
-        for event in events:
-            if event.get("event_type") in VALID_WAKE_EVENTS and self._event_sort_key(event) <= boundary_key:
+        for event in events[: boundary_index + 1]:
+            if event.get("event_type") in VALID_WAKE_EVENTS:
                 event.setdefault("consumed_at", consumed_at)
 
     def claim_work(
@@ -278,6 +274,14 @@ class DevLaneStore:
                     }
                 )
                 self._append_history(recovered)
+                for path in self._claim_record_paths():
+                    claim_at_path = self.read_json(str(path.relative_to(self.root)), {})
+                    if (
+                        claim_at_path.get("work_item_id") == work_item_id
+                        and claim_at_path.get("claim_status") == ACTIVE_CLAIM_STATUS
+                        and utc_parse(claim_at_path.get("claim_expires_at", "1970-01-01T00:00:00Z")) <= now_dt
+                    ):
+                        self.write_json(str(path.relative_to(self.root)), {**claim_at_path, **recovered})
                 self._set_work_item_status(work_item_id, "open")
             items = self.read_json("work/items.json", {})
             item = items.get(work_item_id)
@@ -649,11 +653,10 @@ def latest_event_id(item: dict[str, Any]) -> str | None:
 
 
 def latest_valid_event_id(item: dict[str, Any]) -> str | None:
-    events = [event for event in item.get("events", []) if event.get("event_type") in VALID_WAKE_EVENTS]
-    if not events:
-        return None
-    event = sorted(events, key=lambda e: e.get("created_at", ""), reverse=True)[0]
-    return event_id(event)
+    for event in reversed(item.get("events", [])):
+        if event.get("event_type") in VALID_WAKE_EVENTS:
+            return event_id(event)
+    return None
 
 
 def scopes_overlap(lane_scopes: list[str], item_scopes: list[str]) -> bool:

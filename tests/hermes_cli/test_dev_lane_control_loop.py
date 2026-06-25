@@ -591,3 +591,16 @@ def test_sqlite_invalid_event_type_is_rejected_without_unblocking_work(tmp_path:
     assert denied["reason"] == "blocked_without_new_event"
     assert valid["event_id"] is not None
     assert allowed["claimed"] is True
+
+
+def test_sqlite_next_lane_wake_ignores_injected_invalid_event_rows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-invalid", agent_session_id="sess", repo_scope="repo", state="idle-no-work", last_event_id=0, now=100)
+        conn.execute("INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (NULL, 'not_authorized', NULL, NULL, 101)")
+        valid = kb.record_lane_event(conn, lane_id=None, work_item_id=None, event_type="new_repair_packet", now=102)
+        wake = kb.next_lane_wake(conn, "lane-invalid", now=103)
+
+    assert wake["eligible_now"] is True
+    assert wake["event_id"] == valid["event_id"]
+    assert wake["wake_reason"] == "event:new_repair_packet"

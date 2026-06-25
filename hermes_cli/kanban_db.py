@@ -1956,9 +1956,17 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
     ts = _now(now)
     hb = _lane_row(conn, lane_id)
     last_event_id = int(hb.get("last_event_id") or 0) if hb else 0
+    event_placeholders = ",".join("?" for _ in LANE_VALID_WAKE_EVENTS)
     ev = conn.execute(
-        "SELECT * FROM lane_events WHERE (lane_id=? OR lane_id IS NULL) AND id > ? AND consumed_at IS NULL ORDER BY id LIMIT 1",
-        (lane_id, last_event_id),
+        f"""
+        SELECT * FROM lane_events
+         WHERE (lane_id=? OR lane_id IS NULL)
+           AND id > ?
+           AND consumed_at IS NULL
+           AND event_type IN ({event_placeholders})
+         ORDER BY id LIMIT 1
+        """,
+        (lane_id, last_event_id, *sorted(LANE_VALID_WAKE_EVENTS)),
     ).fetchone()
     if ev is not None:
         return {"eligible_now": True, "wake_reason": f"event:{ev['event_type']}", "event_id": ev["id"]}

@@ -555,3 +555,53 @@ def test_file_backed_scanner_rejects_invalid_event_without_unblocking_blocked_it
     assert after_invalid["action"] == "idle-no-work"
     assert [event["event_id"] for event in item["events"]] == ["E1"]
     assert item["blocked_at_event_id"] == "E1"
+
+
+def test_file_backed_same_timestamp_followup_event_survives_blocked_closeout(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-same-ts", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-same-ts", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    first = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    store.record_event("work-same-ts", "followup_repair_packet", "2099-06-24T00:00:00Z", event_id="E2")
+    store.close_claim("work-same-ts", "blocked", "receipts/blocked.md", "2099-06-24T00:02:00Z")
+    second = store.pick_next_work("lane-b", "session-b", now="2099-06-24T00:03:00Z")
+
+    assert first["claim"]["claimed_event_id"] == "E1"
+    assert second["action"] == "claimed"
+    assert second["claim"]["claimed_event_id"] == "E2"
+
+
+def test_file_backed_legacy_claim_recovery_closes_legacy_path(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-old", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-new", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-legacy-recovery", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    legacy_claim = {
+        "work_item_id": "work-legacy-recovery",
+        "lane_id": "lane-old",
+        "claim_owner_session_id": "session-old",
+        "claim_status": "active",
+        "claimed_at": "2099-06-24T00:00:00Z",
+        "claim_expires_at": "2099-06-24T00:01:00Z",
+    }
+    store.write_json("claims/work-legacy-recovery.json", legacy_claim)
+
+    new_claim = store.claim_work(
+        "work-legacy-recovery",
+        "lane-new",
+        "session-new",
+        "2099-06-24T00:02:00Z",
+        3600,
+        "claims/new.json",
+        recovery_evidence_path="receipts/recovered.md",
+    )
+    report = store.status_report(now="2099-06-24T00:03:00Z")
+    legacy_after = store.read_json("claims/work-legacy-recovery.json")
+
+    assert new_claim["claim_status"] == "active"
+    assert legacy_after["claim_status"] == "expired/recovered"
+    rows = {row["lane_id"]: row for row in report["lanes"]}
+    assert rows["lane-new"]["active_claims"] == ["work-legacy-recovery"]
+    assert rows["lane-old"]["stale_claims"] == []
