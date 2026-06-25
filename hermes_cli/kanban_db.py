@@ -1799,11 +1799,10 @@ def claim_lane_work_item(
                            AND e.event_type IN ({})
                            AND (
                                 (b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id)))
-                                OR (b.id IS NULL AND e.id != ?)
                            )
                          ORDER BY e.created_at DESC, e.id DESC LIMIT 1
                         """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                        (work_item["blocked_event_id"], work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), work_item["blocked_event_id"]),
+                        (work_item["blocked_event_id"], work_item_id, *sorted(LANE_VALID_WAKE_EVENTS)),
                     ).fetchone()
                 if newer_event is None:
                     return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="blocked_without_new_event", detail="blocked_without_new_event")
@@ -2015,7 +2014,16 @@ def record_lane_event(
                 reject_equal_boundary = claim is not None and boundary_event_id is None
             if boundary_event_id is not None:
                 boundary = conn.execute("SELECT created_at FROM lane_events WHERE id=? AND work_item_id=?", (boundary_event_id, work_item_id)).fetchone()
-                boundary_created_at = float(boundary["created_at"]) if boundary is not None else boundary_created_at
+                if boundary is None:
+                    return {
+                        "event_id": None,
+                        "event_type": event_type,
+                        "work_item_id": work_item_id,
+                        "recorded": False,
+                        "result": "STALE_EVENT",
+                        "reason": "missing blocked event baseline",
+                    }
+                boundary_created_at = float(boundary["created_at"])
             if boundary_created_at is not None:
                 if ts < boundary_created_at or (reject_equal_boundary and ts == boundary_created_at):
                     return {
@@ -2059,7 +2067,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
                     AND NOT (
                         w.status='blocked'
                         AND w.blocked_event_id IS NOT NULL
-                        AND (e.id = w.blocked_event_id OR (b.created_at IS NOT NULL AND (e.created_at < b.created_at OR (e.created_at = b.created_at AND e.id <= b.id))))
+                        AND (b.id IS NULL OR e.id = w.blocked_event_id OR (e.created_at < b.created_at OR (e.created_at = b.created_at AND e.id <= b.id)))
                     )
                  )
            )
@@ -2148,10 +2156,10 @@ def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capa
                  WHERE e.work_item_id=?
                    AND e.consumed_at IS NULL
                    AND e.event_type IN ({})
-                   AND ((b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))) OR (b.id IS NULL AND e.id != ?))
+                   AND ((b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))))
                  LIMIT 1
                 """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["blocked_event_id"]),
+                (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS)),
             ).fetchone()
         if newer is None:
             return False

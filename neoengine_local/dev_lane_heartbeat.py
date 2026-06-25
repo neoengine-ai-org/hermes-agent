@@ -443,7 +443,9 @@ class DevLaneStore:
                     boundary_created_at = str(claim.get("claim_started_at") or claim.get("claimed_at") or "") or None
             if boundary_id:
                 boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == boundary_id), None)
-                boundary_created_at = str(boundary.get("created_at", "")) if boundary else boundary_created_at
+                if boundary is None:
+                    raise ValueError("missing blocked event baseline")
+                boundary_created_at = str(boundary.get("created_at", ""))
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
             if boundary_created_at is not None:
                 if item.get("status") == "claimed" and claim and not boundary_id:
@@ -521,7 +523,7 @@ class DevLaneStore:
             now,
             next_wake,
             evidence_path,
-            last_event_consumed=latest_event,
+            last_event_consumed=f"{item['work_item_id']}:{latest_event}" if latest_event else None,
         )
         return {
             "action": "claimed",
@@ -626,8 +628,8 @@ class DevLaneStore:
             boundary = next((event for event in item.get("events", []) if event_id(event) == blocked_boundary), None)
             if boundary and not event_after_frontier(item=item, event=latest_valid, boundary=boundary):
                 return False, "blocked_without_new_event"
-            if not boundary and blocked_boundary and event_id(latest_valid) == blocked_boundary:
-                return False, "blocked_without_new_event"
+            if not boundary and blocked_boundary:
+                return False, "blocked_without_event_baseline"
         if item.get("status") in {"completed", "superseded"}:
             return False, "terminal"
         return True, None
@@ -635,7 +637,14 @@ class DevLaneStore:
     def _wake_reason(self, item: dict[str, Any], lane_id: str, now: str) -> str | None:
         hb = self.latest_heartbeat(lane_id)
         consumed = hb.get("last_event_consumed") if hb else None
-        new_events = [event for event in item.get("events", []) if event_id(event) != consumed and not event.get("consumed_at")]
+        item_prefix = f"{item.get('work_item_id')}:"
+        new_events = [
+            event for event in item.get("events", [])
+            if not event.get("consumed_at")
+            and event_id(event) != consumed
+            and f"{item.get('work_item_id')}:{event_id(event)}" != consumed
+            and not (isinstance(consumed, str) and not consumed.startswith(item_prefix) and event_id(event) == consumed)
+        ]
         valid_events = [event for event in new_events if event.get("event_type") in VALID_WAKE_EVENTS]
         if valid_events:
             event = sorted(valid_events, key=lambda e: e.get("created_at", ""), reverse=True)[0]

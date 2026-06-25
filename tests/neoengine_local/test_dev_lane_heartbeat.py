@@ -747,3 +747,13 @@ def test_file_backed_legacy_claimed_at_baseline_blocks_repick(tmp_path: Path) ->
     result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:03:00Z")
     assert item["blocked_at_event_id"] == "E1"
     assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_blocked_missing_event_baseline_fails_closed(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-missing-baseline", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked", "blocked_at_event_id": "MISSING"})
+    with pytest.raises(ValueError, match="missing blocked event baseline"):
+        store.record_event("work-missing-baseline", "governance_unblock", "2099-06-24T00:01:00Z", event_id="E2")
+    result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:02:00Z")
+    assert result["action"] == "idle-no-work"

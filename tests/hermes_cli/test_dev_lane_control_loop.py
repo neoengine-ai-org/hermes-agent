@@ -134,7 +134,7 @@ def test_direct_claim_requires_existing_pickable_non_governance_held_work(tmp_pa
 def test_direct_claim_rejects_blocked_work_without_new_event(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
-        kb.upsert_lane_work_item(conn, work_item_id="blocked", repo_scope="repo", status="blocked", blocked_event_id=5, now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="blocked", repo_scope="repo", status="blocked", blocked_event_id=None, now=900)
         result = kb.claim_lane_work_item(conn, "blocked", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="blocked.md", now=1000)
         item = conn.execute("SELECT status FROM lane_work_items WHERE work_item_id='blocked'").fetchone()
         active_claims = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE work_item_id='blocked' AND claim_status='active'").fetchone()["n"]
@@ -184,7 +184,7 @@ def test_event_wake_beats_timer_wake(tmp_path, monkeypatch):
 def test_blocked_work_is_not_repicked_without_new_event(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
-        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", priority=10, status="blocked", blocked_event_id=5)
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", priority=10, status="blocked", blocked_event_id=None)
         assert kb.pickup_next_lane_work(conn, lane_id="dev-a", agent_session_id="s1", authorized_scopes=["repo"]) is None
         kb.record_lane_event(conn, lane_id="dev-a", event_type="governance_unblock", work_item_id="W1", now=2000)
         picked = kb.pickup_next_lane_work(conn, lane_id="dev-a", agent_session_id="s1", authorized_scopes=["repo"])
@@ -286,7 +286,7 @@ def test_claim_results_expose_stable_domain_codes(tmp_path, monkeypatch):
 def test_event_is_consumed_after_successful_claim_and_duplicate_wake_is_harmless(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
-        kb.upsert_lane_work_item(conn, work_item_id="W-event", repo_scope="repo", status="blocked", blocked_event_id=99, now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="W-event", repo_scope="repo", status="blocked", blocked_event_id=None, now=900)
         event = kb.record_lane_event(conn, lane_id="dev-a", event_type="governance_unblock", work_item_id="W-event", now=1000)
         picked = kb.pickup_next_lane_work(conn, lane_id="dev-a", agent_session_id="s1", authorized_scopes=["repo"], now=1001)
         duplicate = kb.claim_lane_work_item(conn, "W-event", lane_id="dev-b", claim_owner="s2", ttl_seconds=300, evidence_path="dup.md", now=1002)
@@ -319,7 +319,7 @@ def test_consumed_blocked_event_cannot_reclaim_same_blocked_work(tmp_path: Path,
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
         kb.record_lane_heartbeat(conn, lane_id="lane-a", agent_session_id="sess-a", repo_scope="repo", state="idle-no-work", now=999)
-        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-event", repo_scope="repo", status="blocked", blocked_event_id=99)
+        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-event", repo_scope="repo", status="blocked", blocked_event_id=None)
         event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-event", event_type="new_repair_packet", now=1000)
         assert event["event_id"] == 1
         first = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-a", authorized_scopes=["repo"], ttl_seconds=300, now=1001)
@@ -336,7 +336,7 @@ def test_new_event_during_active_claim_remains_pickable_after_blocked_close(tmp_
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
         kb.record_lane_heartbeat(conn, lane_id="lane-a", agent_session_id="sess-a", repo_scope="repo", state="idle-no-work", now=999)
-        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-race", repo_scope="repo", status="blocked", blocked_event_id=99)
+        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-race", repo_scope="repo", status="blocked", blocked_event_id=None)
         first_event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-race", event_type="new_repair_packet", now=1000)
         first = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-a", authorized_scopes=["repo"], ttl_seconds=300, now=1001)
         assert first is not None and first["claim"]["claimed"] is True
@@ -360,7 +360,7 @@ def test_new_event_during_active_claim_remains_pickable_after_blocked_close(tmp_
 def test_direct_blocked_claim_closeout_baselines_processed_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
-        kb.upsert_lane_work_item(conn, work_item_id="W-direct-blocked", repo_scope="repo", status="blocked", blocked_event_id=99)
+        kb.upsert_lane_work_item(conn, work_item_id="W-direct-blocked", repo_scope="repo", status="blocked", blocked_event_id=None)
         event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-direct-blocked", event_type="governance_unblock", now=1000)
         first = kb.claim_lane_work_item(conn, "W-direct-blocked", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="direct.md", now=1001)
         assert first["claimed"] is True
@@ -413,7 +413,7 @@ def test_duplicate_active_legacy_claim_index_conflict_is_structured(tmp_path: Pa
 def test_blocked_event_baseline_survives_work_item_refresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
-        kb.upsert_lane_work_item(conn, work_item_id="W-refresh-blocked", repo_scope="repo", status="blocked", blocked_event_id=99, now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="W-refresh-blocked", repo_scope="repo", status="blocked", blocked_event_id=None, now=900)
         kb.record_lane_event(conn, lane_id=None, work_item_id="W-refresh-blocked", event_type="governance_unblock", now=1000)
         first = kb.claim_lane_work_item(conn, "W-refresh-blocked", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="first.md", now=1001)
         assert first["claimed"] is True
@@ -575,7 +575,7 @@ def test_claim_consumes_all_prior_same_work_item_events_but_preserves_newer_and_
 def test_sqlite_invalid_event_type_is_rejected_without_unblocking_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
-        kb.upsert_lane_work_item(conn, work_item_id="W-invalid-event", repo_scope="repo", status="blocked", blocked_event_id=7, now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="W-invalid-event", repo_scope="repo", status="blocked", blocked_event_id=None, now=900)
         invalid = kb.record_lane_event(conn, lane_id=None, work_item_id="W-invalid-event", event_type="not_authorized", now=1000)
         row = conn.execute("SELECT last_event_id, blocked_event_id FROM lane_work_items WHERE work_item_id='W-invalid-event'").fetchone()
         count = conn.execute("SELECT COUNT(*) FROM lane_events WHERE work_item_id='W-invalid-event'").fetchone()[0]
@@ -587,7 +587,7 @@ def test_sqlite_invalid_event_type_is_rejected_without_unblocking_work(tmp_path:
     assert invalid["result"] == "INVALID_EVENT_TYPE"
     assert count == 0
     assert row["last_event_id"] is None
-    assert row["blocked_event_id"] == 7
+    assert row["blocked_event_id"] is None
     assert denied["claimed"] is False
     assert denied["reason"] == "blocked_without_new_event"
     assert valid["event_id"] is not None
@@ -727,3 +727,16 @@ def test_sqlite_next_lane_wake_does_not_hide_older_other_work_item_event(tmp_pat
     assert e_a["event_id"] > e_b["event_id"]
     assert wake["wake_reason"] == "event:new_repair_packet"
     assert wake["event_id"] == e_b["event_id"]
+
+
+def test_sqlite_blocked_missing_event_baseline_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-missing-baseline", repo_scope="repo", status="blocked", blocked_event_id=999, now=100)
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-missing-baseline", event_type="governance_unblock", now=200)
+        claim = kb.claim_lane_work_item(conn, "W-missing-baseline", lane_id="lane", claim_owner="session", ttl_seconds=300, evidence_path="claim.md", now=201)
+        wake = kb.next_lane_wake(conn, "lane", now=202)
+    assert event["recorded"] is False
+    assert event["result"] == "STALE_EVENT"
+    assert claim["claimed"] is False
+    assert wake["wake_reason"] == "timer"
