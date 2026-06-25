@@ -370,6 +370,8 @@ def test_direct_blocked_claim_closeout_baselines_processed_event(tmp_path: Path,
         assert blocked["status"] == "blocked"
         assert blocked["blocked_event_id"] == 1
         assert blocked["last_event_id"] == 1
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1001.0
+        assert kb.next_lane_wake(conn, "lane-b", now=1003)["wake_reason"] == "timer"
 
         second = kb.claim_lane_work_item(conn, "W-direct-blocked", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="second.md", now=1003)
         assert second["claimed"] is False

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import fcntl
 import fnmatch
 import json
 import os
@@ -11,6 +10,11 @@ from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - POSIX file locks are required for file-backed claims.
+    fcntl = None  # type: ignore[assignment]
 
 VALID_WAKE_EVENTS = {
     "new_repair_packet",
@@ -69,6 +73,8 @@ class DevLaneStore:
 
     @contextlib.contextmanager
     def _exclusive_store_lock(self) -> Iterator[None]:
+        if fcntl is None:
+            raise RuntimeError("file-backed lane control requires POSIX fcntl locks; unsupported platform fails closed")
         lock_path = self.root / ".dev_lane_store.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+") as handle:
@@ -79,15 +85,16 @@ class DevLaneStore:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def register_lane(self, lane_id: str, *, repo_scope: str, authorized_scopes: list[str]) -> dict[str, Any]:
-        lanes = self.read_json("lanes.json", {})
-        lanes[lane_id] = {
-            "lane_id": lane_id,
-            "repo_scope": repo_scope,
-            "authorized_scopes": authorized_scopes,
-            "registered_at": lanes.get(lane_id, {}).get("registered_at") or utc_now(),
-        }
-        self.write_json("lanes.json", lanes)
-        return lanes[lane_id]
+        with self._exclusive_store_lock():
+            lanes = self.read_json("lanes.json", {})
+            lanes[lane_id] = {
+                "lane_id": lane_id,
+                "repo_scope": repo_scope,
+                "authorized_scopes": authorized_scopes,
+                "registered_at": lanes.get(lane_id, {}).get("registered_at") or utc_now(),
+            }
+            self.write_json("lanes.json", lanes)
+            return lanes[lane_id]
 
     def _safe_storage_key(self, value: str, *, kind: str) -> str:
         if not isinstance(value, str):
@@ -154,7 +161,8 @@ class DevLaneStore:
             "last_event_consumed": last_event_consumed,
             "emitted_at": utc_now(),
         }
-        self.write_json(self._lane_path("heartbeats", lane_id), heartbeat)
+        with self._exclusive_store_lock():
+            self.write_json(self._lane_path("heartbeats", lane_id), heartbeat)
         return heartbeat
 
     def write_continuity_packet(self, lane_id: str, packet: dict[str, Any]) -> dict[str, Any]:
@@ -172,7 +180,8 @@ class DevLaneStore:
         if missing:
             raise ValueError(f"continuity packet missing required fields: {', '.join(missing)}")
         document = {"schema_version": "dev_lane_continuity.v1", "lane_id": lane_id, **packet, "updated_at": utc_now()}
-        self.write_json(self._lane_path("continuity", lane_id), document)
+        with self._exclusive_store_lock():
+            self.write_json(self._lane_path("continuity", lane_id), document)
         return document
 
     def continuity_packet(self, lane_id: str) -> dict[str, Any] | None:
@@ -334,25 +343,27 @@ class DevLaneStore:
         if "work_item_id" not in item:
             raise ValueError("work item missing work_item_id")
         self._safe_storage_key(str(item["work_item_id"]), kind="work_item_id")
-        items = self.read_json("work/items.json", {})
-        item = {"schema_version": "dev_lane_work_item.v1", **item}
-        item.setdefault("events", [])
-        item.setdefault("status", "queued")
-        item.setdefault("created_at", utc_now())
-        items[item["work_item_id"]] = item
-        self.write_json("work/items.json", items)
-        return item
+        with self._exclusive_store_lock():
+            items = self.read_json("work/items.json", {})
+            item = {"schema_version": "dev_lane_work_item.v1", **item}
+            item.setdefault("events", [])
+            item.setdefault("status", "queued")
+            item.setdefault("created_at", utc_now())
+            items[item["work_item_id"]] = item
+            self.write_json("work/items.json", items)
+            return item
 
     def record_event(self, work_item_id: str, event_type: str, created_at: str, event_id: str | None = None) -> dict[str, Any]:
         if event_type not in VALID_WAKE_EVENTS:
             raise ValueError(f"invalid wake event: {event_type}")
-        items = self.read_json("work/items.json", {})
-        if work_item_id not in items:
-            raise ValueError(f"unknown work item: {work_item_id}")
-        event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
-        items[work_item_id].setdefault("events", []).append(event)
-        self.write_json("work/items.json", items)
-        return event
+        with self._exclusive_store_lock():
+            items = self.read_json("work/items.json", {})
+            if work_item_id not in items:
+                raise ValueError(f"unknown work item: {work_item_id}")
+            event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
+            items[work_item_id].setdefault("events", []).append(event)
+            self.write_json("work/items.json", items)
+            return event
 
     def start_session(self, lane_id: str, session_id: str, now: str) -> dict[str, Any]:
         heartbeat = self.latest_heartbeat(lane_id)

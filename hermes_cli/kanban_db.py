@@ -1797,6 +1797,11 @@ def claim_lane_work_item(
             )
             if update.rowcount != 1:
                 raise sqlite3.IntegrityError("work item claim status update failed")
+            if work_item["status"] == "blocked" and work_item["last_event_id"]:
+                conn.execute(
+                    "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+                    (ts, work_item["last_event_id"]),
+                )
     except sqlite3.IntegrityError:
         existing = conn.execute(
             "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
