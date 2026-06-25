@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import fnmatch
 import json
 import os
@@ -8,7 +10,7 @@ import unicodedata
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 VALID_WAKE_EVENTS = {
     "new_repair_packet",
@@ -64,6 +66,17 @@ class DevLaneStore:
         tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
         os.replace(tmp, path)
         return path
+
+    @contextlib.contextmanager
+    def _exclusive_store_lock(self) -> Iterator[None]:
+        lock_path = self.root / ".dev_lane_store.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def register_lane(self, lane_id: str, *, repo_scope: str, authorized_scopes: list[str]) -> dict[str, Any]:
         lanes = self.read_json("lanes.json", {})
@@ -210,64 +223,69 @@ class DevLaneStore:
         evidence_path: str,
         recovery_evidence_path: str | None = None,
     ) -> dict[str, Any]:
-        current = self.claim_for_work(work_item_id)
-        if current is None:
-            self._safe_storage_key(work_item_id, kind="work_item_id")
-        now_dt = utc_parse(now)
-        if current and current.get("claim_status") == ACTIVE_CLAIM_STATUS:
-            expires = utc_parse(current["claim_expires_at"])
-            if expires > now_dt:
-                raise ValueError(
-                    f"active claim already exists for {work_item_id}: "
-                    f"{current.get('claim_owner_session_id')} until {current.get('claim_expires_at')}"
+        with self._exclusive_store_lock():
+            current = self.claim_for_work(work_item_id)
+            if current is None:
+                self._safe_storage_key(work_item_id, kind="work_item_id")
+            now_dt = utc_parse(now)
+            if current and current.get("claim_status") == ACTIVE_CLAIM_STATUS:
+                expires = utc_parse(current["claim_expires_at"])
+                if expires > now_dt:
+                    raise ValueError(
+                        f"active claim already exists for {work_item_id}: "
+                        f"{current.get('claim_owner_session_id')} until {current.get('claim_expires_at')}"
+                    )
+                if not recovery_evidence_path:
+                    raise ValueError(f"expired claim for {work_item_id} requires recovery_evidence_path")
+                recovered = dict(current)
+                recovered.update(
+                    {
+                        "claim_status": "expired/recovered",
+                        "recovered_by_session_id": owner_session_id,
+                        "recovered_at": now,
+                        "recovery_evidence_path": recovery_evidence_path,
+                    }
                 )
-            if not recovery_evidence_path:
-                raise ValueError(f"expired claim for {work_item_id} requires recovery_evidence_path")
-            recovered = dict(current)
-            recovered.update(
-                {
-                    "claim_status": "expired/recovered",
-                    "recovered_by_session_id": owner_session_id,
-                    "recovered_at": now,
-                    "recovery_evidence_path": recovery_evidence_path,
-                }
-            )
-            self._append_history(recovered)
-            self._set_work_item_status(work_item_id, "open")
-        items = self.read_json("work/items.json", {})
-        item = items.get(work_item_id)
-        if item is None:
-            raise ValueError(f"work item does not exist for claim: {work_item_id}")
-        lanes = self.read_json("lanes.json", {})
-        lane = lanes.get(lane_id) or {
-            "lane_id": lane_id,
-            "repo_scope": item.get("repo_scope"),
-            "authorized_scopes": item.get("authorized_scopes", ["**"]),
-        }
-        pickable, reason = self._is_item_pickable_for_lane(item, lane, now)
-        if not pickable:
-            raise ValueError(f"work item is not claimable: {reason}")
-        expires_at = format_utc(now_dt + timedelta(seconds=ttl_seconds))
-        claim = {
-            "schema_version": "dev_lane_claim.v1",
-            "work_item_id": work_item_id,
-            "lane_id": lane_id,
-            "claim_owner_session_id": owner_session_id,
-            "claim_started_at": now,
-            "claim_expires_at": expires_at,
-            "claim_status": ACTIVE_CLAIM_STATUS,
-            "claim_evidence_path": evidence_path,
-        }
-        self.write_json(self._claim_path(work_item_id), claim)
-        self._set_work_item_status(work_item_id, "claimed")
-        return claim
+                self._append_history(recovered)
+                self._set_work_item_status(work_item_id, "open")
+            items = self.read_json("work/items.json", {})
+            item = items.get(work_item_id)
+            if item is None:
+                raise ValueError(f"work item does not exist for claim: {work_item_id}")
+            lanes = self.read_json("lanes.json", {})
+            lane = lanes.get(lane_id) or {
+                "lane_id": lane_id,
+                "repo_scope": item.get("repo_scope"),
+                "authorized_scopes": item.get("authorized_scopes", ["**"]),
+            }
+            pickable, reason = self._is_item_pickable_for_lane(item, lane, now)
+            if not pickable:
+                raise ValueError(f"work item is not claimable: {reason}")
+            claimed_event_id = latest_event_id(item)
+            expires_at = format_utc(now_dt + timedelta(seconds=ttl_seconds))
+            claim = {
+                "schema_version": "dev_lane_claim.v1",
+                "work_item_id": work_item_id,
+                "lane_id": lane_id,
+                "claim_owner_session_id": owner_session_id,
+                "claim_started_at": now,
+                "claim_expires_at": expires_at,
+                "claim_status": ACTIVE_CLAIM_STATUS,
+                "claim_evidence_path": evidence_path,
+                "claimed_event_id": claimed_event_id,
+            }
+            self.write_json(self._claim_path(work_item_id), claim)
+            self._set_work_item_status(work_item_id, "claimed")
+            return claim
 
-    def _set_work_item_status(self, work_item_id: str, status: str) -> None:
+    def _set_work_item_status(self, work_item_id: str, status: str, *, blocked_at_event_id: str | None = None) -> None:
         items = self.read_json("work/items.json", {})
         item = items.get(work_item_id)
         if not item:
             return
         item["status"] = status
+        if status == "blocked" and blocked_at_event_id is not None:
+            item["blocked_at_event_id"] = blocked_at_event_id
         item["updated_at"] = utc_now()
         items[work_item_id] = item
         self.write_json("work/items.json", items)
@@ -275,37 +293,42 @@ class DevLaneStore:
     def close_claim(self, work_item_id: str, status: str, evidence_path: str, now: str, message: str | None = None) -> dict[str, Any]:
         if status not in TERMINAL_CLAIM_STATUSES:
             raise ValueError(f"invalid terminal claim status: {status}")
-        claim = self.claim_for_work(work_item_id)
-        if not claim:
-            raise ValueError(f"no claim exists for {work_item_id}")
-        if claim.get("claim_status") != ACTIVE_CLAIM_STATUS:
-            raise ValueError(f"claim is not active for {work_item_id}: {claim.get('claim_status')}")
-        closed = dict(claim)
-        closed.update({"claim_status": status, "closed_at": now, "closeout_evidence_path": evidence_path})
-        if message:
-            closed["closeout_message"] = message
-        wrote_canonical = False
-        try:
-            self.write_json(self._claim_path(work_item_id), closed)
-            wrote_canonical = True
-        except ValueError:
+        with self._exclusive_store_lock():
+            claim = self.claim_for_work(work_item_id)
+            if not claim:
+                raise ValueError(f"no claim exists for {work_item_id}")
+            if claim.get("claim_status") != ACTIVE_CLAIM_STATUS:
+                raise ValueError(f"claim is not active for {work_item_id}: {claim.get('claim_status')}")
+            closed = dict(claim)
+            closed.update({"claim_status": status, "closed_at": now, "closeout_evidence_path": evidence_path})
+            if message:
+                closed["closeout_message"] = message
             wrote_canonical = False
-        legacy = self._legacy_claim_path(work_item_id)
-        if (self.root / legacy).exists():
-            self.write_json(legacy, closed)
-        elif not wrote_canonical:
-            raise ValueError(f"work_item_id is unsafe for canonical claim close and no legacy claim exists: {work_item_id!r}")
-        self._append_history(closed)
-        status_by_close = {
-            "completed": "completed",
-            "blocked": "blocked",
-            "refused": "refused",
-            "superseded": "superseded",
-            "no-op with evidence": "completed",
-            "expired/recovered": "open",
-        }
-        self._set_work_item_status(work_item_id, status_by_close[status])
-        return closed
+            try:
+                self.write_json(self._claim_path(work_item_id), closed)
+                wrote_canonical = True
+            except ValueError:
+                wrote_canonical = False
+            legacy = self._legacy_claim_path(work_item_id)
+            if (self.root / legacy).exists():
+                self.write_json(legacy, closed)
+            elif not wrote_canonical:
+                raise ValueError(f"work_item_id is unsafe for canonical claim close and no legacy claim exists: {work_item_id!r}")
+            self._append_history(closed)
+            status_by_close = {
+                "completed": "completed",
+                "blocked": "blocked",
+                "refused": "refused",
+                "superseded": "superseded",
+                "no-op with evidence": "completed",
+                "expired/recovered": "open",
+            }
+            self._set_work_item_status(
+                work_item_id,
+                status_by_close[status],
+                blocked_at_event_id=claim.get("claimed_event_id") if status_by_close[status] == "blocked" else None,
+            )
+            return closed
 
     def add_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
         if "work_item_id" not in item:

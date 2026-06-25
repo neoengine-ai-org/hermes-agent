@@ -383,3 +383,54 @@ def test_canonical_terminal_does_not_hide_legacy_active_claim(tmp_path: Path) ->
     assert store.active_claim_for_work("work-2", now="2026-06-24T00:20:00Z") == legacy_active
     with pytest.raises(ValueError, match="active claim already exists"):
         store.claim_work("work-2", "lane-b", "new", "2026-06-24T00:20:00Z", 3600, "evidence")
+
+
+def _file_backed_claim_worker(args: tuple[str, str]) -> dict[str, str]:
+    root, lane_id = args
+    store = DevLaneStore(Path(root))
+    try:
+        claim = store.claim_work(
+            "work-concurrent",
+            lane_id,
+            f"session-{lane_id}",
+            "2026-06-24T00:00:00Z",
+            3600,
+            f"claims/{lane_id}.json",
+        )
+        return {"lane_id": lane_id, "claimed": "true", "claim_owner_session_id": claim["claim_owner_session_id"]}
+    except ValueError as exc:
+        return {"lane_id": lane_id, "claimed": "false", "error": str(exc)}
+
+
+def test_file_backed_blocked_closeout_baselines_event_across_lanes(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-blocked", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    event = store.record_event("work-blocked", "failed_ci_transition", "2026-06-24T00:00:00Z", event_id="e1")
+
+    first = store.pick_next_work("lane-a", "session-a", now="2026-06-24T00:01:00Z")
+    assert first["action"] == "claimed"
+    store.close_claim("work-blocked", "blocked", "receipts/blocked.md", "2026-06-24T00:02:00Z")
+
+    item = store.read_json("work/items.json")["work-blocked"]
+    assert item["status"] == "blocked"
+    assert item["blocked_at_event_id"] == event["event_id"]
+
+    second = store.pick_next_work("lane-b", "session-b", now="2026-06-24T00:03:00Z")
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_claim_work_is_serialized_across_processes(tmp_path: Path) -> None:
+    import multiprocessing as mp
+
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-concurrent", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=4) as pool:
+        results = pool.map(_file_backed_claim_worker, [(str(tmp_path), f"lane-{idx}") for idx in range(4)])
+
+    assert sum(1 for result in results if result["claimed"] == "true") == 1
+    assert sum(1 for result in results if "active claim already exists" in result.get("error", "")) == 3
+    claims = [path for path in (tmp_path / "claims" / "by-work-item").glob("*.json")]
+    assert len(claims) == 1
