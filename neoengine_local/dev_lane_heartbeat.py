@@ -236,8 +236,9 @@ class DevLaneStore:
         boundary_index = next((idx for idx, event in enumerate(events) if event_id(event) == boundary_event_id), None)
         if boundary_index is None:
             return
-        for event in events[: boundary_index + 1]:
-            if event.get("event_type") in VALID_WAKE_EVENTS:
+        boundary_created_at = str(events[boundary_index].get("created_at", ""))
+        for event in events:
+            if event.get("event_type") in VALID_WAKE_EVENTS and str(event.get("created_at", "")) <= boundary_created_at:
                 event.setdefault("consumed_at", consumed_at)
 
     def claim_work(
@@ -364,7 +365,7 @@ class DevLaneStore:
             blocked_event_id = None
             if status_by_close[status] == "blocked":
                 items = self.read_json("work/items.json", {})
-                blocked_event_id = claim.get("claimed_event_id") or latest_valid_event_id_at_or_before(
+                blocked_event_id = claim.get("claimed_event_id") or latest_valid_event_id_before(
                     items.get(work_item_id, {}), claim.get("claim_started_at")
                 )
             self._set_work_item_status(
@@ -442,7 +443,7 @@ class DevLaneStore:
                 boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == boundary_id), None)
                 boundary_created_at = str(boundary.get("created_at", "")) if boundary else boundary_created_at
             if boundary_created_at is not None:
-                if str(created_at) < boundary_created_at:
+                if str(created_at) < boundary_created_at or (item.get("status") == "claimed" and claim and not boundary_id and str(created_at) == boundary_created_at):
                     raise ValueError("event is older than blocked baseline or claim baseline")
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
             item.setdefault("events", []).append(event)
@@ -613,8 +614,17 @@ class DevLaneStore:
         if item.get("status") == "refused" and not item.get("sidecar_evidence_path"):
             return False, "refused_without_sidecar_evidence"
         if item.get("status") == "blocked":
-            latest_valid = latest_valid_event_id(item)
-            if not latest_valid or latest_valid == item.get("blocked_at_event_id"):
+            latest_valid = latest_valid_event(item)
+            if not latest_valid:
+                return False, "blocked_without_new_event"
+            blocked_boundary = item.get("blocked_at_event_id")
+            boundary = next((event for event in item.get("events", []) if event_id(event) == blocked_boundary), None)
+            if boundary and (
+                event_id(latest_valid) == blocked_boundary
+                or str(latest_valid.get("created_at", "")) < str(boundary.get("created_at", ""))
+            ):
+                return False, "blocked_without_new_event"
+            if not boundary and blocked_boundary and event_id(latest_valid) == blocked_boundary:
                 return False, "blocked_without_new_event"
         if item.get("status") in {"completed", "superseded"}:
             return False, "terminal"
@@ -679,29 +689,34 @@ def latest_event_id(item: dict[str, Any]) -> str | None:
     events = item.get("events", [])
     if not events:
         return None
-    event = sorted(events, key=lambda e: e.get("created_at", ""), reverse=True)[0]
+    event = sorted(events, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
     return event_id(event)
 
 
+def latest_valid_event(item: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = [event for event in item.get("events", []) if event.get("event_type") in VALID_WAKE_EVENTS]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
+
+
 def latest_valid_event_id(item: dict[str, Any]) -> str | None:
-    for event in reversed(item.get("events", [])):
-        if event.get("event_type") in VALID_WAKE_EVENTS:
-            return event_id(event)
-    return None
+    event = latest_valid_event(item)
+    return event_id(event) if event else None
 
 
-
-def latest_valid_event_id_at_or_before(item: dict[str, Any], created_at: str | None) -> str | None:
+def latest_valid_event_id_before(item: dict[str, Any], created_at: str | None) -> str | None:
     if not created_at:
         return None
     candidates = [
         event for event in item.get("events", [])
-        if event.get("event_type") in VALID_WAKE_EVENTS and str(event.get("created_at", "")) <= str(created_at)
+        if event.get("event_type") in VALID_WAKE_EVENTS and str(event.get("created_at", "")) < str(created_at)
     ]
     if not candidates:
         return None
     event = sorted(candidates, key=lambda e: (e.get("created_at", ""), event_id(e)), reverse=True)[0]
     return event_id(event)
+
 
 def scopes_overlap(lane_scopes: list[str], item_scopes: list[str]) -> bool:
     if not lane_scopes or not item_scopes:
