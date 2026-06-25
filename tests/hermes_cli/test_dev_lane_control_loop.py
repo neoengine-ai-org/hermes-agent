@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import time
 from pathlib import Path
 
@@ -353,3 +354,54 @@ def test_new_event_during_active_claim_remains_pickable_after_blocked_close(tmp_
         second = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-b", authorized_scopes=["repo"], ttl_seconds=300, now=1004)
         assert second is not None and second["work_item_id"] == "W-blocked-race"
         assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 2").fetchone()[0] == 1004.0
+
+
+def test_direct_blocked_claim_closeout_baselines_processed_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-direct-blocked", repo_scope="repo", status="blocked", blocked_event_id=99)
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-direct-blocked", event_type="governance_unblock", now=1000)
+        first = kb.claim_lane_work_item(conn, "W-direct-blocked", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="direct.md", now=1001)
+        assert first["claimed"] is True
+        assert event["event_id"] == 1
+        assert kb.close_lane_claim(conn, claim_id=first["claim_id"], status="blocked", evidence_path="blocked.md", now=1002) is True
+
+        blocked = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id='W-direct-blocked'").fetchone()
+        assert blocked["status"] == "blocked"
+        assert blocked["blocked_event_id"] == 1
+        assert blocked["last_event_id"] == 1
+
+        second = kb.claim_lane_work_item(conn, "W-direct-blocked", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="second.md", now=1003)
+        assert second["claimed"] is False
+        assert second["result"] == "WORK_ITEM_INELIGIBLE"
+        assert second["reason"] == "blocked_without_new_event"
+
+
+def test_duplicate_active_legacy_claim_index_conflict_is_structured(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy-duplicates.db"
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        CREATE TABLE lane_claims (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            work_item_id TEXT NOT NULL,
+            lane_id TEXT NOT NULL,
+            claim_owner TEXT NOT NULL,
+            claim_started_at INTEGER NOT NULL,
+            claim_expires_at INTEGER NOT NULL,
+            claim_status TEXT NOT NULL,
+            claim_evidence_path TEXT NOT NULL,
+            closed_at INTEGER,
+            recovery_of_claim_id INTEGER,
+            close_message TEXT
+        );
+        INSERT INTO lane_claims(work_item_id, lane_id, claim_owner, claim_started_at, claim_expires_at, claim_status, claim_evidence_path)
+        VALUES ('W-dup', 'lane-a', 'sess-a', 1, 100, 'active', 'a.md'),
+               ('W-dup', 'lane-b', 'sess-b', 2, 100, 'active', 'b.md');
+        """
+    )
+    con.close()
+
+    with pytest.raises(kb.LaneControlMigrationConflictError) as excinfo:
+        kb.connect(db_path)
+    assert not isinstance(excinfo.value, sqlite3.IntegrityError)

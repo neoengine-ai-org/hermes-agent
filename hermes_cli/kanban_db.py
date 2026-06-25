@@ -1104,6 +1104,18 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+class LaneControlMigrationConflictError(RuntimeError):
+    """Raised when legacy lane-control rows violate fail-closed invariants."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        super().__init__(
+            "Refusing to initialize kanban DB because existing lane-control "
+            "rows violate current safety constraints; quarantine or recover "
+            f"duplicate active lane claims before startup: {db_path}"
+        )
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a timestamped backup.
 
@@ -1294,7 +1306,10 @@ def connect(
                     # here via the file lock above; without that, simultaneous first
                     # connects can interleave WAL/schema setup and leave malformed
                     # sqlite_master metadata.
-                    conn.executescript(SCHEMA_SQL)
+                    try:
+                        conn.executescript(SCHEMA_SQL)
+                    except sqlite3.IntegrityError as exc:
+                        raise LaneControlMigrationConflictError(path) from exc
                     _migrate_add_optional_columns(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
@@ -1769,7 +1784,12 @@ def claim_lane_work_item(
             update = conn.execute(
                 """
                 UPDATE lane_work_items
-                   SET status='claimed', updated_at=?
+                   SET status='claimed',
+                       updated_at=?,
+                       blocked_event_id=CASE
+                           WHEN status='blocked' THEN last_event_id
+                           ELSE blocked_event_id
+                       END
                  WHERE work_item_id=?
                    AND status IN ('open', 'blocked')
                 """,
