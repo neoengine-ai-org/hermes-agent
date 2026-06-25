@@ -1861,10 +1861,11 @@ def claim_lane_work_item(
                     UPDATE lane_events
                        SET consumed_at=?
                      WHERE work_item_id=?
+                       AND event_type IN ({})
                        AND created_at <= ?
                        AND consumed_at IS NULL
-                    """,
-                    (ts, work_item_id, claimed_event_created_at),
+                    """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                    (ts, work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), claimed_event_created_at),
                 )
     except sqlite3.IntegrityError:
         existing = conn.execute(

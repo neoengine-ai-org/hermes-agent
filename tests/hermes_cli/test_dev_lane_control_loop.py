@@ -560,6 +560,10 @@ def test_claim_consumes_all_prior_same_work_item_events_but_preserves_newer_and_
         kb.record_lane_heartbeat(conn, lane_id="lane-b", agent_session_id="sess-b", repo_scope="repo", state="idle-no-work", now=900)
         kb.upsert_lane_work_item(conn, work_item_id="W-events", repo_scope="repo", status="open", now=900)
         kb.upsert_lane_work_item(conn, work_item_id="W-other", repo_scope="repo", status="open", now=900)
+        conn.execute(
+            "INSERT INTO lane_events(lane_id, work_item_id, event_type, evidence_path, created_at) VALUES (NULL, 'W-events', 'not_authorized', NULL, 999)"
+        )
+        invalid_same_item = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         e1 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-events", event_type="new_repair_packet", now=1000)
         e_other = kb.record_lane_event(conn, lane_id=None, work_item_id="W-other", event_type="new_repair_packet", now=1001)
         e2 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-events", event_type="followup_repair_packet", now=1002)
@@ -571,6 +575,7 @@ def test_claim_consumes_all_prior_same_work_item_events_but_preserves_newer_and_
 
     assert claim["claimed"] is True
     assert claim["claimed_event_id"] == e2["event_id"]
+    assert events[invalid_same_item] is None
     assert events[e1["event_id"]] == 1003
     assert events[e2["event_id"]] == 1003
     assert events[e_other["event_id"]] is None
