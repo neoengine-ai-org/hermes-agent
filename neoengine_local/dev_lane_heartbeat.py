@@ -733,22 +733,6 @@ def event_id(event: dict[str, Any]) -> str:
     return str(event.get("event_id") or f"{event.get('event_type')}:{event.get('created_at')}")
 
 
-def event_after_frontier(event: dict[str, Any], boundary: dict[str, Any]) -> bool:
-    event_created = str(event.get("created_at", ""))
-    boundary_created = str(boundary.get("created_at", ""))
-    if event_created != boundary_created:
-        return event_created > boundary_created
-    return event_id(event) > event_id(boundary)
-
-
-def _event_order(item: dict[str, Any], target: dict[str, Any]) -> int:
-    target_id = event_id(target)
-    for idx, candidate in enumerate(item.get("events", [])):
-        if event_id(candidate) == target_id:
-            return idx
-    return len(item.get("events", []))
-
-
 def event_after_frontier(*, item: dict[str, Any], event: dict[str, Any], boundary: dict[str, Any]) -> bool:
     return str(event.get("created_at", "")) > str(boundary.get("created_at", ""))
 
