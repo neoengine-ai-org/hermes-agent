@@ -376,9 +376,10 @@ class DevLaneStore:
                 items = self.read_json("work/items.json", {})
                 item_for_baseline = items.get(work_item_id, {})
                 claim_started_at = claim.get("claim_started_at") or claim.get("claimed_at")
-                blocked_event_id = claim.get("claimed_event_id") or latest_consumed_valid_event_id_at_or_before(
-                    item_for_baseline, claim_started_at
-                ) or latest_valid_event_id_before(item_for_baseline, claim_started_at)
+                # Only the event captured at claim open may become the
+                # blocked baseline. If it is absent, keep a null baseline and
+                # rely on blocked_at as the closeout frontier.
+                blocked_event_id = claim.get("claimed_event_id")
             self._set_work_item_status(
                 work_item_id,
                 status_by_close[status],

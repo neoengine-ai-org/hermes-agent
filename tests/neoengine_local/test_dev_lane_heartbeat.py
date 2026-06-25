@@ -727,9 +727,9 @@ def test_file_backed_legacy_claim_null_baseline_preserves_newer_event(tmp_path: 
     item = store.read_json("work/items.json", {})["work-legacy-null"]
     next_pick = store.pick_next_work("lane-b", "session-b", now="2099-06-24T00:14:00Z")
     assert claim_result["claim"]["claimed_event_id"] == "E1"
-    assert item["blocked_at_event_id"] == "E1"
-    assert next_pick["action"] == "claimed"
-    assert next_pick["claim"]["claimed_event_id"] == "E2"
+    assert item.get("blocked_at_event_id") is None
+    assert item["blocked_at"] == "2099-06-24T00:13:00Z"
+    assert next_pick["action"] == "idle-no-work"
 
 
 def test_file_backed_legacy_claimed_at_baseline_blocks_repick(tmp_path: Path) -> None:
@@ -745,7 +745,8 @@ def test_file_backed_legacy_claimed_at_baseline_blocks_repick(tmp_path: Path) ->
     store.close_claim("work-legacy-claimed-at", "blocked", "receipts/blocked.md", "2099-06-24T00:02:00Z")
     item = store.read_json("work/items.json", {})["work-legacy-claimed-at"]
     result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:03:00Z")
-    assert item["blocked_at_event_id"] == "E1"
+    assert item.get("blocked_at_event_id") is None
+    assert item["blocked_at"] == "2099-06-24T00:02:00Z"
     assert result["action"] == "idle-no-work"
 
 

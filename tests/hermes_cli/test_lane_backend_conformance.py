@@ -337,3 +337,40 @@ def test_sqlite_null_baseline_closeout_does_not_reconstruct_from_consumed_rows(t
     assert blocked["blocked_at"] == 120
     assert stale["result"] == "STALE_EVENT"
     assert second["claimed"] is False
+
+
+
+def test_file_null_baseline_closeout_does_not_reconstruct_from_consumed_rows(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path / "file-consumed-closeout-store")
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({
+        "work_item_id": "FILE-null-reconstruct",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "open",
+        "events": [{"event_id": "old", "event_type": "queue_priority_change", "created_at": "2099-01-01T00:00:00Z", "consumed_at": "2099-01-01T00:00:01Z"}],
+    })
+    claim = store.claim_work("FILE-null-reconstruct", "lane-a", "sess-a", "2099-01-01T00:01:00Z", 3600, "claims/a.json")
+    assert claim["claimed_event_id"] is None
+    store.close_claim("FILE-null-reconstruct", "blocked", "receipts/blocked.md", "2099-01-01T00:02:00Z")
+    item = store.read_json("work/items.json", {})["FILE-null-reconstruct"]
+    assert item.get("blocked_at_event_id") is None
+    assert item.get("blocked_at") == "2099-01-01T00:02:00Z"
+    with pytest.raises(ValueError):
+        store.record_event("FILE-null-reconstruct", "governance_unblock", "2099-01-01T00:01:30Z")
+    assert store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:01:31Z")["action"] == "idle-no-work"
+
+
+def test_sqlite_event_baseline_same_timestamp_is_stale(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "sqlite-same-ts-baseline-home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="SQL-same-ts", repo_scope="repo", status="open", now=90)
+        base = kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-same-ts", event_type="queue_priority_change", now=100)
+        claim = kb.claim_lane_work_item(conn, "SQL-same-ts", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=101)
+        assert kb.close_lane_claim(conn, claim_id=claim["claim_id"], status="blocked", evidence_path="blocked.md", now=102) is True
+        same = kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-same-ts", event_type="review_request", now=100)
+        second = kb.claim_lane_work_item(conn, "SQL-same-ts", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="second.md", now=103)
+    assert base["event_id"]
+    assert same["result"] == "STALE_EVENT"
+    assert second["claimed"] is False

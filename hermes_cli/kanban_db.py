@@ -1807,7 +1807,7 @@ def claim_lane_work_item(
                            AND e.event_type IN ({})
                            AND e.created_at <= ?
                            AND (
-                                (b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id)))
+                                (b.id IS NOT NULL AND e.created_at > b.created_at)
                            )
                          ORDER BY e.created_at DESC, e.id DESC LIMIT 1
                         """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
@@ -1994,6 +1994,7 @@ def record_lane_event(
             if item["status"] == "blocked":
                 if item["blocked_event_id"] is not None:
                     boundary_event_id = item["blocked_event_id"]
+                    reject_equal_boundary = True
                 elif item["blocked_at"] is not None:
                     # Null-baseline blocked closeouts record blocked_at as the
                     # durable frontier. Older legacy blocked rows without
@@ -2122,7 +2123,7 @@ def upsert_lane_work_item(
                            AND e.event_type IN ({wake_event_placeholders})
                            AND e.created_at <= excluded.updated_at
                            AND b.id IS NOT NULL
-                           AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
+                           AND e.created_at > b.created_at
                      )
                     THEN lane_work_items.status
                     WHEN lane_work_items.status='blocked'
@@ -2163,7 +2164,7 @@ def upsert_lane_work_item(
                            AND e.event_type IN ({wake_event_placeholders})
                            AND e.created_at <= excluded.updated_at
                            AND b.id IS NOT NULL
-                           AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
+                           AND e.created_at > b.created_at
                      )
                     THEN lane_work_items.updated_at
                     WHEN lane_work_items.status='blocked'
@@ -2213,7 +2214,7 @@ def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capa
                    AND e.consumed_at IS NULL
                    AND e.event_type IN ({})
                    AND e.created_at <= ?
-                   AND ((b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))))
+                   AND ((b.id IS NOT NULL AND e.created_at > b.created_at))
                  LIMIT 1
                 """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
                 (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), ts),
