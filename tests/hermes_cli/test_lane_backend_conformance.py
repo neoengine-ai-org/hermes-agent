@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import kanban_db as kb
 from neoengine_local.dev_lane_heartbeat import DevLaneStore, VALID_WAKE_EVENTS
 
@@ -83,3 +85,112 @@ def test_file_backend_conformance_event_claim_and_blocked_refresh(tmp_path: Path
     assert refreshed["blocked_at_event_id"] == "E2"
     assert allowed["action"] == "claimed"
     assert allowed["claim"]["claimed_event_id"] == "E3"
+
+
+
+def test_sqlite_null_baseline_blocked_authority_is_closeout_time(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "sqlite-null-home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="NB", repo_scope="repo", status="open", now=100)
+        claim = kb.claim_lane_work_item(
+            conn,
+            "NB",
+            lane_id="lane-a",
+            claim_owner="sess-a",
+            ttl_seconds=300,
+            evidence_path="claim.md",
+            now=110,
+        )
+        assert claim["claimed"] is True
+        assert claim["claimed_event_id"] is None
+        assert kb.close_lane_claim(conn, claim_id=claim["claim_id"], status="blocked", evidence_path="blocked.md", now=120)
+
+        stale = kb.record_lane_event(conn, lane_id=None, work_item_id="NB", event_type="new_repair_packet", now=119)
+        same_ts = kb.record_lane_event(conn, lane_id=None, work_item_id="NB", event_type="review_request", now=120)
+        assert stale["result"] == "STALE_EVENT"
+        assert same_ts["result"] == "STALE_EVENT"
+        assert conn.execute("SELECT COUNT(*) FROM lane_events WHERE work_item_id='NB'").fetchone()[0] == 0
+
+        refreshed = kb.upsert_lane_work_item(conn, work_item_id="NB", repo_scope="repo", status="open", now=130)
+        assert refreshed["status"] == "blocked"
+        assert kb.next_lane_wake(conn, "lane-a", now=131)["wake_reason"] == "timer"
+        assert kb.claim_lane_work_item(
+            conn,
+            "NB",
+            lane_id="lane-b",
+            claim_owner="sess-b",
+            ttl_seconds=300,
+            evidence_path="blocked-too-soon.md",
+            now=132,
+        )["result"] == "WORK_ITEM_INELIGIBLE"
+
+        newer = kb.record_lane_event(conn, lane_id=None, work_item_id="NB", event_type="queue_priority_change", now=121)
+        assert newer["event_id"]
+        assert kb.next_lane_wake(conn, "lane-a", now=133)["event_id"] == newer["event_id"]
+        claimed = kb.claim_lane_work_item(
+            conn,
+            "NB",
+            lane_id="lane-b",
+            claim_owner="sess-b",
+            ttl_seconds=300,
+            evidence_path="allowed.md",
+            now=134,
+        )
+        assert claimed["claimed"] is True
+        assert claimed["claimed_event_id"] == newer["event_id"]
+
+
+def test_file_null_baseline_blocked_authority_is_closeout_time(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path / "file-null-store")
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "NB", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    claim = store.claim_work("NB", "lane-a", "sess-a", "2099-01-01T00:01:00Z", 3600, "claims/a.json")
+    assert claim["claimed_event_id"] is None
+    store.close_claim("NB", "blocked", "receipts/blocked.md", "2099-01-01T00:02:00Z")
+
+    with pytest.raises(ValueError, match="older than blocked baseline"):
+        store.record_event("NB", "new_repair_packet", "2099-01-01T00:01:59Z", event_id="stale")
+    with pytest.raises(ValueError, match="older than blocked baseline"):
+        store.record_event("NB", "review_request", "2099-01-01T00:02:00Z", event_id="same-ts")
+
+    refreshed = store.add_work_item({
+        "work_item_id": "NB",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "open",
+        "events": [{"event_id": "scanner-stale", "event_type": "governance_unblock", "created_at": "2099-01-01T00:01:58Z"}],
+    })
+    assert refreshed["status"] == "blocked"
+    idle = store.pick_next_work("lane-b", "sess-idle", now="2099-01-01T00:02:30Z")
+    assert idle["action"] == "idle-no-work"
+
+    newer = store.record_event("NB", "queue_priority_change", "2099-01-01T00:02:01Z", event_id="newer")
+    assert newer["event_id"] == "newer"
+    claimed = store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:03:00Z")
+    assert claimed["action"] == "claimed"
+    assert claimed["work_item_id"] == "NB"
+    assert claimed["claim"]["claimed_event_id"] == "newer"
+
+
+@pytest.mark.parametrize("event_type", sorted(VALID_WAKE_EVENTS))
+def test_null_baseline_all_wake_event_types_reopen_only_when_newer(tmp_path: Path, monkeypatch, event_type: str) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / f"sqlite-{event_type}"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="SQL-" + event_type, repo_scope="repo", status="open", now=10)
+        claim = kb.claim_lane_work_item(conn, "SQL-" + event_type, lane_id="lane", claim_owner="sess", ttl_seconds=300, evidence_path="c.md", now=11)
+        assert kb.close_lane_claim(conn, claim_id=claim["claim_id"], status="blocked", evidence_path="b.md", now=20)
+        assert kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-" + event_type, event_type=event_type, now=20)["result"] == "STALE_EVENT"
+        assert kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-" + event_type, event_type=event_type, now=21)["event_id"]
+        assert kb.claim_lane_work_item(conn, "SQL-" + event_type, lane_id="lane2", claim_owner="sess2", ttl_seconds=300, evidence_path="ok.md", now=22)["claimed"] is True
+
+    store = DevLaneStore(tmp_path / f"file-{event_type}")
+    store.register_lane("lane", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane2", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "FILE-" + event_type, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("FILE-" + event_type, "lane", "sess", "2099-01-01T00:00:11Z", 3600, "c.json")
+    store.close_claim("FILE-" + event_type, "blocked", "b.md", "2099-01-01T00:00:20Z")
+    with pytest.raises(ValueError):
+        store.record_event("FILE-" + event_type, event_type, "2099-01-01T00:00:20Z", event_id="same")
+    store.record_event("FILE-" + event_type, event_type, "2099-01-01T00:00:21Z", event_id="new")
+    assert store.pick_next_work("lane2", "sess2", now="2099-01-01T00:00:22Z")["action"] == "claimed"

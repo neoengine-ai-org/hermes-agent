@@ -317,15 +317,24 @@ class DevLaneStore:
             self._set_work_item_status(work_item_id, "claimed")
             return claim
 
-    def _set_work_item_status(self, work_item_id: str, status: str, *, blocked_at_event_id: str | None = None) -> None:
+    def _set_work_item_status(
+        self,
+        work_item_id: str,
+        status: str,
+        *,
+        blocked_at_event_id: str | None = None,
+        updated_at: str | None = None,
+    ) -> None:
         items = self.read_json("work/items.json", {})
         item = items.get(work_item_id)
         if not item:
             return
         item["status"] = status
-        if status == "blocked" and blocked_at_event_id is not None:
-            item["blocked_at_event_id"] = blocked_at_event_id
-        item["updated_at"] = utc_now()
+        if status == "blocked":
+            if blocked_at_event_id is not None:
+                item["blocked_at_event_id"] = blocked_at_event_id
+            item["blocked_at"] = updated_at or utc_now()
+        item["updated_at"] = updated_at or utc_now()
         items[work_item_id] = item
         self.write_json("work/items.json", items)
 
@@ -374,6 +383,7 @@ class DevLaneStore:
                 work_item_id,
                 status_by_close[status],
                 blocked_at_event_id=blocked_event_id,
+                updated_at=now,
             )
             return closed
 
@@ -408,12 +418,22 @@ class DevLaneStore:
                     seen.add(event_id(event))
                 incoming["events"] = merged_events
                 incoming.setdefault("created_at", existing.get("created_at") or utc_now())
+                if existing.get("status") == "blocked":
+                    incoming["updated_at"] = existing.get("updated_at") or incoming.get("updated_at") or utc_now()
+                    incoming["blocked_at"] = existing.get("blocked_at") or existing.get("updated_at") or incoming.get("blocked_at")
                 if existing.get("blocked_at_event_id") and not incoming.get("blocked_at_event_id"):
                     incoming["blocked_at_event_id"] = existing.get("blocked_at_event_id")
                 if existing.get("status") == "blocked":
                     latest_valid = latest_valid_event(incoming)
                     if boundary_event is None:
-                        incoming["status"] = "blocked"
+                        if blocked_boundary:
+                            incoming["status"] = "blocked"
+                        elif existing.get("blocked_at"):
+                            blocked_at = str(existing.get("blocked_at"))
+                            if not latest_valid or str(latest_valid.get("created_at", "")) <= blocked_at:
+                                incoming["status"] = "blocked"
+                        elif not latest_valid:
+                            incoming["status"] = "blocked"
                     elif not latest_valid or not event_after_frontier(item=incoming, event=latest_valid, boundary=boundary_event):
                         incoming["status"] = "blocked"
                 active_claim = self.active_claim_for_work(work_item_id, now=utc_now())
@@ -438,6 +458,8 @@ class DevLaneStore:
             item = items[work_item_id]
             boundary_id = item.get("blocked_at_event_id") if item.get("status") == "blocked" else None
             boundary_created_at = None
+            if item.get("status") == "blocked" and not boundary_id and item.get("blocked_at"):
+                boundary_created_at = str(item.get("blocked_at")) or None
             if item.get("status") == "claimed":
                 claim = self.claim_for_work(work_item_id)
                 boundary_id = claim.get("claimed_event_id") if claim else boundary_id
@@ -450,7 +472,7 @@ class DevLaneStore:
                 boundary_created_at = str(boundary.get("created_at", ""))
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
             if boundary_created_at is not None:
-                if item.get("status") == "claimed" and claim and not boundary_id:
+                if (item.get("status") == "claimed" and claim and not boundary_id) or (item.get("status") == "blocked" and not boundary_id):
                     if str(created_at) <= boundary_created_at:
                         raise ValueError("event is older than blocked baseline or claim baseline")
                 elif boundary and not event_after_frontier(item={"events": item.get("events", []) + [event]}, event=event, boundary=boundary):
@@ -632,6 +654,13 @@ class DevLaneStore:
                 return False, "blocked_without_new_event"
             if not boundary and blocked_boundary:
                 return False, "blocked_without_event_baseline"
+            if (
+                not boundary
+                and not blocked_boundary
+                and item.get("blocked_at")
+                and str(latest_valid.get("created_at", "")) <= str(item.get("blocked_at"))
+            ):
+                return False, "blocked_without_new_event"
         if item.get("status") in {"completed", "superseded"}:
             return False, "terminal"
         return True, None

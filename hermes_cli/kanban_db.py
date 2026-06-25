@@ -997,6 +997,7 @@ CREATE TABLE IF NOT EXISTS lane_work_items (
     governance_state      TEXT,
     capability            TEXT,
     blocked_event_id      INTEGER,
+    blocked_at            INTEGER,
     last_event_id         INTEGER,
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL
@@ -1452,6 +1453,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     lane_claim_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_claims)")}
     if "claimed_event_id" not in lane_claim_cols:
         _add_column_if_missing(conn, "lane_claims", "claimed_event_id", "claimed_event_id INTEGER")
+    lane_work_item_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_work_items)")}
+    if "blocked_at" not in lane_work_item_cols:
+        _add_column_if_missing(conn, "lane_work_items", "blocked_at", "blocked_at INTEGER")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker (additive to the built-in `kanban-worker`). NULL is fine
@@ -1785,9 +1789,13 @@ def claim_lane_work_item(
             if work_item["status"] == "blocked":
                 newer_event = None
                 if work_item["blocked_event_id"] is None:
+                    # Null-baseline blocked closeout has no immutable event id,
+                    # so the closeout timestamp (lane_work_items.updated_at) is
+                    # the fail-closed frontier. Only a valid wake event strictly
+                    # newer than that closeout may make the item claimable.
                     newer_event = conn.execute(
-                        "SELECT id FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) ORDER BY created_at DESC, id DESC LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                        (work_item_id, *sorted(LANE_VALID_WAKE_EVENTS)),
+                        "SELECT id FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND (? IS NULL OR created_at > ?) ORDER BY created_at DESC, id DESC LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                        (work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), work_item["blocked_at"], work_item["blocked_at"]),
                     ).fetchone()
                 else:
                     newer_event = conn.execute(
@@ -1921,10 +1929,10 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
                         ).fetchone()
                     processed_event_id = baseline["id"] if baseline is not None else None
                 conn.execute(
-                    "UPDATE lane_work_items SET status=?, updated_at=?, "
+                    "UPDATE lane_work_items SET status=?, updated_at=?, blocked_at=?, "
                     "blocked_event_id=COALESCE(?, blocked_event_id) "
                     "WHERE work_item_id=? AND status='claimed'",
-                    (status_by_close[status], ts, processed_event_id, row["work_item_id"]),
+                    (status_by_close[status], ts, ts, processed_event_id, row["work_item_id"]),
                 )
                 if processed_event_id:
                     conn.execute(
@@ -1992,7 +2000,7 @@ def record_lane_event(
         }
     with write_txn(conn):
         if work_item_id:
-            item = conn.execute("SELECT status, blocked_event_id FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
+            item = conn.execute("SELECT status, blocked_event_id, blocked_at, updated_at FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
             if item is None:
                 return {
                     "event_id": None,
@@ -2005,8 +2013,16 @@ def record_lane_event(
             boundary_event_id = None
             boundary_created_at = None
             reject_equal_boundary = False
-            if item["status"] == "blocked" and item["blocked_event_id"] is not None:
-                boundary_event_id = item["blocked_event_id"]
+            if item["status"] == "blocked":
+                if item["blocked_event_id"] is not None:
+                    boundary_event_id = item["blocked_event_id"]
+                elif item["blocked_at"] is not None:
+                    # Null-baseline blocked closeouts record blocked_at as the
+                    # durable frontier. Older legacy blocked rows without
+                    # blocked_at predate this contract and may be reopened by
+                    # the next valid event.
+                    boundary_created_at = float(item["blocked_at"])
+                    reject_equal_boundary = True
             elif item["status"] == "claimed":
                 claim = conn.execute("SELECT claimed_event_id, claim_started_at FROM lane_claims WHERE work_item_id=? AND claim_status='active' ORDER BY id DESC LIMIT 1", (work_item_id,)).fetchone()
                 boundary_event_id = claim["claimed_event_id"] if claim is not None else None
@@ -2066,8 +2082,11 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
                     AND w.status != 'claimed'
                     AND NOT (
                         w.status='blocked'
-                        AND w.blocked_event_id IS NOT NULL
-                        AND (b.id IS NULL OR e.id = w.blocked_event_id OR (e.created_at < b.created_at OR (e.created_at = b.created_at AND e.id <= b.id)))
+                        AND (
+                            (w.blocked_event_id IS NOT NULL
+                             AND (b.id IS NULL OR e.id = w.blocked_event_id OR (e.created_at < b.created_at OR (e.created_at = b.created_at AND e.id <= b.id))))
+                            OR (w.blocked_event_id IS NULL AND w.blocked_at IS NOT NULL AND e.created_at <= w.blocked_at)
+                        )
                     )
                  )
            )
@@ -2100,13 +2119,14 @@ def upsert_lane_work_item(
 ) -> dict[str, Any]:
     ts = _now(now)
     with write_txn(conn):
+        wake_event_placeholders = ",".join("?" for _ in LANE_VALID_WAKE_EVENTS)
         conn.execute(
-            """
+            f"""
             INSERT INTO lane_work_items(
                 work_item_id, repo_scope, status, priority, failed_required_ci,
                 stale_open_pr, governance_blocker, review_gap, dependency_unblocked,
-                governance_state, capability, blocked_event_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                governance_state, capability, blocked_event_id, blocked_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(work_item_id) DO UPDATE SET
                 repo_scope=excluded.repo_scope,
                 status=CASE
@@ -2120,14 +2140,20 @@ def upsert_lane_work_item(
                         LEFT JOIN lane_events b ON b.id=lane_work_items.blocked_event_id AND b.work_item_id=e.work_item_id
                          WHERE e.work_item_id=lane_work_items.work_item_id
                            AND e.consumed_at IS NULL
-                           AND e.event_type IN ('new_repair_packet','governance_unblock','failed_ci_transition','followup_repair_packet')
+                           AND e.event_type IN ({wake_event_placeholders})
                            AND b.id IS NOT NULL
                            AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
                      )
                     THEN lane_work_items.status
                     WHEN lane_work_items.status='blocked'
                      AND lane_work_items.blocked_event_id IS NULL
-                     AND (lane_work_items.last_event_id IS NULL OR lane_work_items.last_event_id=lane_work_items.blocked_event_id)
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND (lane_work_items.blocked_at IS NULL OR e.created_at > lane_work_items.blocked_at)
+                     )
                     THEN lane_work_items.status
                     ELSE excluded.status
                 END,
@@ -2137,11 +2163,44 @@ def upsert_lane_work_item(
                 dependency_unblocked=excluded.dependency_unblocked, governance_state=excluded.governance_state,
                 capability=excluded.capability,
                 blocked_event_id=COALESCE(excluded.blocked_event_id, lane_work_items.blocked_event_id),
-                updated_at=excluded.updated_at
+                blocked_at=CASE
+                    WHEN lane_work_items.status='blocked' THEN lane_work_items.blocked_at
+                    WHEN excluded.status='blocked' THEN COALESCE(excluded.blocked_at, excluded.updated_at)
+                    ELSE excluded.blocked_at
+                END,
+                updated_at=CASE
+                    WHEN lane_work_items.status='claimed'
+                     AND EXISTS (SELECT 1 FROM lane_claims WHERE work_item_id=lane_work_items.work_item_id AND claim_status='active')
+                    THEN lane_work_items.updated_at
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NOT NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                        LEFT JOIN lane_events b ON b.id=lane_work_items.blocked_event_id AND b.work_item_id=e.work_item_id
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND b.id IS NOT NULL
+                           AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))
+                     )
+                    THEN lane_work_items.updated_at
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND (lane_work_items.blocked_at IS NULL OR e.created_at > lane_work_items.blocked_at)
+                     )
+                    THEN lane_work_items.updated_at
+                    ELSE excluded.updated_at
+                END
             """,
             (work_item_id, repo_scope, status, int(priority), int(failed_required_ci), int(stale_open_pr),
              int(governance_blocker), int(review_gap), int(dependency_unblocked), governance_state,
-             capability, blocked_event_id, ts, ts),
+             capability, blocked_event_id, None, ts, ts, *sorted(LANE_VALID_WAKE_EVENTS), *sorted(LANE_VALID_WAKE_EVENTS),
+             *sorted(LANE_VALID_WAKE_EVENTS), *sorted(LANE_VALID_WAKE_EVENTS)),
         )
     return _dict(conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()) or {}
 
@@ -2158,8 +2217,8 @@ def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capa
         # that originally caused/recorded the block.
         if row["blocked_event_id"] is None:
             newer = conn.execute(
-                "SELECT 1 FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS)),
+                "SELECT 1 FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND (? IS NULL OR created_at > ?) LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["blocked_at"], row["blocked_at"]),
             ).fetchone()
         else:
             newer = conn.execute(

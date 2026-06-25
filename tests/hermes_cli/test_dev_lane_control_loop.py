@@ -466,7 +466,7 @@ def test_new_event_during_direct_claim_remains_pickable_after_blocked_close(tmp_
         assert second["claim"]["claimed"] is True
 
 
-def test_legacy_active_claim_without_claimed_event_preserves_newer_event_on_blocked_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_legacy_active_claim_without_claimed_event_requires_post_closeout_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
     with kb.connect() as conn:
         kb.upsert_lane_work_item(conn, work_item_id="W-legacy", repo_scope="repo", status="claimed", now=900)
@@ -488,7 +488,13 @@ def test_legacy_active_claim_without_claimed_event_preserves_newer_event_on_bloc
         assert blocked["blocked_event_id"] is None
         assert conn.execute("SELECT consumed_at FROM lane_events WHERE id=?", (event["event_id"],)).fetchone()[0] is None
         second = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1002)
-        assert second is not None and second["work_item_id"] == "W-legacy"
+        assert second is None
+        stale = kb.record_lane_event(conn, lane_id=None, work_item_id="W-legacy", event_type="review_request", now=1000)
+        assert stale["result"] == "STALE_EVENT"
+        fresh = kb.record_lane_event(conn, lane_id=None, work_item_id="W-legacy", event_type="review_request", now=1002)
+        assert fresh["event_id"]
+        third = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1003)
+        assert third is not None and third["work_item_id"] == "W-legacy"
 
 
 def test_direct_open_claim_consumes_claimed_event_at_claim_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
