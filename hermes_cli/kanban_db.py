@@ -1011,6 +1011,7 @@ CREATE TABLE IF NOT EXISTS lane_claims (
     claim_expires_at      INTEGER NOT NULL,
     claim_status          TEXT NOT NULL,
     claim_evidence_path   TEXT NOT NULL,
+    claimed_event_id      INTEGER,
     closed_at             INTEGER,
     recovery_of_claim_id  INTEGER,
     close_message         TEXT
@@ -1447,6 +1448,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+
+    lane_claim_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_claims)")}
+    if "claimed_event_id" not in lane_claim_cols:
+        _add_column_if_missing(conn, "lane_claims", "claimed_event_id", "claimed_event_id INTEGER")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker (additive to the built-in `kanban-worker`). NULL is fine
@@ -1776,10 +1781,10 @@ def claim_lane_work_item(
                 INSERT INTO lane_claims(
                     work_item_id, lane_id, claim_owner, claim_started_at,
                     claim_expires_at, claim_status, claim_evidence_path,
-                    recovery_of_claim_id
-                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                    claimed_event_id, recovery_of_claim_id
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
-                (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, recovery_of_claim_id),
+                (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, work_item["last_event_id"], recovery_of_claim_id),
             )
             update = conn.execute(
                 """
@@ -1828,7 +1833,7 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         "expired/recovered": "open",
     }
     with write_txn(conn):
-        row = conn.execute("SELECT work_item_id, lane_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
+        row = conn.execute("SELECT work_item_id, lane_id, claimed_event_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
         res = conn.execute(
             "UPDATE lane_claims SET claim_status=?, claim_evidence_path=?, closed_at=?, close_message=? "
             "WHERE id=? AND claim_status='active'",
@@ -1836,17 +1841,19 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         )
         if res.rowcount == 1 and row is not None:
             if status_by_close[status] == "blocked":
-                processed_event = conn.execute(
-                    """
-                    SELECT last_event_id
-                      FROM lane_heartbeats
-                     WHERE lane_id=?
-                       AND claimed_work_item_id=?
-                     LIMIT 1
-                    """,
-                    (row["lane_id"], row["work_item_id"]),
-                ).fetchone()
-                processed_event_id = processed_event["last_event_id"] if processed_event else None
+                processed_event_id = row["claimed_event_id"] if row["claimed_event_id"] is not None else None
+                if processed_event_id is None:
+                    processed_event = conn.execute(
+                        """
+                        SELECT last_event_id
+                          FROM lane_heartbeats
+                         WHERE lane_id=?
+                           AND claimed_work_item_id=?
+                         LIMIT 1
+                        """,
+                        (row["lane_id"], row["work_item_id"]),
+                    ).fetchone()
+                    processed_event_id = processed_event["last_event_id"] if processed_event else None
                 if processed_event_id is None:
                     work_item_event = conn.execute(
                         "SELECT last_event_id FROM lane_work_items WHERE work_item_id=?",
