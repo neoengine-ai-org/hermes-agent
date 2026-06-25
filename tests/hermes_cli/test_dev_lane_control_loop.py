@@ -627,3 +627,19 @@ def test_sqlite_upsert_refresh_preserves_blocked_status_without_new_event(tmp_pa
     assert refreshed_after_new["status"] == "open"
     assert allowed["work_item_id"] == "W-blocked-refresh"
     assert allowed["claim"]["claimed_event_id"] == newer["event_id"]
+
+
+def test_sqlite_record_lane_event_rejects_backdated_blocked_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-backdated", repo_scope="repo", status="open", now=100)
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-backdated", event_type="failed_ci_transition", now=100)
+        picked = kb.pickup_next_lane_work(conn, lane_id="lane", agent_session_id="session-a", authorized_scopes=["repo"], now=101)
+        kb.close_lane_claim(conn, picked["claim"]["claim_id"], status="blocked", evidence_path="receipts/blocked.md", now=102)
+        stale = kb.record_lane_event(conn, lane_id=None, work_item_id="W-backdated", event_type="governance_unblock", now=50)
+        denied = kb.pickup_next_lane_work(conn, lane_id="lane", agent_session_id="session-b", authorized_scopes=["repo"], now=103)
+
+    assert event["event_id"] is not None
+    assert stale["recorded"] is False
+    assert stale["result"] == "STALE_EVENT"
+    assert denied is None

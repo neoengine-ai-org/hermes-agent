@@ -1942,6 +1942,19 @@ def record_lane_event(
             "reason": "invalid_event_type",
         }
     with write_txn(conn):
+        if work_item_id:
+            item = conn.execute("SELECT status, blocked_event_id FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
+            if item is not None and item["status"] == "blocked" and item["blocked_event_id"] is not None:
+                boundary = conn.execute("SELECT created_at FROM lane_events WHERE id=? AND work_item_id=?", (item["blocked_event_id"], work_item_id)).fetchone()
+                if boundary is not None and ts < float(boundary["created_at"]):
+                    return {
+                        "event_id": None,
+                        "event_type": event_type,
+                        "work_item_id": work_item_id,
+                        "recorded": False,
+                        "result": "STALE_EVENT",
+                        "reason": "event_not_newer_than_blocked_baseline",
+                    }
         cur = conn.execute(
             "INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (?, ?, ?, ?, ?)",
             (lane_id, event_type, work_item_id, evidence_path, ts),

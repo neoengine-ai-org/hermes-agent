@@ -657,3 +657,41 @@ def test_file_backed_pickup_evidence_path_points_to_canonical_claim(tmp_path: Pa
     assert result["claim"]["claim_evidence_path"] == "claims/by-work-item/work-evidence.json"
     assert heartbeat["evidence_pointer"] == "claims/by-work-item/work-evidence.json"
     assert (tmp_path / heartbeat["evidence_pointer"]).exists()
+
+
+def test_file_backed_record_event_rejects_backdated_blocked_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-backdated", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-backdated", "failed_ci_transition", "2099-06-24T00:10:00Z", event_id="E1")
+    first = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    store.close_claim("work-backdated", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+
+    with pytest.raises(ValueError, match="older than blocked baseline"):
+        store.record_event("work-backdated", "governance_unblock", "2099-06-24T00:00:00Z", event_id="OLD")
+    second = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+
+    assert first["claim"]["claimed_event_id"] == "E1"
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_blocked_refresh_accepts_same_timestamp_followup(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-same-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-same-refresh", "failed_ci_transition", "2099-06-24T00:10:00Z", event_id="E1")
+    store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    store.close_claim("work-same-refresh", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+
+    refreshed = store.add_work_item({
+        "work_item_id": "work-same-refresh",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "blocked",
+        "events": [{"event_id": "E2", "event_type": "governance_unblock", "created_at": "2099-06-24T00:10:00Z"}],
+    })
+    second = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+
+    assert [event["event_id"] for event in refreshed["events"]] == ["E1", "E2"]
+    assert second["action"] == "claimed"
+    assert second["claim"]["claimed_event_id"] == "E2"

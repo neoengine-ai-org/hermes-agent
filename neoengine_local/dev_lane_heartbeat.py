@@ -361,10 +361,14 @@ class DevLaneStore:
                 "no-op with evidence": "completed",
                 "expired/recovered": "open",
             }
+            blocked_event_id = None
+            if status_by_close[status] == "blocked":
+                items = self.read_json("work/items.json", {})
+                blocked_event_id = claim.get("claimed_event_id") or latest_valid_event_id(items.get(work_item_id, {}))
             self._set_work_item_status(
                 work_item_id,
                 status_by_close[status],
-                blocked_at_event_id=claim.get("claimed_event_id") if status_by_close[status] == "blocked" else None,
+                blocked_at_event_id=blocked_event_id,
             )
             return closed
 
@@ -392,8 +396,9 @@ class DevLaneStore:
                 for event in incoming.get("events", []):
                     if event_id(event) in seen:
                         continue
-                    if blocked_boundary and boundary_created_at is not None and str(event.get("created_at", "")) <= boundary_created_at:
-                        continue
+                    if blocked_boundary:
+                        if boundary_created_at is None or str(event.get("created_at", "")) < boundary_created_at:
+                            continue
                     merged_events.append(event)
                     seen.add(event_id(event))
                 incoming["events"] = merged_events
@@ -423,8 +428,15 @@ class DevLaneStore:
             items = self.read_json("work/items.json", {})
             if work_item_id not in items:
                 raise ValueError(f"unknown work item: {work_item_id}")
+            item = items[work_item_id]
+            blocked_boundary = item.get("blocked_at_event_id") if item.get("status") == "blocked" else None
+            if blocked_boundary:
+                boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == blocked_boundary), None)
+                boundary_created_at = str(boundary.get("created_at", "")) if boundary else None
+                if boundary_created_at is None or str(created_at) < boundary_created_at:
+                    raise ValueError("event is older than blocked baseline")
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
-            items[work_item_id].setdefault("events", []).append(event)
+            item.setdefault("events", []).append(event)
             self.write_json("work/items.json", items)
             return event
 
