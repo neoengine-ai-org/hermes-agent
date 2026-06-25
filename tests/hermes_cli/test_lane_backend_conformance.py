@@ -194,3 +194,27 @@ def test_null_baseline_all_wake_event_types_reopen_only_when_newer(tmp_path: Pat
         store.record_event("FILE-" + event_type, event_type, "2099-01-01T00:00:20Z", event_id="same")
     store.record_event("FILE-" + event_type, event_type, "2099-01-01T00:00:21Z", event_id="new")
     assert store.pick_next_work("lane2", "sess2", now="2099-01-01T00:00:22Z")["action"] == "claimed"
+
+
+
+def test_file_null_baseline_consumed_newer_event_does_not_reopen(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path / "file-consumed-store")
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "NB-consumed", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("NB-consumed", "lane-a", "sess-a", "2099-01-01T00:01:00Z", 3600, "claims/a.json")
+    store.close_claim("NB-consumed", "blocked", "receipts/blocked.md", "2099-01-01T00:02:00Z")
+    refreshed = store.add_work_item({
+        "work_item_id": "NB-consumed",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "open",
+        "events": [{
+            "event_id": "consumed-newer",
+            "event_type": "queue_priority_change",
+            "created_at": "2099-01-01T00:02:01Z",
+            "consumed_at": "2099-01-01T00:02:02Z",
+        }],
+    })
+    assert refreshed["status"] == "blocked"
+    assert store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:03:00Z")["action"] == "idle-no-work"
