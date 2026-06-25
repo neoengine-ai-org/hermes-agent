@@ -366,9 +366,10 @@ class DevLaneStore:
             if status_by_close[status] == "blocked":
                 items = self.read_json("work/items.json", {})
                 item_for_baseline = items.get(work_item_id, {})
+                claim_started_at = claim.get("claim_started_at") or claim.get("claimed_at")
                 blocked_event_id = claim.get("claimed_event_id") or latest_consumed_valid_event_id_at_or_before(
-                    item_for_baseline, claim.get("claim_started_at")
-                ) or latest_valid_event_id_before(item_for_baseline, claim.get("claim_started_at"))
+                    item_for_baseline, claim_started_at
+                ) or latest_valid_event_id_before(item_for_baseline, claim_started_at)
             self._set_work_item_status(
                 work_item_id,
                 status_by_close[status],
@@ -439,7 +440,7 @@ class DevLaneStore:
                 claim = self.claim_for_work(work_item_id)
                 boundary_id = claim.get("claimed_event_id") if claim else boundary_id
                 if claim and not boundary_id:
-                    boundary_created_at = str(claim.get("claim_started_at", "")) or None
+                    boundary_created_at = str(claim.get("claim_started_at") or claim.get("claimed_at") or "") or None
             if boundary_id:
                 boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == boundary_id), None)
                 boundary_created_at = str(boundary.get("created_at", "")) if boundary else boundary_created_at

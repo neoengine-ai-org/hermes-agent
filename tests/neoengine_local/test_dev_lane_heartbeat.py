@@ -730,3 +730,20 @@ def test_file_backed_legacy_claim_null_baseline_preserves_newer_event(tmp_path: 
     assert item["blocked_at_event_id"] == "E1"
     assert next_pick["action"] == "claimed"
     assert next_pick["claim"]["claimed_event_id"] == "E2"
+
+
+def test_file_backed_legacy_claimed_at_baseline_blocks_repick(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-legacy-claimed-at", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-legacy-claimed-at", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    claim = store.claim_for_work("work-legacy-claimed-at")
+    claim.pop("claimed_event_id", None)
+    claim["claimed_at"] = claim.pop("claim_started_at")
+    store.write_json(str(store._claim_path("work-legacy-claimed-at")), claim)
+    store.close_claim("work-legacy-claimed-at", "blocked", "receipts/blocked.md", "2099-06-24T00:02:00Z")
+    item = store.read_json("work/items.json", {})["work-legacy-claimed-at"]
+    result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:03:00Z")
+    assert item["blocked_at_event_id"] == "E1"
+    assert result["action"] == "idle-no-work"

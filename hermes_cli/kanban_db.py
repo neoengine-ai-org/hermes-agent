@@ -2048,7 +2048,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
           LEFT JOIN lane_work_items w ON w.work_item_id = e.work_item_id
           LEFT JOIN lane_events b ON b.id = w.blocked_event_id AND b.work_item_id = w.work_item_id
          WHERE (e.lane_id=? OR e.lane_id IS NULL)
-           AND e.id > ?
+           AND (e.work_item_id IS NOT NULL OR e.id > ?)
            AND e.consumed_at IS NULL
            AND e.event_type IN ({event_placeholders})
            AND (

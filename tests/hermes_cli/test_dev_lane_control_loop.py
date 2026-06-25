@@ -710,3 +710,20 @@ def test_sqlite_legacy_claim_null_baseline_reconstructs_boundary_without_swallow
     assert row["blocked_event_id"] == e1["event_id"]
     assert allowed is not None
     assert allowed["claim"]["claimed_event_id"] == newer["event_id"]
+
+
+def test_sqlite_next_lane_wake_does_not_hide_older_other_work_item_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-global-frontier", agent_session_id="session", repo_scope="repo", state="idle-no-work", last_event_id=0, now=90)
+        kb.upsert_lane_work_item(conn, work_item_id="B-older", repo_scope="repo", status="open", priority=1, now=100)
+        e_b = kb.record_lane_event(conn, lane_id=None, work_item_id="B-older", event_type="new_repair_packet", now=100)
+        kb.upsert_lane_work_item(conn, work_item_id="A-newer", repo_scope="repo", status="open", priority=10, now=101)
+        e_a = kb.record_lane_event(conn, lane_id=None, work_item_id="A-newer", event_type="new_repair_packet", now=101)
+        first = kb.pickup_next_lane_work(conn, lane_id="lane-global-frontier", agent_session_id="session", authorized_scopes=["repo"], now=102)
+        kb.close_lane_claim(conn, first["claim"]["claim_id"], status="completed", evidence_path="done.md", now=103)
+        wake = kb.next_lane_wake(conn, "lane-global-frontier", now=104)
+    assert first["work_item_id"] == "A-newer"
+    assert e_a["event_id"] > e_b["event_id"]
+    assert wake["wake_reason"] == "event:new_repair_packet"
+    assert wake["event_id"] == e_b["event_id"]
