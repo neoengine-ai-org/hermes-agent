@@ -1598,6 +1598,17 @@ LANE_TERMINAL_CLAIM_STATUSES = {
 LANE_GOVERNANCE_HOLDS = {"do-not-merge", "awaiting-human", "held", "human-review"}
 
 
+def _lane_claim_result(claimed: bool, result: str, **extra: Any) -> dict[str, Any]:
+    """Return a stable public lane-claim domain result.
+
+    ``reason`` is kept for older callers/tests; ``result`` is the canonical
+    all-caps domain code used by convergence receipts and adapters.
+    """
+    out: dict[str, Any] = {"claimed": claimed, "result": result, "reason": result.lower()}
+    out.update(extra)
+    return out
+
+
 def _dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
     return dict(row) if row is not None else None
 
@@ -1725,26 +1736,26 @@ def claim_lane_work_item(
     expires = ts + max(1, int(ttl_seconds))
     if not evidence_path:
         raise ValueError("claim_evidence_path is required")
-    with write_txn(conn):
-        existing = conn.execute(
-            "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
-            (work_item_id,),
-        ).fetchone()
-        if existing is not None:
-            return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing)}
-        work_item = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
-        if work_item is None:
-            return {"claimed": False, "reason": "work_item_missing"}
-        if work_item["status"] not in {"open", "blocked"}:
-            return {"claimed": False, "reason": "work_item_not_claimable"}
-        if work_item["governance_state"] in {"do-not-merge", "awaiting-human", "held", "human-review"}:
-            return {"claimed": False, "reason": "governance_held"}
-        if work_item["status"] == "blocked" and not (
-            work_item["last_event_id"]
-            and (work_item["blocked_event_id"] is None or work_item["last_event_id"] != work_item["blocked_event_id"])
-        ):
-            return {"claimed": False, "reason": "blocked_without_new_event"}
-        try:
+    try:
+        with write_txn(conn):
+            existing = conn.execute(
+                "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
+                (work_item_id,),
+            ).fetchone()
+            if existing is not None:
+                return _lane_claim_result(False, "ACTIVE_CLAIM_EXISTS", active_claim=dict(existing))
+            work_item = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
+            if work_item is None:
+                return _lane_claim_result(False, "WORK_ITEM_NOT_FOUND", reason="work_item_missing")
+            if work_item["status"] not in {"open", "blocked"}:
+                return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="work_item_not_claimable")
+            if work_item["governance_state"] in LANE_GOVERNANCE_HOLDS:
+                return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="governance_held", governance_state=work_item["governance_state"])
+            if work_item["status"] == "blocked" and not (
+                work_item["last_event_id"]
+                and (work_item["blocked_event_id"] is None or work_item["last_event_id"] != work_item["blocked_event_id"])
+            ):
+                return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="blocked_without_new_event", detail="blocked_without_new_event")
             cur = conn.execute(
                 """
                 INSERT INTO lane_claims(
@@ -1766,13 +1777,15 @@ def claim_lane_work_item(
             )
             if update.rowcount != 1:
                 raise sqlite3.IntegrityError("work item claim status update failed")
-        except sqlite3.IntegrityError:
-            existing = conn.execute(
-                "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
-                (work_item_id,),
-            ).fetchone()
-            return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing) if existing else None}
-    return {"claimed": True, "claim_id": cur.lastrowid, "claim_expires_at": expires}
+    except sqlite3.IntegrityError:
+        existing = conn.execute(
+            "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
+            (work_item_id,),
+        ).fetchone()
+        if existing is not None:
+            return _lane_claim_result(False, "ACTIVE_CLAIM_EXISTS", active_claim=dict(existing))
+        return _lane_claim_result(False, "CLAIM_TRANSACTION_FAILED")
+    return _lane_claim_result(True, "CLAIMED", claim_id=cur.lastrowid, claim_expires_at=expires)
 
 
 def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, evidence_path: str, message: Optional[str] = None, now: Optional[int] = None) -> bool:
@@ -1955,8 +1968,24 @@ def pickup_next_lane_work(
         evidence = evidence_path or f"lane-claims/{lane_id}/{row['work_item_id']}-{ts}.json"
         claim = claim_lane_work_item(conn, row["work_item_id"], lane_id=lane_id, claim_owner=agent_session_id, ttl_seconds=ttl_seconds, evidence_path=evidence, now=ts)
         if claim.get("claimed"):
-            conn.execute("UPDATE lane_work_items SET status='claimed', updated_at=? WHERE work_item_id=?", (ts, row["work_item_id"]))
-            hb = record_lane_heartbeat(conn, lane_id=lane_id, agent_session_id=agent_session_id, repo_scope=row["repo_scope"], state="working", claimed_work_item_id=row["work_item_id"], evidence_path=evidence, now=ts)
+            event_id = row["last_event_id"]
+            if event_id:
+                with write_txn(conn):
+                    conn.execute(
+                        "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+                        (ts, event_id),
+                    )
+            hb = record_lane_heartbeat(
+                conn,
+                lane_id=lane_id,
+                agent_session_id=agent_session_id,
+                repo_scope=row["repo_scope"],
+                state="working",
+                claimed_work_item_id=row["work_item_id"],
+                evidence_path=evidence,
+                last_event_id=event_id,
+                now=ts,
+            )
             item = dict(row)
             item.update({"claim": claim, "heartbeat": hb})
             return item

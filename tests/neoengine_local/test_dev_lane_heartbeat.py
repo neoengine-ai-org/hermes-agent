@@ -75,7 +75,7 @@ def test_reserved_history_work_item_id_does_not_overwrite_claim_history(tmp_path
 def test_unsafe_lane_ids_are_rejected_before_writing_lane_files(tmp_path: Path, lane_id: str) -> None:
     store = DevLaneStore(tmp_path)
 
-    with pytest.raises(ValueError, match="lane_id must be a safe slug"):
+    with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
         store.emit_heartbeat(
             lane_id=lane_id,
             agent_session_id="session-a",
@@ -90,17 +90,31 @@ def test_unsafe_lane_ids_are_rejected_before_writing_lane_files(tmp_path: Path, 
     assert list((tmp_path / "heartbeats").iterdir()) == []
 
 
-def test_claim_file_paths_are_collision_resistant_for_sanitized_work_item_ids(tmp_path: Path) -> None:
+def test_claim_file_paths_use_non_colliding_namespace_for_valid_ids(tmp_path: Path) -> None:
     store = DevLaneStore(tmp_path)
-    store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "PR-36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
     store.add_work_item({"work_item_id": "PR_36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
-    store.claim_work("PR:36", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/colon.json")
+    store.claim_work("PR-36", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/dash.json")
 
     assert store.active_claim_for_work("PR_36", now="2026-06-24T00:01:00Z") is None
     store.claim_work("PR_36", "lane-b", "session-b", "2026-06-24T00:01:00Z", 3600, "claims/underscore.json")
 
-    claim_files = sorted(path.name for path in (tmp_path / "claims").glob("*.json"))
-    assert claim_files == ["PR%3A36.json", "PR_36.json"]
+    claim_files = sorted(path.name for path in (tmp_path / "claims" / "by-work-item").glob("*.json"))
+    assert claim_files == ["PR-36.json", "PR_36.json"]
+
+
+
+@pytest.mark.parametrize("work_item_id", ["../x", "a/b", "/abs", "claims", "history.json", "caf\u0301"])
+def test_unsafe_work_item_ids_are_rejected_without_mutating_history(tmp_path: Path, work_item_id: str) -> None:
+    store = DevLaneStore(tmp_path)
+    original_history = [{"work_item_id": "prior", "claim_status": "completed"}]
+    store.write_json("claims/history.json", original_history)
+    store.add_work_item({"work_item_id": work_item_id, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+
+    with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
+        store.claim_work(work_item_id, "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/x.json")
+
+    assert store.read_json("claims/history.json") == original_history
 
 
 def test_stale_claims_can_be_recovered_with_evidence(tmp_path: Path) -> None:

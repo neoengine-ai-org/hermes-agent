@@ -118,9 +118,15 @@ def test_direct_claim_requires_existing_pickable_non_governance_held_work(tmp_pa
         kb.upsert_lane_work_item(conn, work_item_id="held", repo_scope="repo", status="open", governance_state="do-not-merge")
         held = kb.claim_lane_work_item(conn, "held", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="held.md")
         active_claims = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE claim_status='active'").fetchone()["n"]
-    assert missing == {"claimed": False, "reason": "work_item_missing"}
-    assert terminal == {"claimed": False, "reason": "work_item_not_claimable"}
-    assert held == {"claimed": False, "reason": "governance_held"}
+    assert missing["claimed"] is False
+    assert missing["reason"] == "work_item_missing"
+    assert missing["result"] == "WORK_ITEM_NOT_FOUND"
+    assert terminal["claimed"] is False
+    assert terminal["reason"] == "work_item_not_claimable"
+    assert terminal["result"] == "WORK_ITEM_INELIGIBLE"
+    assert held["claimed"] is False
+    assert held["reason"] == "governance_held"
+    assert held["result"] == "WORK_ITEM_INELIGIBLE"
     assert active_claims == 0
 
 
@@ -131,7 +137,9 @@ def test_direct_claim_rejects_blocked_work_without_new_event(tmp_path, monkeypat
         result = kb.claim_lane_work_item(conn, "blocked", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="blocked.md", now=1000)
         item = conn.execute("SELECT status FROM lane_work_items WHERE work_item_id='blocked'").fetchone()
         active_claims = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE work_item_id='blocked' AND claim_status='active'").fetchone()["n"]
-    assert result == {"claimed": False, "reason": "blocked_without_new_event"}
+    assert result["claimed"] is False
+    assert result["reason"] == "blocked_without_new_event"
+    assert result["result"] == "WORK_ITEM_INELIGIBLE"
     assert item["status"] == "blocked"
     assert active_claims == 0
 
@@ -235,6 +243,71 @@ def test_claim_race_integrity_error_returns_structured_duplicate(tmp_path, monke
         )
         rows = conn.execute("SELECT lane_id, claim_owner FROM lane_claims WHERE work_item_id='W-race'").fetchall()
     assert result["claimed"] is False
-    assert result["reason"] == "active_claim_exists"
-    assert result["active_claim"] is None
+    assert result["result"] == "CLAIM_TRANSACTION_FAILED"
+    assert "active_claim" not in result
     assert rows == []
+
+
+def _claim_same_work_worker(args):
+    import os
+    from hermes_cli import kanban_db as worker_kb
+
+    home, lane_id = args
+    os.environ["HERMES_KANBAN_HOME"] = home
+    with worker_kb.connect() as conn:
+        return worker_kb.claim_lane_work_item(
+            conn,
+            "W-concurrent",
+            lane_id=lane_id,
+            claim_owner=f"{lane_id}-session",
+            ttl_seconds=300,
+            evidence_path=f"{lane_id}.md",
+            now=2000,
+        )
+
+
+def test_claim_results_expose_stable_domain_codes(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        missing = kb.claim_lane_work_item(conn, "missing", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="missing.md")
+        kb.upsert_lane_work_item(conn, work_item_id="held", repo_scope="repo", status="open", governance_state="awaiting-human")
+        held = kb.claim_lane_work_item(conn, "held", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="held.md")
+        kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", status="open")
+        first = kb.claim_lane_work_item(conn, "W1", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="one.md")
+        duplicate = kb.claim_lane_work_item(conn, "W1", lane_id="dev-b", claim_owner="s2", ttl_seconds=300, evidence_path="two.md")
+    assert missing["result"] == "WORK_ITEM_NOT_FOUND"
+    assert held["result"] == "WORK_ITEM_INELIGIBLE"
+    assert first["result"] == "CLAIMED"
+    assert duplicate["result"] == "ACTIVE_CLAIM_EXISTS"
+
+
+def test_event_is_consumed_after_successful_claim_and_duplicate_wake_is_harmless(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-event", repo_scope="repo", status="blocked", blocked_event_id=99, now=900)
+        event = kb.record_lane_event(conn, lane_id="dev-a", event_type="governance_unblock", work_item_id="W-event", now=1000)
+        picked = kb.pickup_next_lane_work(conn, lane_id="dev-a", agent_session_id="s1", authorized_scopes=["repo"], now=1001)
+        duplicate = kb.claim_lane_work_item(conn, "W-event", lane_id="dev-b", claim_owner="s2", ttl_seconds=300, evidence_path="dup.md", now=1002)
+        ev = conn.execute("SELECT consumed_at FROM lane_events WHERE id=?", (event["event_id"],)).fetchone()
+    assert picked is not None and picked["work_item_id"] == "W-event"
+    assert ev["consumed_at"] == 1001
+    assert duplicate["result"] == "ACTIVE_CLAIM_EXISTS"
+
+
+def test_multiprocess_same_item_claim_has_exactly_one_active_claim_and_integrity_ok(tmp_path, monkeypatch):
+    import multiprocessing as mp
+
+    _home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-concurrent", repo_scope="repo", status="open", now=1000)
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=4) as pool:
+        results = pool.map(_claim_same_work_worker, [(str(tmp_path), f"dev-{idx}") for idx in range(4)])
+    with kb.connect() as conn:
+        active = conn.execute("SELECT COUNT(*) AS n FROM lane_claims WHERE work_item_id='W-concurrent' AND claim_status='active'").fetchone()["n"]
+        status = conn.execute("SELECT status FROM lane_work_items WHERE work_item_id='W-concurrent'").fetchone()["status"]
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    assert sum(1 for result in results if result["claimed"] is True) == 1
+    assert active == 1
+    assert status == "claimed"
+    assert integrity == "ok"

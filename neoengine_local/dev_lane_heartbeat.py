@@ -4,6 +4,7 @@ import argparse
 import fnmatch
 import json
 import os
+import unicodedata
 from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -75,21 +76,37 @@ class DevLaneStore:
         self.write_json("lanes.json", lanes)
         return lanes[lane_id]
 
+    def _safe_storage_key(self, value: str, *, kind: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError(f"{kind} must be a string")
+        normalized = unicodedata.normalize("NFC", value.strip())
+        if (
+            not normalized
+            or normalized in {".", ".."}
+            or normalized.startswith(".")
+            or Path(normalized).is_absolute()
+            or "/" in normalized
+            or "\\" in normalized
+            or ".." in normalized.split("/")
+            or normalized != value.strip()
+        ):
+            raise ValueError(f"{kind} is unsafe for lane-control storage: {value!r}")
+        safe = quote(normalized, safe="-_.")
+        stem = safe.removesuffix(".json")
+        reserved = {"history", "_history", "items", "lanes", "events", "receipts", "claims", "continuity", "heartbeats"}
+        if not safe or safe.startswith(".") or stem in reserved or safe != normalized:
+            raise ValueError(f"{kind} is reserved or unsafe for lane-control storage: {value!r}")
+        if safe_id(normalized) != normalized:
+            raise ValueError(f"{kind} must be a stable safe slug: {value!r}")
+        return safe
+
     def _lane_path(self, dirname: str, lane_id: str) -> Path:
-        safe_lane = safe_id(lane_id)
-        if not safe_lane or safe_lane != lane_id or safe_lane.startswith("."):
-            raise ValueError(f"lane_id must be a safe slug: {lane_id!r}")
+        safe_lane = self._safe_storage_key(lane_id, kind="lane_id")
         return Path(dirname) / f"{safe_lane}.json"
 
     def _claim_path(self, work_item_id: str) -> Path:
-        safe_work_item = quote(work_item_id, safe="-_.")
-        if (
-            not safe_work_item
-            or safe_work_item.startswith(".")
-            or safe_work_item in {"history", "_history"}
-        ):
-            raise ValueError(f"work_item_id is reserved or unsafe for claim storage: {work_item_id!r}")
-        return Path("claims") / f"{safe_work_item}.json"
+        safe_work_item = self._safe_storage_key(work_item_id, kind="work_item_id")
+        return Path("claims") / "by-work-item" / f"{safe_work_item}.json"
 
     def latest_heartbeat(self, lane_id: str) -> dict[str, Any] | None:
         value = self.read_json(self._lane_path("heartbeats", lane_id), None)
@@ -156,8 +173,15 @@ class DevLaneStore:
             return None
         return claim
 
+    def _legacy_claim_path(self, work_item_id: str) -> Path:
+        return Path("claims") / f"{quote(work_item_id, safe='-_.')}.json"
+
     def claim_for_work(self, work_item_id: str) -> dict[str, Any] | None:
         claim = self.read_json(self._claim_path(work_item_id), None)
+        if not isinstance(claim, dict):
+            legacy = self._legacy_claim_path(work_item_id)
+            if (self.root / legacy).exists():
+                claim = self.read_json(legacy, None)
         return claim if isinstance(claim, dict) else None
 
     def claim_work(
@@ -394,11 +418,21 @@ class DevLaneStore:
         history.append(claim)
         self.write_json("claims/history.json", history)
 
+    def _claim_record_paths(self) -> list[Path]:
+        roots = [self.root / "claims", self.root / "claims" / "by-work-item"]
+        paths: list[Path] = []
+        for root in roots:
+            if not root.exists():
+                continue
+            for path in root.glob("*.json"):
+                if path.name == "history.json":
+                    continue
+                paths.append(path)
+        return paths
+
     def _active_claims_for_lane(self, lane_id: str, now: str) -> list[dict[str, Any]]:
         claims = []
-        for path in (self.root / "claims").glob("*.json"):
-            if path.name == "history.json":
-                continue
+        for path in self._claim_record_paths():
             claim = json.loads(path.read_text())
             if claim.get("lane_id") == lane_id and claim.get("claim_status") == ACTIVE_CLAIM_STATUS and utc_parse(claim["claim_expires_at"]) > utc_parse(now):
                 claims.append(claim)
@@ -406,9 +440,7 @@ class DevLaneStore:
 
     def _stale_claims_for_lane(self, lane_id: str, now: str) -> list[dict[str, Any]]:
         claims = []
-        for path in (self.root / "claims").glob("*.json"):
-            if path.name == "history.json":
-                continue
+        for path in self._claim_record_paths():
             claim = json.loads(path.read_text())
             if claim.get("lane_id") == lane_id and claim.get("claim_status") == ACTIVE_CLAIM_STATUS and utc_parse(claim["claim_expires_at"]) <= utc_parse(now):
                 claims.append(claim)
