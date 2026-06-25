@@ -429,12 +429,15 @@ class DevLaneStore:
             if work_item_id not in items:
                 raise ValueError(f"unknown work item: {work_item_id}")
             item = items[work_item_id]
-            blocked_boundary = item.get("blocked_at_event_id") if item.get("status") == "blocked" else None
-            if blocked_boundary:
-                boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == blocked_boundary), None)
+            boundary_id = item.get("blocked_at_event_id") if item.get("status") == "blocked" else None
+            if item.get("status") == "claimed":
+                claim = self.claim_for_work(work_item_id)
+                boundary_id = claim.get("claimed_event_id") if claim else boundary_id
+            if boundary_id:
+                boundary = next((existing for existing in item.get("events", []) if globals()["event_id"](existing) == boundary_id), None)
                 boundary_created_at = str(boundary.get("created_at", "")) if boundary else None
                 if boundary_created_at is None or str(created_at) < boundary_created_at:
-                    raise ValueError("event is older than blocked baseline")
+                    raise ValueError("event is older than blocked baseline or claim baseline")
             event = {"event_id": event_id or f"{event_type}:{created_at}", "event_type": event_type, "created_at": created_at}
             item.setdefault("events", []).append(event)
             self.write_json("work/items.json", items)

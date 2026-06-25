@@ -1944,8 +1944,23 @@ def record_lane_event(
     with write_txn(conn):
         if work_item_id:
             item = conn.execute("SELECT status, blocked_event_id FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
-            if item is not None and item["status"] == "blocked" and item["blocked_event_id"] is not None:
-                boundary = conn.execute("SELECT created_at FROM lane_events WHERE id=? AND work_item_id=?", (item["blocked_event_id"], work_item_id)).fetchone()
+            if item is None:
+                return {
+                    "event_id": None,
+                    "event_type": event_type,
+                    "work_item_id": work_item_id,
+                    "recorded": False,
+                    "result": "WORK_ITEM_NOT_FOUND",
+                    "reason": "work_item_not_found",
+                }
+            boundary_event_id = None
+            if item["status"] == "blocked" and item["blocked_event_id"] is not None:
+                boundary_event_id = item["blocked_event_id"]
+            elif item["status"] == "claimed":
+                claim = conn.execute("SELECT claimed_event_id FROM lane_claims WHERE work_item_id=? AND claim_status='active' ORDER BY id DESC LIMIT 1", (work_item_id,)).fetchone()
+                boundary_event_id = claim["claimed_event_id"] if claim is not None else None
+            if boundary_event_id is not None:
+                boundary = conn.execute("SELECT created_at FROM lane_events WHERE id=? AND work_item_id=?", (boundary_event_id, work_item_id)).fetchone()
                 if boundary is not None and ts < float(boundary["created_at"]):
                     return {
                         "event_id": None,
@@ -1953,7 +1968,7 @@ def record_lane_event(
                         "work_item_id": work_item_id,
                         "recorded": False,
                         "result": "STALE_EVENT",
-                        "reason": "event_not_newer_than_blocked_baseline",
+                        "reason": "event_not_newer_than_claim_or_block_baseline",
                     }
         cur = conn.execute(
             "INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -1972,12 +1987,26 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
     event_placeholders = ",".join("?" for _ in LANE_VALID_WAKE_EVENTS)
     ev = conn.execute(
         f"""
-        SELECT * FROM lane_events
-         WHERE (lane_id=? OR lane_id IS NULL)
-           AND id > ?
-           AND consumed_at IS NULL
-           AND event_type IN ({event_placeholders})
-         ORDER BY id LIMIT 1
+        SELECT e.*
+          FROM lane_events e
+          LEFT JOIN lane_work_items w ON w.work_item_id = e.work_item_id
+         WHERE (e.lane_id=? OR e.lane_id IS NULL)
+           AND e.id > ?
+           AND e.consumed_at IS NULL
+           AND e.event_type IN ({event_placeholders})
+           AND (
+                 e.work_item_id IS NULL
+                 OR (
+                    w.work_item_id IS NOT NULL
+                    AND w.status != 'claimed'
+                    AND NOT (
+                        w.status='blocked'
+                        AND w.blocked_event_id IS NOT NULL
+                        AND e.id <= w.blocked_event_id
+                    )
+                 )
+           )
+         ORDER BY e.id LIMIT 1
         """,
         (lane_id, last_event_id, *sorted(LANE_VALID_WAKE_EVENTS)),
     ).fetchone()

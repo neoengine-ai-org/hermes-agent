@@ -174,6 +174,7 @@ def test_event_wake_beats_timer_wake(tmp_path, monkeypatch):
     now = 1000
     with kb.connect() as conn:
         kb.record_lane_heartbeat(conn, lane_id="dev-a", agent_session_id="s1", repo_scope="repo", state="idle-no-work", now=now)
+        kb.upsert_lane_work_item(conn, work_item_id="W2", repo_scope="repo", status="open", now=now)
         kb.record_lane_event(conn, lane_id="dev-a", event_type="new_repair_packet", work_item_id="W2", evidence_path="events/e1.json", now=now + 10)
         wake = kb.next_lane_wake(conn, "dev-a", now=now + 11)
     assert wake["wake_reason"] == "event:new_repair_packet"
@@ -643,3 +644,33 @@ def test_sqlite_record_lane_event_rejects_backdated_blocked_event(tmp_path: Path
     assert stale["recorded"] is False
     assert stale["result"] == "STALE_EVENT"
     assert denied is None
+
+
+def test_sqlite_rejects_unknown_work_item_and_backdated_claimed_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-orphan", agent_session_id="session-orphan", repo_scope="repo", state="idle-no-work", last_event_id=0, now=9)
+        # Legacy/injected orphan event rows must not be treated as authoritative wakes.
+        conn.execute("INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (NULL, 'new_repair_packet', 'missing-legacy', NULL, 9)")
+        missing = kb.record_lane_event(conn, lane_id=None, work_item_id="missing", event_type="new_repair_packet", now=10)
+        orphan_wake = kb.next_lane_wake(conn, "lane-orphan", now=11)
+        missing_count = conn.execute("SELECT COUNT(*) FROM lane_events WHERE work_item_id='missing'").fetchone()[0]
+        kb.upsert_lane_work_item(conn, work_item_id="W-claimed-backdated", repo_scope="repo", status="open", now=100)
+        e1 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-claimed-backdated", event_type="new_repair_packet", now=100)
+        picked = kb.pickup_next_lane_work(conn, lane_id="lane", agent_session_id="session-a", authorized_scopes=["repo"], now=101)
+        stale = kb.record_lane_event(conn, lane_id=None, work_item_id="W-claimed-backdated", event_type="governance_unblock", now=50)
+        claim_wake = kb.next_lane_wake(conn, "lane-orphan", now=101)
+        newer = kb.record_lane_event(conn, lane_id=None, work_item_id="W-claimed-backdated", event_type="governance_unblock", now=104)
+        claim_newer_wake = kb.next_lane_wake(conn, "lane-orphan", now=105)
+        kb.close_lane_claim(conn, picked["claim"]["claim_id"], status="blocked", evidence_path="r", now=106)
+        allowed = kb.pickup_next_lane_work(conn, lane_id="lane", agent_session_id="session-b", authorized_scopes=["repo"], now=107)
+    assert missing["recorded"] is False and missing["result"] == "WORK_ITEM_NOT_FOUND"
+    assert missing_count == 0
+    assert orphan_wake["wake_reason"] == "timer"
+    assert e1["event_id"] is not None
+    assert stale["recorded"] is False and stale["result"] == "STALE_EVENT"
+    assert claim_wake["wake_reason"] == "timer"
+    assert newer["event_id"] is not None
+    assert claim_newer_wake["wake_reason"] == "timer"
+    assert allowed is not None
+    assert allowed["claim"]["claimed_event_id"] == newer["event_id"]

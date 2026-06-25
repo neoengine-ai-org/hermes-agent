@@ -695,3 +695,16 @@ def test_file_backed_blocked_refresh_accepts_same_timestamp_followup(tmp_path: P
     assert [event["event_id"] for event in refreshed["events"]] == ["E1", "E2"]
     assert second["action"] == "claimed"
     assert second["claim"]["claimed_event_id"] == "E2"
+
+
+def test_file_backed_record_event_rejects_backdated_active_claim_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-claimed-backdated", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-claimed-backdated", "new_repair_packet", "2099-06-24T00:10:00Z", event_id="E1")
+    store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    with pytest.raises(ValueError, match="older than"):
+        store.record_event("work-claimed-backdated", "governance_unblock", "2099-06-24T00:00:00Z", event_id="OLD")
+    store.close_claim("work-claimed-backdated", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+    result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+    assert result["action"] == "idle-no-work"
