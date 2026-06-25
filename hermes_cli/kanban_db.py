@@ -1790,12 +1790,12 @@ def claim_lane_work_item(
                 newer_event = None
                 if work_item["blocked_event_id"] is None:
                     # Null-baseline blocked closeout has no immutable event id,
-                    # so the closeout timestamp (lane_work_items.updated_at) is
+                    # so the closeout timestamp (lane_work_items.blocked_at) is
                     # the fail-closed frontier. Only a valid wake event strictly
                     # newer than that closeout may make the item claimable.
                     newer_event = conn.execute(
-                        "SELECT id FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND (? IS NULL OR created_at > ?) ORDER BY created_at DESC, id DESC LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                        (work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), work_item["blocked_at"], work_item["blocked_at"]),
+                        "SELECT id FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND created_at <= ? AND (? IS NULL OR created_at > ?) ORDER BY created_at DESC, id DESC LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                        (work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), ts, work_item["blocked_at"], work_item["blocked_at"]),
                     ).fetchone()
                 else:
                     newer_event = conn.execute(
@@ -1805,12 +1805,13 @@ def claim_lane_work_item(
                          WHERE e.work_item_id=?
                            AND e.consumed_at IS NULL
                            AND e.event_type IN ({})
+                           AND e.created_at <= ?
                            AND (
                                 (b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id)))
                            )
                          ORDER BY e.created_at DESC, e.id DESC LIMIT 1
                         """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                        (work_item["blocked_event_id"], work_item_id, *sorted(LANE_VALID_WAKE_EVENTS)),
+                        (work_item["blocked_event_id"], work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), ts),
                     ).fetchone()
                 if newer_event is None:
                     return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="blocked_without_new_event", detail="blocked_without_new_event")
@@ -1829,6 +1830,7 @@ def claim_lane_work_item(
                 SELECT id, created_at FROM lane_events
                  WHERE work_item_id=?
                    AND event_type IN ({})
+                   AND consumed_at IS NULL
                    AND created_at <= ?
                  ORDER BY created_at DESC, id DESC LIMIT 1
                 """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
@@ -2074,6 +2076,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
          WHERE (e.lane_id=? OR e.lane_id IS NULL)
            AND (e.work_item_id IS NOT NULL OR e.id > ?)
            AND e.consumed_at IS NULL
+           AND e.created_at <= ?
            AND e.event_type IN ({event_placeholders})
            AND (
                  e.work_item_id IS NULL
@@ -2092,7 +2095,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
            )
          ORDER BY e.id LIMIT 1
         """,
-        (lane_id, last_event_id, *sorted(LANE_VALID_WAKE_EVENTS)),
+        (lane_id, last_event_id, ts, *sorted(LANE_VALID_WAKE_EVENTS)),
     ).fetchone()
     if ev is not None:
         return {"eligible_now": True, "wake_reason": f"event:{ev['event_type']}", "event_id": ev["id"]}
@@ -2205,20 +2208,21 @@ def upsert_lane_work_item(
     return _dict(conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()) or {}
 
 
-def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capabilities: Optional[Iterable[str]], conn: sqlite3.Connection) -> bool:
+def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capabilities: Optional[Iterable[str]], conn: sqlite3.Connection, *, now: Optional[int] = None) -> bool:
     if row["repo_scope"] not in set(authorized_scopes):
         return False
     if capabilities is not None and row["capability"] and row["capability"] not in set(capabilities):
         return False
     if row["governance_state"] in LANE_GOVERNANCE_HOLDS:
         return False
+    ts = _now(now)
     if row["status"] == "blocked":
         # Blocked work becomes eligible only after a new event beyond the event
         # that originally caused/recorded the block.
         if row["blocked_event_id"] is None:
             newer = conn.execute(
-                "SELECT 1 FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND (? IS NULL OR created_at > ?) LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), row["blocked_at"], row["blocked_at"]),
+                "SELECT 1 FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND created_at <= ? AND (? IS NULL OR created_at > ?) LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), ts, row["blocked_at"], row["blocked_at"]),
             ).fetchone()
         else:
             newer = conn.execute(
@@ -2228,10 +2232,11 @@ def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capa
                  WHERE e.work_item_id=?
                    AND e.consumed_at IS NULL
                    AND e.event_type IN ({})
+                   AND e.created_at <= ?
                    AND ((b.id IS NOT NULL AND (e.created_at > b.created_at OR (e.created_at = b.created_at AND e.id > b.id))))
                  LIMIT 1
                 """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
-                (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS)),
+                (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), ts),
             ).fetchone()
         if newer is None:
             return False
@@ -2262,7 +2267,7 @@ def pickup_next_lane_work(
         """
     ).fetchall()
     for row in rows:
-        if not _work_item_pickable(row, authorized_scopes, capabilities, conn):
+        if not _work_item_pickable(row, authorized_scopes, capabilities, conn, now=ts):
             continue
         evidence = evidence_path or f"lane-claims/{lane_id}/{row['work_item_id']}-{ts}.json"
         claim = claim_lane_work_item(conn, row["work_item_id"], lane_id=lane_id, claim_owner=agent_session_id, ttl_seconds=ttl_seconds, evidence_path=evidence, now=ts)

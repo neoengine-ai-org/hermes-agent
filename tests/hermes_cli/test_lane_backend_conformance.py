@@ -218,3 +218,56 @@ def test_file_null_baseline_consumed_newer_event_does_not_reopen(tmp_path: Path)
     })
     assert refreshed["status"] == "blocked"
     assert store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:03:00Z")["action"] == "idle-no-work"
+
+
+
+def test_sqlite_null_baseline_future_event_waits_until_event_time(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "sqlite-future-home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="SQL-future", repo_scope="repo", status="open", now=100)
+        assert kb.claim_lane_work_item(conn, "SQL-future", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=110)["claimed"] is True
+        claim_id = conn.execute("SELECT id FROM lane_claims WHERE work_item_id='SQL-future'").fetchone()["id"]
+        assert kb.close_lane_claim(conn, claim_id=claim_id, status="blocked", evidence_path="blocked.md", now=120) is True
+        kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-future", event_type="queue_priority_change", now=180)
+        early = kb.claim_lane_work_item(conn, "SQL-future", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="early.md", now=150)
+        wake_early = kb.next_lane_wake(conn, "lane-b", now=150)
+        late = kb.claim_lane_work_item(conn, "SQL-future", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="late.md", now=180)
+    assert early["claimed"] is False
+    assert early["result"] == "WORK_ITEM_INELIGIBLE"
+    assert wake_early["wake_reason"] == "timer"
+    assert late["claimed"] is True
+    assert late["claimed_event_id"] is not None
+
+
+def test_file_null_baseline_future_event_waits_until_event_time(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path / "file-future-store")
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "FILE-future", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("FILE-future", "lane-a", "sess-a", "2099-01-01T00:01:00Z", 3600, "claims/a.json")
+    store.close_claim("FILE-future", "blocked", "receipts/blocked.md", "2099-01-01T00:02:00Z")
+    store.record_event(work_item_id="FILE-future", event_type="queue_priority_change", created_at="2099-01-01T00:03:00Z")
+    early = store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:02:30Z")
+    late = store.pick_next_work("lane-b", "sess-b", now="2099-01-01T00:03:00Z")
+    assert early["action"] == "idle-no-work"
+    assert late["action"] == "claimed"
+    assert late["claim"]["claimed_event_id"]
+
+
+def test_sqlite_claim_baseline_ignores_preconsumed_direct_rows(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "sqlite-consumed-baseline-home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="SQL-consumed", repo_scope="repo", status="blocked", now=100)
+        base = kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-consumed", event_type="queue_priority_change", now=105)
+        first = kb.claim_lane_work_item(conn, "SQL-consumed", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="first.md", now=106)
+        assert first["claimed"] is True
+        claim_id = conn.execute("SELECT id FROM lane_claims WHERE work_item_id='SQL-consumed' AND claim_status='active'").fetchone()["id"]
+        assert kb.close_lane_claim(conn, claim_id=claim_id, status="blocked", evidence_path="blocked.md", now=107) is True
+        unconsumed = kb.record_lane_event(conn, lane_id=None, work_item_id="SQL-consumed", event_type="queue_priority_change", now=110)
+        conn.execute(
+            "INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at, consumed_at) VALUES(NULL, 'queue_priority_change', 'SQL-consumed', NULL, 120, 121)"
+        )
+        second = kb.claim_lane_work_item(conn, "SQL-consumed", lane_id="lane-b", claim_owner="sess-b", ttl_seconds=300, evidence_path="second.md", now=130)
+    assert base["event_id"]
+    assert second["claimed"] is True
+    assert second["claimed_event_id"] == unconsumed["event_id"]

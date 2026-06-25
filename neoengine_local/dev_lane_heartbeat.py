@@ -297,7 +297,7 @@ class DevLaneStore:
             pickable, reason = self._is_item_pickable_for_lane(item, lane, now)
             if not pickable:
                 raise ValueError(f"work item is not claimable: {reason}")
-            claimed_event_id = latest_unconsumed_valid_event_id(item)
+            claimed_event_id = latest_unconsumed_valid_event_id(item, at_or_before=now)
             expires_at = format_utc(now_dt + timedelta(seconds=ttl_seconds))
             claim = {
                 "schema_version": "dev_lane_claim.v1",
@@ -645,7 +645,7 @@ class DevLaneStore:
         if item.get("status") == "refused" and not item.get("sidecar_evidence_path"):
             return False, "refused_without_sidecar_evidence"
         if item.get("status") == "blocked":
-            latest_valid = latest_unconsumed_valid_event(item)
+            latest_valid = latest_unconsumed_valid_event(item, at_or_before=now)
             if not latest_valid:
                 return False, "blocked_without_new_event"
             blocked_boundary = item.get("blocked_at_event_id")
@@ -673,6 +673,7 @@ class DevLaneStore:
             event for event in item.get("events", [])
             if not event.get("consumed_at")
             and f"{item.get('work_item_id')}:{event_id(event)}" != consumed
+            and str(event.get("created_at", "")) <= str(now)
         ]
         valid_events = [event for event in new_events if event.get("event_type") in VALID_WAKE_EVENTS]
         if valid_events:
@@ -771,11 +772,13 @@ def latest_valid_event_id(item: dict[str, Any]) -> str | None:
     return event_id(event) if event else None
 
 
-def latest_unconsumed_valid_event(item: dict[str, Any]) -> dict[str, Any] | None:
+def latest_unconsumed_valid_event(item: dict[str, Any], *, at_or_before: str | None = None) -> dict[str, Any] | None:
     indexed = [
         (idx, event)
         for idx, event in enumerate(item.get("events", []))
-        if event.get("event_type") in VALID_WAKE_EVENTS and not event.get("consumed_at")
+        if event.get("event_type") in VALID_WAKE_EVENTS
+        and not event.get("consumed_at")
+        and (at_or_before is None or str(event.get("created_at", "")) <= str(at_or_before))
     ]
     if not indexed:
         return None
@@ -783,8 +786,8 @@ def latest_unconsumed_valid_event(item: dict[str, Any]) -> dict[str, Any] | None
     return event
 
 
-def latest_unconsumed_valid_event_id(item: dict[str, Any]) -> str | None:
-    event = latest_unconsumed_valid_event(item)
+def latest_unconsumed_valid_event_id(item: dict[str, Any], *, at_or_before: str | None = None) -> str | None:
+    event = latest_unconsumed_valid_event(item, at_or_before=at_or_before)
     return event_id(event) if event else None
 
 
