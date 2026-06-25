@@ -1908,7 +1908,7 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
                 processed_event_id = row["claimed_event_id"]
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, blocked_at=?, "
-                    "blocked_event_id=COALESCE(?, blocked_event_id) "
+                    "blocked_event_id=? "
                     "WHERE work_item_id=? AND status='claimed'",
                     (status_by_close[status], ts, ts, processed_event_id, row["work_item_id"]),
                 )
@@ -2064,7 +2064,7 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
                         w.status='blocked'
                         AND (
                             (w.blocked_event_id IS NOT NULL
-                             AND (b.id IS NULL OR e.id = w.blocked_event_id OR (e.created_at < b.created_at OR (e.created_at = b.created_at AND e.id <= b.id))))
+                             AND (b.id IS NULL OR e.id = w.blocked_event_id OR e.created_at <= b.created_at))
                             OR (w.blocked_event_id IS NULL AND w.blocked_at IS NOT NULL AND e.created_at <= w.blocked_at)
                         )
                     )

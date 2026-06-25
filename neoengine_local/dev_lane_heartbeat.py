@@ -333,7 +333,12 @@ class DevLaneStore:
         if status == "blocked":
             if blocked_at_event_id is not None:
                 item["blocked_at_event_id"] = blocked_at_event_id
+            else:
+                item.pop("blocked_at_event_id", None)
             item["blocked_at"] = updated_at or utc_now()
+        else:
+            item.pop("blocked_at_event_id", None)
+            item.pop("blocked_at", None)
         item["updated_at"] = updated_at or utc_now()
         items[work_item_id] = item
         self.write_json("work/items.json", items)
@@ -745,11 +750,7 @@ def _event_order(item: dict[str, Any], target: dict[str, Any]) -> int:
 
 
 def event_after_frontier(*, item: dict[str, Any], event: dict[str, Any], boundary: dict[str, Any]) -> bool:
-    event_created = str(event.get("created_at", ""))
-    boundary_created = str(boundary.get("created_at", ""))
-    if event_created != boundary_created:
-        return event_created > boundary_created
-    return _event_order(item, event) > _event_order(item, boundary)
+    return str(event.get("created_at", "")) > str(boundary.get("created_at", ""))
 
 
 def latest_event_id(item: dict[str, Any]) -> str | None:

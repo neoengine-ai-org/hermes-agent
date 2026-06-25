@@ -557,20 +557,20 @@ def test_file_backed_scanner_rejects_invalid_event_without_unblocking_blocked_it
     assert item["blocked_at_event_id"] == "E1"
 
 
-def test_file_backed_same_timestamp_followup_event_survives_blocked_closeout(tmp_path: Path) -> None:
+def test_file_backed_same_timestamp_followup_event_is_stale_for_active_claim(tmp_path: Path) -> None:
     store = DevLaneStore(tmp_path)
     store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
     store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
     store.add_work_item({"work_item_id": "work-same-ts", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
     store.record_event("work-same-ts", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
     first = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
-    store.record_event("work-same-ts", "followup_repair_packet", "2099-06-24T00:00:00Z", event_id="E2")
+    with pytest.raises(ValueError, match="older than"):
+        store.record_event("work-same-ts", "followup_repair_packet", "2099-06-24T00:00:00Z", event_id="E2")
     store.close_claim("work-same-ts", "blocked", "receipts/blocked.md", "2099-06-24T00:02:00Z")
     second = store.pick_next_work("lane-b", "session-b", now="2099-06-24T00:03:00Z")
 
     assert first["claim"]["claimed_event_id"] == "E1"
-    assert second["action"] == "claimed"
-    assert second["claim"]["claimed_event_id"] == "E2"
+    assert second["action"] == "idle-no-work"
 
 
 def test_file_backed_legacy_claim_recovery_closes_legacy_path(tmp_path: Path) -> None:
@@ -675,7 +675,7 @@ def test_file_backed_record_event_rejects_backdated_blocked_event(tmp_path: Path
     assert second["action"] == "idle-no-work"
 
 
-def test_file_backed_blocked_refresh_accepts_same_timestamp_followup(tmp_path: Path) -> None:
+def test_file_backed_blocked_refresh_rejects_same_timestamp_followup(tmp_path: Path) -> None:
     store = DevLaneStore(tmp_path)
     store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
     store.add_work_item({"work_item_id": "work-same-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
@@ -692,9 +692,8 @@ def test_file_backed_blocked_refresh_accepts_same_timestamp_followup(tmp_path: P
     })
     second = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
 
-    assert [event["event_id"] for event in refreshed["events"]] == ["E1", "E2"]
-    assert second["action"] == "claimed"
-    assert second["claim"]["claimed_event_id"] == "E2"
+    assert [event["event_id"] for event in refreshed["events"]] == ["E1"]
+    assert second["action"] == "idle-no-work"
 
 
 def test_file_backed_record_event_rejects_backdated_active_claim_event(tmp_path: Path) -> None:
