@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Spawned multiprocessing workers can inherit sys.path entries inserted by
+# deployed-script integration tests.  Keep this checkout first so workers test
+# the PR code, not an older live deployment checkout.
+try:
+    sys.path.remove(str(REPO_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(REPO_ROOT))
 
 from neoengine_local.dev_lane_heartbeat import DevLaneStore, utc_parse
 
@@ -393,7 +404,7 @@ def _file_backed_claim_worker(args: tuple[str, str]) -> dict[str, str]:
             "work-concurrent",
             lane_id,
             f"session-{lane_id}",
-            "2026-06-24T00:00:00Z",
+            "2099-06-24T00:00:00Z",
             3600,
             f"claims/{lane_id}.json",
         )
@@ -447,3 +458,70 @@ def test_colon_work_item_id_uses_encoded_non_colliding_claim_path(tmp_path: Path
     claim_files = sorted(path.name for path in (tmp_path / "claims" / "by-work-item").glob("*.json"))
     assert claim_files == ["neowealth%3Astartup-proof%3Acodex.json"]
     assert not (tmp_path / "claims" / "history.json").exists()
+
+
+def test_file_backed_refresh_preserves_active_claimed_status_and_terminal_closeout(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-refresh-active", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("work-refresh-active", "lane-a", "session-a", "2099-06-24T00:00:00Z", 3600, "claims/a.json")
+
+    refreshed = store.add_work_item({"work_item_id": "work-refresh-active", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "queued"})
+    status = store.status_report(now="2099-06-24T00:05:00Z")
+    store.close_claim("work-refresh-active", "completed", "receipts/done.md", "2099-06-24T00:06:00Z")
+    closed = store.read_json("work/items.json")["work-refresh-active"]
+
+    assert refreshed["status"] == "claimed"
+    assert status["lanes"] == [] or "work-refresh-active" not in [item.get("work_item_id") for item in status["lanes"]]
+    assert closed["status"] == "completed"
+
+
+def test_file_backed_blocked_baseline_survives_refresh_until_new_valid_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-blocked-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked"})
+    e1 = store.record_event("work-blocked-refresh", "new_repair_packet", "2026-06-24T00:00:00Z", event_id="E1")
+    store.claim_work("work-blocked-refresh", "lane-a", "session-a", "2026-06-24T00:01:00Z", 3600, "claims/a.json")
+    store.close_claim("work-blocked-refresh", "blocked", "receipts/blocked.md", "2026-06-24T00:02:00Z")
+
+    refreshed = store.add_work_item({"work_item_id": "work-blocked-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked"})
+    denied = store.pick_next_work("lane-a", "session-b", now="2026-06-24T00:03:00Z")
+    e2 = store.record_event("work-blocked-refresh", "governance_unblock", "2026-06-24T00:04:00Z", event_id="E2")
+    picked = store.pick_next_work("lane-a", "session-c", now="2026-06-24T00:05:00Z")
+
+    assert e1["event_id"] == "E1"
+    assert refreshed["blocked_at_event_id"] == "E1"
+    assert denied["action"] == "idle-no-work"
+    assert e2["event_id"] == "E2"
+    assert picked["action"] == "claimed"
+    assert picked["claim"]["claimed_event_id"] == "E2"
+
+
+def test_file_backed_claim_consumes_prior_same_work_item_events_only(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-events", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "work-other", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-events", "new_repair_packet", "2026-06-24T00:00:00Z", event_id="E1")
+    store.record_event("work-other", "new_repair_packet", "2026-06-24T00:01:00Z", event_id="O1")
+    store.record_event("work-events", "followup_repair_packet", "2026-06-24T00:02:00Z", event_id="E2")
+
+    claim = store.claim_work("work-events", "lane-a", "session-a", "2026-06-24T00:03:00Z", 3600, "claims/a.json")
+    store.record_event("work-events", "governance_unblock", "2026-06-24T00:04:00Z", event_id="E3")
+    items = store.read_json("work/items.json")
+    wake = store.pick_next_work("lane-b", "session-b", now="2026-06-24T00:05:00Z")
+
+    event_map = {event["event_id"]: event for event in items["work-events"]["events"]}
+    assert claim["claimed_event_id"] == "E2"
+    assert event_map["E1"]["consumed_at"] == "2026-06-24T00:03:00Z"
+    assert event_map["E2"]["consumed_at"] == "2026-06-24T00:03:00Z"
+    assert "consumed_at" not in event_map["E3"]
+    assert wake["action"] == "claimed"
+    assert wake["work_item_id"] == "work-other"
+
+
+def test_event_vocabulary_matches_sqlite_backend() -> None:
+    from hermes_cli import kanban_db as kb
+    from neoengine_local import dev_lane_heartbeat as hb
+
+    assert kb.LANE_VALID_WAKE_EVENTS == hb.VALID_WAKE_EVENTS

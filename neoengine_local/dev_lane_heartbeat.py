@@ -25,6 +25,7 @@ VALID_WAKE_EVENTS = {
     "failed_ci_transition",
     "governance_unblock",
     "explicit_operator_command",
+    "followup_repair_packet",
 }
 
 TERMINAL_CLAIM_STATUSES = {
@@ -228,6 +229,21 @@ class DevLaneStore:
             return claim
         return legacy_claim if isinstance(legacy_claim, dict) else None
 
+    def _event_sort_key(self, event: dict[str, Any]) -> tuple[str, str]:
+        return (str(event.get("created_at", "")), event_id(event))
+
+    def _consume_events_through(self, item: dict[str, Any], boundary_event_id: str | None, consumed_at: str) -> None:
+        if not boundary_event_id:
+            return
+        events = item.setdefault("events", [])
+        boundary = next((event for event in events if event_id(event) == boundary_event_id), None)
+        if boundary is None:
+            return
+        boundary_key = self._event_sort_key(boundary)
+        for event in events:
+            if event.get("event_type") in VALID_WAKE_EVENTS and self._event_sort_key(event) <= boundary_key:
+                event.setdefault("consumed_at", consumed_at)
+
     def claim_work(
         self,
         work_item_id: str,
@@ -289,6 +305,9 @@ class DevLaneStore:
                 "claim_evidence_path": evidence_path,
                 "claimed_event_id": claimed_event_id,
             }
+            self._consume_events_through(item, claimed_event_id, now)
+            items[work_item_id] = item
+            self.write_json("work/items.json", items)
             self.write_json(self._claim_path(work_item_id), claim)
             self._set_work_item_status(work_item_id, "claimed")
             return claim
@@ -351,13 +370,36 @@ class DevLaneStore:
         self._safe_storage_key(str(item["work_item_id"]), kind="work_item_id", allow_encoded=True)
         with self._exclusive_store_lock():
             items = self.read_json("work/items.json", {})
-            item = {"schema_version": "dev_lane_work_item.v1", **item}
-            item.setdefault("events", [])
-            item.setdefault("status", "queued")
-            item.setdefault("created_at", utc_now())
-            items[item["work_item_id"]] = item
+            work_item_id = str(item["work_item_id"])
+            existing = items.get(work_item_id)
+            incoming = {"schema_version": "dev_lane_work_item.v1", **item}
+            incoming.setdefault("events", [])
+            incoming.setdefault("status", "queued")
+            incoming.setdefault("created_at", utc_now())
+            if existing:
+                merged_events = list(existing.get("events", []))
+                seen = {event_id(event) for event in merged_events}
+                for event in incoming.get("events", []):
+                    if event_id(event) not in seen:
+                        merged_events.append(event)
+                        seen.add(event_id(event))
+                incoming["events"] = merged_events
+                incoming.setdefault("created_at", existing.get("created_at") or utc_now())
+                if existing.get("blocked_at_event_id") and not incoming.get("blocked_at_event_id"):
+                    incoming["blocked_at_event_id"] = existing.get("blocked_at_event_id")
+                if existing.get("status") == "blocked" and latest_event_id(incoming) == incoming.get("blocked_at_event_id"):
+                    incoming["status"] = "blocked"
+                active_claim = self.active_claim_for_work(work_item_id, now=utc_now())
+                if active_claim:
+                    incoming["status"] = "claimed"
+                    incoming["active_claim_lane_id"] = active_claim.get("lane_id")
+                    incoming["active_claim_owner_session_id"] = active_claim.get("claim_owner_session_id")
+                    incoming["claim_expires_at"] = active_claim.get("claim_expires_at")
+                elif existing.get("status") in {"completed", "superseded", "refused"}:
+                    incoming["status"] = existing["status"]
+            items[work_item_id] = incoming
             self.write_json("work/items.json", items)
-            return item
+            return incoming
 
     def record_event(self, work_item_id: str, event_type: str, created_at: str, event_id: str | None = None) -> dict[str, Any]:
         if event_type not in VALID_WAKE_EVENTS:
@@ -543,7 +585,7 @@ class DevLaneStore:
     def _wake_reason(self, item: dict[str, Any], lane_id: str, now: str) -> str | None:
         hb = self.latest_heartbeat(lane_id)
         consumed = hb.get("last_event_consumed") if hb else None
-        new_events = [event for event in item.get("events", []) if event_id(event) != consumed]
+        new_events = [event for event in item.get("events", []) if event_id(event) != consumed and not event.get("consumed_at")]
         valid_events = [event for event in new_events if event.get("event_type") in VALID_WAKE_EVENTS]
         if valid_events:
             event = sorted(valid_events, key=lambda e: e.get("created_at", ""), reverse=True)[0]

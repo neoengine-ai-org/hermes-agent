@@ -1616,6 +1616,17 @@ LANE_TERMINAL_CLAIM_STATUSES = {
     "completed", "blocked", "refused", "superseded", "no-op with evidence", "expired/recovered"
 }
 LANE_GOVERNANCE_HOLDS = {"do-not-merge", "awaiting-human", "held", "human-review"}
+LANE_VALID_WAKE_EVENTS = {
+    "new_repair_packet",
+    "pr_status_check_change",
+    "review_request",
+    "queue_priority_change",
+    "stale_claim_expiry",
+    "failed_ci_transition",
+    "governance_unblock",
+    "explicit_operator_command",
+    "followup_repair_packet",
+}
 
 
 def _lane_claim_result(claimed: bool, result: str, **extra: Any) -> dict[str, Any]:
@@ -1811,8 +1822,14 @@ def claim_lane_work_item(
                 raise sqlite3.IntegrityError("work item claim status update failed")
             if claimed_event_id:
                 conn.execute(
-                    "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
-                    (ts, claimed_event_id),
+                    """
+                    UPDATE lane_events
+                       SET consumed_at=?
+                     WHERE work_item_id=?
+                       AND id <= ?
+                       AND consumed_at IS NULL
+                    """,
+                    (ts, work_item_id, claimed_event_id),
                 )
     except sqlite3.IntegrityError:
         existing = conn.execute(
@@ -1915,6 +1932,15 @@ def record_lane_event(
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     ts = _now(now)
+    if event_type not in LANE_VALID_WAKE_EVENTS:
+        return {
+            "event_id": None,
+            "event_type": event_type,
+            "work_item_id": work_item_id,
+            "recorded": False,
+            "result": "INVALID_EVENT_TYPE",
+            "reason": "invalid_event_type",
+        }
     with write_txn(conn):
         cur = conn.execute(
             "INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -2034,12 +2060,6 @@ def pickup_next_lane_work(
         claim = claim_lane_work_item(conn, row["work_item_id"], lane_id=lane_id, claim_owner=agent_session_id, ttl_seconds=ttl_seconds, evidence_path=evidence, now=ts)
         if claim.get("claimed"):
             event_id = claim.get("claimed_event_id")
-            if event_id:
-                with write_txn(conn):
-                    conn.execute(
-                        "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
-                        (ts, event_id),
-                    )
             hb = record_lane_heartbeat(
                 conn,
                 lane_id=lane_id,

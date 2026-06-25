@@ -529,7 +529,7 @@ def test_pickup_consumes_actual_claimed_event_not_stale_candidate_event(tmp_path
         hb = conn.execute("SELECT last_event_id FROM lane_heartbeats WHERE lane_id='lane-a'").fetchone()
     assert picked is not None and picked["work_item_id"] == "W-stale-row"
     assert claimed_event_id != first_event["event_id"]
-    assert events[0]["consumed_at"] is None
+    assert events[0]["consumed_at"] == 1002.0
     assert events[1]["consumed_at"] == 1002.0
     assert hb["last_event_id"] == claimed_event_id
 
@@ -545,3 +545,49 @@ def test_upsert_does_not_overwrite_active_claimed_status(tmp_path: Path, monkeyp
         item = conn.execute("SELECT status, priority FROM lane_work_items WHERE work_item_id='W-refresh-active'").fetchone()
     assert item["status"] == "completed"
     assert item["priority"] == 10
+
+
+def test_claim_consumes_all_prior_same_work_item_events_but_preserves_newer_and_other_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-b", agent_session_id="sess-b", repo_scope="repo", state="idle-no-work", now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="W-events", repo_scope="repo", status="open", now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="W-other", repo_scope="repo", status="open", now=900)
+        e1 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-events", event_type="new_repair_packet", now=1000)
+        e_other = kb.record_lane_event(conn, lane_id=None, work_item_id="W-other", event_type="new_repair_packet", now=1001)
+        e2 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-events", event_type="followup_repair_packet", now=1002)
+
+        claim = kb.claim_lane_work_item(conn, "W-events", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=1003)
+        e3 = kb.record_lane_event(conn, lane_id=None, work_item_id="W-events", event_type="governance_unblock", now=1004)
+        events = {row["id"]: row["consumed_at"] for row in conn.execute("SELECT id, consumed_at FROM lane_events").fetchall()}
+        wake = kb.next_lane_wake(conn, "lane-b", now=1005)
+
+    assert claim["claimed"] is True
+    assert claim["claimed_event_id"] == e2["event_id"]
+    assert events[e1["event_id"]] == 1003
+    assert events[e2["event_id"]] == 1003
+    assert events[e_other["event_id"]] is None
+    assert events[e3["event_id"]] is None
+    assert wake["event_id"] == e_other["event_id"]
+
+
+def test_sqlite_invalid_event_type_is_rejected_without_unblocking_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-invalid-event", repo_scope="repo", status="blocked", blocked_event_id=7, now=900)
+        invalid = kb.record_lane_event(conn, lane_id=None, work_item_id="W-invalid-event", event_type="not_authorized", now=1000)
+        row = conn.execute("SELECT last_event_id, blocked_event_id FROM lane_work_items WHERE work_item_id='W-invalid-event'").fetchone()
+        count = conn.execute("SELECT COUNT(*) FROM lane_events WHERE work_item_id='W-invalid-event'").fetchone()[0]
+        denied = kb.claim_lane_work_item(conn, "W-invalid-event", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="denied.md", now=1001)
+        valid = kb.record_lane_event(conn, lane_id=None, work_item_id="W-invalid-event", event_type="governance_unblock", now=1002)
+        allowed = kb.claim_lane_work_item(conn, "W-invalid-event", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="allowed.md", now=1003)
+
+    assert invalid["recorded"] is False
+    assert invalid["result"] == "INVALID_EVENT_TYPE"
+    assert count == 0
+    assert row["last_event_id"] is None
+    assert row["blocked_event_id"] == 7
+    assert denied["claimed"] is False
+    assert denied["reason"] == "blocked_without_new_event"
+    assert valid["event_id"] is not None
+    assert allowed["claimed"] is True
