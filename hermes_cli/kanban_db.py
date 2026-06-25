@@ -1810,10 +1810,18 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
             (status, evidence_path, ts, message, claim_id),
         )
         if res.rowcount == 1 and row is not None:
-            conn.execute(
-                "UPDATE lane_work_items SET status=?, updated_at=? WHERE work_item_id=? AND status='claimed'",
-                (status_by_close[status], ts, row["work_item_id"]),
-            )
+            if status_by_close[status] == "blocked":
+                conn.execute(
+                    "UPDATE lane_work_items SET status=?, updated_at=?, "
+                    "blocked_event_id=COALESCE(last_event_id, blocked_event_id) "
+                    "WHERE work_item_id=? AND status='claimed'",
+                    (status_by_close[status], ts, row["work_item_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE lane_work_items SET status=?, updated_at=? WHERE work_item_id=? AND status='claimed'",
+                    (status_by_close[status], ts, row["work_item_id"]),
+                )
     return res.rowcount == 1
 
 

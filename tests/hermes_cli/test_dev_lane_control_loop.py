@@ -51,7 +51,7 @@ def test_duplicate_active_claims_are_rejected(tmp_path, monkeypatch):
         kb.upsert_lane_work_item(conn, work_item_id="W1", repo_scope="repo", status="open")
         first = kb.claim_lane_work_item(conn, "W1", lane_id="dev-a", claim_owner="s1", ttl_seconds=300, evidence_path="r1.md")
         second = kb.claim_lane_work_item(conn, "W1", lane_id="dev-b", claim_owner="s2", ttl_seconds=300, evidence_path="r2.md")
-    assert first["claimed"] is True
+    assert first is not None and first["claimed"] is True
     assert second["claimed"] is False
     assert second["reason"] == "active_claim_exists"
 
@@ -311,3 +311,20 @@ def test_multiprocess_same_item_claim_has_exactly_one_active_claim_and_integrity
     assert active == 1
     assert status == "claimed"
     assert integrity == "ok"
+
+
+def test_consumed_blocked_event_cannot_reclaim_same_blocked_work(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-a", agent_session_id="sess-a", repo_scope="repo", state="idle-no-work", now=999)
+        kb.upsert_lane_work_item(conn, work_item_id="W-blocked-event", repo_scope="repo", status="blocked", blocked_event_id=99)
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-blocked-event", event_type="new_repair_packet", now=1000)
+        assert event["event_id"] == 1
+        first = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-a", authorized_scopes=["repo"], ttl_seconds=300, now=1001)
+        assert first is not None and first["claim"]["claimed"] is True
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1001.0
+        assert kb.close_lane_claim(conn, claim_id=first["claim"]["claim_id"], status="blocked", evidence_path="receipts/blocked.md", now=1002) is True
+        blocked = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id='W-blocked-event'").fetchone()
+        assert blocked["blocked_event_id"] == 1
+        second = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-b", authorized_scopes=["repo"], ttl_seconds=300, now=1003)
+        assert second is None

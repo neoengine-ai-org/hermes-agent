@@ -186,11 +186,19 @@ class DevLaneStore:
             # the bounded legacy percent-encoded path so they can be closed or
             # recovered without making new unsafe paths valid.
             claim = None
-        if not isinstance(claim, dict):
-            legacy = self._legacy_claim_path(work_item_id)
-            if (self.root / legacy).exists():
-                claim = self.read_json(legacy, None)
-        return claim if isinstance(claim, dict) else None
+        legacy_claim = None
+        legacy = self._legacy_claim_path(work_item_id)
+        if (self.root / legacy).exists():
+            legacy_candidate = self.read_json(legacy, None)
+            if isinstance(legacy_candidate, dict):
+                legacy_claim = legacy_candidate
+        if isinstance(claim, dict) and claim.get("claim_status") == ACTIVE_CLAIM_STATUS:
+            return claim
+        if isinstance(legacy_claim, dict) and legacy_claim.get("claim_status") == ACTIVE_CLAIM_STATUS:
+            return legacy_claim
+        if isinstance(claim, dict):
+            return claim
+        return legacy_claim if isinstance(legacy_claim, dict) else None
 
     def claim_work(
         self,

@@ -359,3 +359,27 @@ def test_governance_bypass_cases_are_preserved(tmp_path: Path) -> None:
         "human": "awaiting_human_review",
         "refused": "refused_without_sidecar_evidence",
     }
+
+
+def test_canonical_terminal_does_not_hide_legacy_active_claim(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-2", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    legacy_active = {
+        "schema_version": "dev_lane_claim.v1",
+        "work_item_id": "work-2",
+        "lane_id": "lane-a",
+        "claim_owner_session_id": "old",
+        "claim_started_at": "2026-06-24T00:00:00Z",
+        "claim_expires_at": "2026-06-24T01:00:00Z",
+        "claim_status": "active",
+        "claim_evidence_path": "claims/work-2.json",
+    }
+    canonical_closed = {**legacy_active, "claim_status": "completed", "closed_at": "2026-06-24T00:10:00Z"}
+    store.write_json("claims/by-work-item/work-2.json", canonical_closed)
+    store.write_json("claims/work-2.json", legacy_active)
+
+    assert store.active_claim_for_work("work-2", now="2026-06-24T00:20:00Z") == legacy_active
+    with pytest.raises(ValueError, match="active claim already exists"):
+        store.claim_work("work-2", "lane-b", "new", "2026-06-24T00:20:00Z", 3600, "evidence")
