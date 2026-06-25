@@ -292,7 +292,7 @@ class DevLaneStore:
             pickable, reason = self._is_item_pickable_for_lane(item, lane, now)
             if not pickable:
                 raise ValueError(f"work item is not claimable: {reason}")
-            claimed_event_id = latest_event_id(item)
+            claimed_event_id = latest_valid_event_id(item)
             expires_at = format_utc(now_dt + timedelta(seconds=ttl_seconds))
             claim = {
                 "schema_version": "dev_lane_claim.v1",
@@ -374,6 +374,9 @@ class DevLaneStore:
             existing = items.get(work_item_id)
             incoming = {"schema_version": "dev_lane_work_item.v1", **item}
             incoming.setdefault("events", [])
+            for event in incoming.get("events", []):
+                if event.get("event_type") not in VALID_WAKE_EVENTS:
+                    raise ValueError(f"invalid wake event: {event.get('event_type')}")
             incoming.setdefault("status", "queued")
             incoming.setdefault("created_at", utc_now())
             if existing:
@@ -576,7 +579,7 @@ class DevLaneStore:
             return False, "awaiting_human_review"
         if item.get("status") == "refused" and not item.get("sidecar_evidence_path"):
             return False, "refused_without_sidecar_evidence"
-        if item.get("status") == "blocked" and latest_event_id(item) == item.get("blocked_at_event_id"):
+        if item.get("status") == "blocked" and latest_valid_event_id(item) == item.get("blocked_at_event_id"):
             return False, "blocked_without_new_event"
         if item.get("status") in {"completed", "superseded"}:
             return False, "terminal"
@@ -639,6 +642,14 @@ def event_id(event: dict[str, Any]) -> str:
 
 def latest_event_id(item: dict[str, Any]) -> str | None:
     events = item.get("events", [])
+    if not events:
+        return None
+    event = sorted(events, key=lambda e: e.get("created_at", ""), reverse=True)[0]
+    return event_id(event)
+
+
+def latest_valid_event_id(item: dict[str, Any]) -> str | None:
+    events = [event for event in item.get("events", []) if event.get("event_type") in VALID_WAKE_EVENTS]
     if not events:
         return None
     event = sorted(events, key=lambda e: e.get("created_at", ""), reverse=True)[0]

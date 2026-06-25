@@ -525,3 +525,33 @@ def test_event_vocabulary_matches_sqlite_backend() -> None:
     from neoengine_local import dev_lane_heartbeat as hb
 
     assert kb.LANE_VALID_WAKE_EVENTS == hb.VALID_WAKE_EVENTS
+
+
+def test_file_backed_scanner_rejects_invalid_event_without_unblocking_blocked_item(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({
+        "work_item_id": "work-invalid-scanner-event",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "blocked",
+        "blocked_at_event_id": "E1",
+        "events": [{"event_id": "E1", "event_type": "new_repair_packet", "created_at": "2099-06-24T00:00:00Z"}],
+    })
+
+    initial = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    with pytest.raises(ValueError, match="invalid wake event"):
+        store.add_work_item({
+            "work_item_id": "work-invalid-scanner-event",
+            "repo_scope": "repo",
+            "authorized_scopes": ["**"],
+            "status": "blocked",
+            "events": [{"event_id": "BAD", "event_type": "unauthorized_closeout", "created_at": "2099-06-24T00:02:00Z"}],
+        })
+    after_invalid = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:03:00Z")
+    item = store.read_json("work/items.json")["work-invalid-scanner-event"]
+
+    assert initial["action"] == "idle-no-work"
+    assert after_invalid["action"] == "idle-no-work"
+    assert [event["event_id"] for event in item["events"]] == ["E1"]
+    assert item["blocked_at_event_id"] == "E1"
