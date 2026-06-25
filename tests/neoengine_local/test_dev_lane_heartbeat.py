@@ -157,8 +157,8 @@ def test_legacy_percent_encoded_claim_can_be_read_without_reopening_unsafe_id_ad
 
     assert store.claim_for_work("PR:36") == legacy_claim
     assert store.active_claim_for_work("PR:36", now="2026-06-24T00:10:00Z") == legacy_claim
-    with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
-        store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    assert (tmp_path / "work" / "items.json").exists()
 
 
 def test_stale_claims_can_be_recovered_with_evidence(tmp_path: Path) -> None:
@@ -434,3 +434,16 @@ def test_file_backed_claim_work_is_serialized_across_processes(tmp_path: Path) -
     assert sum(1 for result in results if "active claim already exists" in result.get("error", "")) == 3
     claims = [path for path in (tmp_path / "claims" / "by-work-item").glob("*.json")]
     assert len(claims) == 1
+
+
+def test_colon_work_item_id_uses_encoded_non_colliding_claim_path(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    work_item_id = "neowealth:startup-proof:codex"
+    store.add_work_item({"work_item_id": work_item_id, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    claim = store.claim_work(work_item_id, "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/colon.json")
+
+    assert claim["work_item_id"] == work_item_id
+    assert store.active_claim_for_work(work_item_id, now="2026-06-24T00:01:00Z") is not None
+    claim_files = sorted(path.name for path in (tmp_path / "claims" / "by-work-item").glob("*.json"))
+    assert claim_files == ["neowealth%3Astartup-proof%3Acodex.json"]
+    assert not (tmp_path / "claims" / "history.json").exists()

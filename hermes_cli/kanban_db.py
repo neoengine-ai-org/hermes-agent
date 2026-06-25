@@ -1786,6 +1786,13 @@ def claim_lane_work_item(
                 """,
                 (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, work_item["last_event_id"], recovery_of_claim_id),
             )
+            claimed_event_row = conn.execute(
+                "SELECT last_event_id FROM lane_work_items WHERE work_item_id=?",
+                (work_item_id,),
+            ).fetchone()
+            claimed_event_id = claimed_event_row["last_event_id"] if claimed_event_row else work_item["last_event_id"]
+            if claimed_event_id != work_item["last_event_id"]:
+                conn.execute("UPDATE lane_claims SET claimed_event_id=? WHERE id=?", (claimed_event_id, cur.lastrowid))
             update = conn.execute(
                 """
                 UPDATE lane_work_items
@@ -1802,10 +1809,10 @@ def claim_lane_work_item(
             )
             if update.rowcount != 1:
                 raise sqlite3.IntegrityError("work item claim status update failed")
-            if work_item["status"] == "blocked" and work_item["last_event_id"]:
+            if claimed_event_id:
                 conn.execute(
                     "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
-                    (ts, work_item["last_event_id"]),
+                    (ts, claimed_event_id),
                 )
     except sqlite3.IntegrityError:
         existing = conn.execute(
@@ -1815,7 +1822,7 @@ def claim_lane_work_item(
         if existing is not None:
             return _lane_claim_result(False, "ACTIVE_CLAIM_EXISTS", active_claim=dict(existing))
         return _lane_claim_result(False, "CLAIM_TRANSACTION_FAILED")
-    return _lane_claim_result(True, "CLAIMED", claim_id=cur.lastrowid, claim_expires_at=expires)
+    return _lane_claim_result(True, "CLAIMED", claim_id=cur.lastrowid, claim_expires_at=expires, claimed_event_id=claimed_event_id)
 
 
 def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, evidence_path: str, message: Optional[str] = None, now: Optional[int] = None) -> bool:
@@ -1842,24 +1849,11 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         if res.rowcount == 1 and row is not None:
             if status_by_close[status] == "blocked":
                 processed_event_id = row["claimed_event_id"] if row["claimed_event_id"] is not None else None
-                if processed_event_id is None:
-                    processed_event = conn.execute(
-                        """
-                        SELECT last_event_id
-                          FROM lane_heartbeats
-                         WHERE lane_id=?
-                           AND claimed_work_item_id=?
-                         LIMIT 1
-                        """,
-                        (row["lane_id"], row["work_item_id"]),
-                    ).fetchone()
-                    processed_event_id = processed_event["last_event_id"] if processed_event else None
-                if processed_event_id is None:
-                    work_item_event = conn.execute(
-                        "SELECT last_event_id FROM lane_work_items WHERE work_item_id=?",
-                        (row["work_item_id"],),
-                    ).fetchone()
-                    processed_event_id = work_item_event["last_event_id"] if work_item_event else None
+                # Legacy active claims migrated before claimed_event_id existed do not
+                # have an immutable claim-time event baseline.  Do not fall back
+                # to mutable heartbeat/work-item latest-event fields here: a newer
+                # event may have arrived during the active claim and must remain
+                # available to wake a repair/retry lane after blocked closeout.
                 conn.execute(
                     "UPDATE lane_work_items SET status=?, updated_at=?, "
                     "blocked_event_id=COALESCE(?, blocked_event_id) "
@@ -1973,7 +1967,14 @@ def upsert_lane_work_item(
                 governance_state, capability, blocked_event_id, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(work_item_id) DO UPDATE SET
-                repo_scope=excluded.repo_scope, status=excluded.status, priority=excluded.priority,
+                repo_scope=excluded.repo_scope,
+                status=CASE
+                    WHEN lane_work_items.status='claimed'
+                     AND EXISTS (SELECT 1 FROM lane_claims WHERE work_item_id=lane_work_items.work_item_id AND claim_status='active')
+                    THEN lane_work_items.status
+                    ELSE excluded.status
+                END,
+                priority=excluded.priority,
                 failed_required_ci=excluded.failed_required_ci, stale_open_pr=excluded.stale_open_pr,
                 governance_blocker=excluded.governance_blocker, review_gap=excluded.review_gap,
                 dependency_unblocked=excluded.dependency_unblocked, governance_state=excluded.governance_state,
@@ -2032,7 +2033,7 @@ def pickup_next_lane_work(
         evidence = evidence_path or f"lane-claims/{lane_id}/{row['work_item_id']}-{ts}.json"
         claim = claim_lane_work_item(conn, row["work_item_id"], lane_id=lane_id, claim_owner=agent_session_id, ttl_seconds=ttl_seconds, evidence_path=evidence, now=ts)
         if claim.get("claimed"):
-            event_id = row["last_event_id"]
+            event_id = claim.get("claimed_event_id")
             if event_id:
                 with write_txn(conn):
                     conn.execute(
@@ -2050,7 +2051,7 @@ def pickup_next_lane_work(
                 last_event_id=event_id,
                 now=ts,
             )
-            item = dict(row)
+            item = _dict(conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (row["work_item_id"],)).fetchone()) or dict(row)
             item.update({"claim": claim, "heartbeat": hb})
             return item
     record_lane_heartbeat(conn, lane_id=lane_id, agent_session_id=agent_session_id, repo_scope=authorized_scopes[0] if authorized_scopes else "", state="idle-no-work", now=ts)

@@ -96,7 +96,7 @@ class DevLaneStore:
             self.write_json("lanes.json", lanes)
             return lanes[lane_id]
 
-    def _safe_storage_key(self, value: str, *, kind: str) -> str:
+    def _safe_storage_key(self, value: str, *, kind: str, allow_encoded: bool = False) -> str:
         if not isinstance(value, str):
             raise ValueError(f"{kind} must be a string")
         normalized = unicodedata.normalize("NFC", value.strip())
@@ -114,10 +114,16 @@ class DevLaneStore:
         safe = quote(normalized, safe="-_.")
         stem = safe.removesuffix(".json")
         reserved = {"history", "_history", "items", "lanes", "events", "receipts", "claims", "continuity", "heartbeats"}
-        if not safe or safe.startswith(".") or stem in reserved or safe != normalized:
+        if not safe or safe.startswith(".") or stem in reserved:
             raise ValueError(f"{kind} is reserved or unsafe for lane-control storage: {value!r}")
+        if safe != normalized:
+            if not allow_encoded or not normalized.isascii():
+                raise ValueError(f"{kind} is reserved or unsafe for lane-control storage: {value!r}")
+            return safe
         if safe_id(normalized) != normalized:
-            raise ValueError(f"{kind} must be a stable safe slug: {value!r}")
+            if not allow_encoded:
+                raise ValueError(f"{kind} must be a stable safe slug: {value!r}")
+            return safe
         return safe
 
     def _lane_path(self, dirname: str, lane_id: str) -> Path:
@@ -125,7 +131,7 @@ class DevLaneStore:
         return Path(dirname) / f"{safe_lane}.json"
 
     def _claim_path(self, work_item_id: str) -> Path:
-        safe_work_item = self._safe_storage_key(work_item_id, kind="work_item_id")
+        safe_work_item = self._safe_storage_key(work_item_id, kind="work_item_id", allow_encoded=True)
         return Path("claims") / "by-work-item" / f"{safe_work_item}.json"
 
     def latest_heartbeat(self, lane_id: str) -> dict[str, Any] | None:
@@ -235,7 +241,7 @@ class DevLaneStore:
         with self._exclusive_store_lock():
             current = self.claim_for_work(work_item_id)
             if current is None:
-                self._safe_storage_key(work_item_id, kind="work_item_id")
+                self._safe_storage_key(work_item_id, kind="work_item_id", allow_encoded=True)
             now_dt = utc_parse(now)
             if current and current.get("claim_status") == ACTIVE_CLAIM_STATUS:
                 expires = utc_parse(current["claim_expires_at"])
@@ -342,7 +348,7 @@ class DevLaneStore:
     def add_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
         if "work_item_id" not in item:
             raise ValueError("work item missing work_item_id")
-        self._safe_storage_key(str(item["work_item_id"]), kind="work_item_id")
+        self._safe_storage_key(str(item["work_item_id"]), kind="work_item_id", allow_encoded=True)
         with self._exclusive_store_lock():
             items = self.read_json("work/items.json", {})
             item = {"schema_version": "dev_lane_work_item.v1", **item}
@@ -512,7 +518,7 @@ class DevLaneStore:
 
     def _is_item_pickable_for_lane(self, item: dict[str, Any], lane: dict[str, Any], now: str) -> tuple[bool, str | None]:
         try:
-            self._safe_storage_key(str(item.get("work_item_id", "")), kind="work_item_id")
+            self._safe_storage_key(str(item.get("work_item_id", "")), kind="work_item_id", allow_encoded=True)
         except ValueError:
             return False, "unsafe_work_item_id"
         if item.get("repo_scope") != lane.get("repo_scope"):

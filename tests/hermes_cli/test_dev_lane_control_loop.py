@@ -439,7 +439,7 @@ def test_open_event_direct_claim_blocked_closeout_baselines_processed_event(tmp_
         assert blocked["status"] == "blocked"
         assert blocked["last_event_id"] == 1
         assert blocked["blocked_event_id"] == 1
-        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1002.0
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1001.0
         assert kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1003) is None
 
 
@@ -457,9 +457,91 @@ def test_new_event_during_direct_claim_remains_pickable_after_blocked_close(tmp_
         assert blocked["status"] == "blocked"
         assert blocked["blocked_event_id"] == 1
         assert blocked["last_event_id"] == 2
-        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1003.0
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 1").fetchone()[0] == 1001.0
         assert conn.execute("SELECT consumed_at FROM lane_events WHERE id = 2").fetchone()[0] is None
 
         second = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], ttl_seconds=300, now=1004)
         assert second is not None
         assert second["claim"]["claimed"] is True
+
+
+def test_legacy_active_claim_without_claimed_event_preserves_newer_event_on_blocked_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-legacy", repo_scope="repo", status="claimed", now=900)
+        conn.execute(
+            """
+            INSERT INTO lane_claims(
+                work_item_id, lane_id, claim_owner, claim_started_at,
+                claim_expires_at, claim_status, claim_evidence_path, claimed_event_id
+            ) VALUES ('W-legacy', 'lane-a', 'sess-a', 900, 1200, 'active', 'legacy.md', NULL)
+            """
+        )
+        claim_id = conn.execute("SELECT id FROM lane_claims WHERE work_item_id='W-legacy'").fetchone()["id"]
+        event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-legacy", event_type="followup_repair_packet", now=1000)
+
+        assert kb.close_lane_claim(conn, claim_id=claim_id, status="blocked", evidence_path="blocked.md", now=1001) is True
+
+        blocked = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id='W-legacy'").fetchone()
+        assert blocked["status"] == "blocked"
+        assert blocked["blocked_event_id"] is None
+        assert conn.execute("SELECT consumed_at FROM lane_events WHERE id=?", (event["event_id"],)).fetchone()[0] is None
+        second = kb.pickup_next_lane_work(conn, lane_id="lane-b", agent_session_id="sess-b", authorized_scopes=["repo"], now=1002)
+        assert second is not None and second["work_item_id"] == "W-legacy"
+
+
+def test_direct_open_claim_consumes_claimed_event_at_claim_time(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.record_lane_heartbeat(conn, lane_id="lane-a", agent_session_id="sess-a", repo_scope="repo", state="idle-no-work", now=900)
+        kb.upsert_lane_work_item(conn, work_item_id="W-open-event", repo_scope="repo", status="open", now=900)
+        event = kb.record_lane_event(conn, lane_id="lane-a", work_item_id="W-open-event", event_type="new_repair_packet", now=1000)
+        claim = kb.claim_lane_work_item(conn, "W-open-event", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=1001)
+        wake = kb.next_lane_wake(conn, "lane-a", now=1002)
+        consumed_at = conn.execute("SELECT consumed_at FROM lane_events WHERE id=?", (event["event_id"],)).fetchone()[0]
+    assert claim["claimed"] is True
+    assert claim["claimed_event_id"] == event["event_id"]
+    assert consumed_at == 1001.0
+    assert wake["wake_reason"] == "timer"
+
+
+def test_pickup_consumes_actual_claimed_event_not_stale_candidate_event(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-stale-row", repo_scope="repo", status="open", now=900)
+        first_event = kb.record_lane_event(conn, lane_id=None, work_item_id="W-stale-row", event_type="new_repair_packet", now=1000)
+        conn.execute(
+            """
+            CREATE TEMP TRIGGER add_event_during_claim
+            BEFORE INSERT ON lane_claims
+            WHEN NEW.work_item_id='W-stale-row'
+            BEGIN
+                INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at)
+                VALUES (NULL, 'followup_repair_packet', 'W-stale-row', NULL, 1001);
+                UPDATE lane_work_items SET last_event_id = (SELECT max(id) FROM lane_events), updated_at=1001
+                 WHERE work_item_id='W-stale-row';
+            END
+            """
+        )
+        picked = kb.pickup_next_lane_work(conn, lane_id="lane-a", agent_session_id="sess-a", authorized_scopes=["repo"], now=1002)
+        claimed_event_id = picked["claim"]["claimed_event_id"]
+        events = conn.execute("SELECT id, consumed_at FROM lane_events ORDER BY id").fetchall()
+        hb = conn.execute("SELECT last_event_id FROM lane_heartbeats WHERE lane_id='lane-a'").fetchone()
+    assert picked is not None and picked["work_item_id"] == "W-stale-row"
+    assert claimed_event_id != first_event["event_id"]
+    assert events[0]["consumed_at"] is None
+    assert events[1]["consumed_at"] == 1002.0
+    assert hb["last_event_id"] == claimed_event_id
+
+
+def test_upsert_does_not_overwrite_active_claimed_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "home"))
+    with kb.connect() as conn:
+        kb.upsert_lane_work_item(conn, work_item_id="W-refresh-active", repo_scope="repo", status="open", now=900)
+        claim = kb.claim_lane_work_item(conn, "W-refresh-active", lane_id="lane-a", claim_owner="sess-a", ttl_seconds=300, evidence_path="claim.md", now=1000)
+        refreshed = kb.upsert_lane_work_item(conn, work_item_id="W-refresh-active", repo_scope="repo", status="open", priority=10, now=1001)
+        assert refreshed["status"] == "claimed"
+        assert kb.close_lane_claim(conn, claim_id=claim["claim_id"], status="completed", evidence_path="done.md", now=1002) is True
+        item = conn.execute("SELECT status, priority FROM lane_work_items WHERE work_item_id='W-refresh-active'").fetchone()
+    assert item["status"] == "completed"
+    assert item["priority"] == 10
