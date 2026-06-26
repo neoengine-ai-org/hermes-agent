@@ -22,6 +22,7 @@ The evidence fabric turns delivery claims into verified operating truth for NeoE
   stale/<org>/                    # receipts invalidated by subject movement
   superseded/<org>/               # promoted receipts already consumed
   projections/<org>/              # product-progress, proof-debt, contradiction, readiness views
+  projections/all-orgs/           # watchdog summary and dispatch ticket views across org policies
   verifier-runs/<org>/            # verifier run receipts
 ```
 
@@ -54,10 +55,12 @@ A no-agent verifier consumes candidate receipts, checks live subject state, prom
 
 ```bash
 scripts/hermes_progress.py verify \
-  --policy neoengine=neoengine_local/org_evidence_policies/neoengine.policy.json \
-  --policy neowealth=neoengine_local/org_evidence_policies/neowealth.policy.json \
   --live-state /path/to/live-state.json
 ```
+
+When no `--policy` argument is supplied, the CLI loads every seeded policy from
+`neoengine_local/org_evidence_policies/*.policy.json`. Passing one or more
+`--policy` arguments intentionally narrows verification to those policies.
 
 Production wrappers should build `live-state.json` from GitHub PR/check APIs, deployment APIs, and local runtime receipts. Tests inject live state directly so verifier behavior stays deterministic.
 
@@ -69,6 +72,8 @@ Founder/CEO/CTO watchdogs should read:
 - `projections/<org>/proof-debt.json`
 - `projections/<org>/contradiction-ledger.json`
 - `projections/<org>/release-readiness.json`
+- `projections/all-orgs/watchdog-summary.json`
+- `projections/all-orgs/dispatch-tickets.json`
 
 They should report material deltas only: critical-path rung advancement/regression, proof debt changes, contradictions, protected-boundary events, blocker closure, and delivery-rung advancement.
 
@@ -76,5 +81,6 @@ They should report material deltas only: critical-path rung advancement/regressi
 
 - `neoengine.policy.json` seeds Roadmap OS #726 as critical path, #729 as diagnostic, #722 as downstream, and OCR #735–#740 as contained.
 - `neowealth.policy.json` seeds NeoWealth PR #625 as a product capability proof-ladder item.
+- `everarc.policy.json` seeds Everarc delivery evidence adoption as a product capability proof-ladder item.
 
 These are policy seeds, not permanent truth. Update them through policy-versioned PRs as critical paths change.

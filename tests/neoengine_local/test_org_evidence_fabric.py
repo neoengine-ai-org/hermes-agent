@@ -294,3 +294,42 @@ def test_subject_pr_number_cannot_escape_evidence_root(tmp_path: Path) -> None:
             claims=[{"type": "PR_REBASED", "status": "candidate", "evidence": {}}],
             non_claims=[],
         )
+
+
+def test_all_org_policy_loader_includes_seeded_orgs() -> None:
+    from scripts.hermes_progress import _load_policies
+
+    policies = _load_policies([])
+
+    assert {"neoengine", "neowealth", "everarc"}.issubset(policies)
+    assert all(policy["schema"] == "org.policy.v1" for policy in policies.values())
+
+
+def test_verify_all_writes_all_org_watchdog_summary_and_dispatch_tickets(tmp_path: Path) -> None:
+    policies = {
+        "neoengine": _policy("neoengine", 726),
+        "neowealth": _policy("neowealth", 625),
+        "everarc": _policy("everarc", 91),
+    }
+    live_state = {
+        "neoengine": {"pull_requests": {726: {"head_sha": "neoh", "base_sha": "base", "state": "OPEN", "checks": {"Mac App": "SUCCESS"}}}},
+        "neowealth": {"pull_requests": {625: {"head_sha": "nwh", "base_sha": "base", "state": "OPEN", "checks": {"Mac App": "CANCELLED"}}}},
+        "everarc": {"pull_requests": {91: {"head_sha": "evh", "base_sha": "base", "state": "OPEN", "checks": {"Mac App": "SUCCESS"}}}},
+    }
+
+    result = OrgEvidenceFabric(tmp_path, policies=policies).verify_all(live_state=live_state)
+
+    assert set(result) == {"neoengine", "neowealth", "everarc"}
+    summary = json.loads((tmp_path / "projections" / "all-orgs" / "watchdog-summary.json").read_text())
+    assert summary["orgs"] == ["everarc", "neoengine", "neowealth"]
+    assert summary["totals"]["proof_debt_open"] >= 3
+    assert summary["totals"]["ready_orgs"] == 0
+    assert summary["non_claims"] == ["not_deployed", "not_accepted", "not_landed", "not_live"]
+    assert any(item["org"] == "neowealth" and item["debt_type"] == "REQUIRED_CHECK_CANCELLED" for item in summary["material_debt"])
+
+    tickets = json.loads((tmp_path / "projections" / "all-orgs" / "dispatch-tickets.json").read_text())
+    assert tickets["schema"] == "org.dispatch_ticket_projection.v1"
+    assert tickets["tickets"]
+    assert all(ticket["protected_boundary"] is False for ticket in tickets["tickets"])
+    assert any(ticket["org"] == "neoengine" and ticket["reason"] == "CURRENT_HEAD_SIDECAR_RECEIPT_MISSING" for ticket in tickets["tickets"])
+    assert any(ticket["org"] == "everarc" for ticket in tickets["tickets"])

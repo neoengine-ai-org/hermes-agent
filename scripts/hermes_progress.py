@@ -36,7 +36,10 @@ def _load_json(path: str | None) -> dict[str, Any]:
 
 def _load_policies(values: list[str]) -> dict[str, dict[str, Any]]:
     policies: dict[str, dict[str, Any]] = {}
-    for value in values:
+    policy_values = list(values)
+    if not policy_values:
+        policy_values = [str(path) for path in sorted((REPO_ROOT / "neoengine_local" / "org_evidence_policies").glob("*.policy.json"))]
+    for value in policy_values:
         if "=" in value:
             org, raw_path = value.split("=", 1)
             policy = _load_json(raw_path)

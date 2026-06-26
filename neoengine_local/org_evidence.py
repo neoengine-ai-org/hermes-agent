@@ -158,6 +158,7 @@ class OrgEvidenceFabric:
             self._apply_policy_debt(org, live_state.get(org, {}))
             self._write_projections(org)
             self._write_verifier_run(org)
+        self._write_all_org_projections(sorted(orgs))
         return deepcopy(self._results)
 
     def _empty_result(self) -> dict[str, int]:
@@ -498,6 +499,81 @@ class OrgEvidenceFabric:
         _write_json(projection_root / "contradiction-ledger.json", {"schema": "org.contradiction_projection.v1", "org": org, "computed_at": _now(), "contradictions": len(contradictions), "items": contradictions})
         readiness_verified = any(event.get("event_type") == "RELEASE_READY_VERIFIED" for event in events)
         _write_json(projection_root / "release-readiness.json", {"schema": "org.release_readiness_projection.v1", "org": org, "computed_at": _now(), "ready": readiness_verified and not debts and not contradictions, "blocking_debt": [d["debt_type"] for d in debts], "forbidden_claims": sorted(FORBIDDEN_DELIVERY_CLAIMS) if debts or contradictions or not readiness_verified else []})
+
+    def _write_all_org_projections(self, orgs: list[str]) -> None:
+        projection_root = self.root / "projections" / "all-orgs"
+        material_debt: list[dict[str, Any]] = []
+        tickets: list[dict[str, Any]] = []
+        totals = {"verified_movement": 0, "candidate_progress": 0, "proof_debt_open": 0, "contradictions": 0, "ready_orgs": 0}
+        org_summaries: list[dict[str, Any]] = []
+        for org in orgs:
+            org_projection = _read_json(self.root / "projections" / org / "product-progress-proof.json")
+            readiness = _read_json(self.root / "projections" / org / "release-readiness.json")
+            debts = self._debts.get(org, [])
+            contradictions = self._contradictions.get(org, [])
+            totals["verified_movement"] += int(org_projection.get("verified_movement") or 0)
+            totals["candidate_progress"] += int(org_projection.get("candidate_progress") or 0)
+            totals["proof_debt_open"] += len(debts)
+            totals["contradictions"] += len(contradictions)
+            if readiness.get("ready") is True:
+                totals["ready_orgs"] += 1
+            org_summaries.append(
+                {
+                    "org": org,
+                    "ready": readiness.get("ready") is True,
+                    "verified_movement": int(org_projection.get("verified_movement") or 0),
+                    "proof_debt_open": len(debts),
+                    "contradictions": len(contradictions),
+                }
+            )
+            for debt in debts:
+                debt_summary = {
+                    "org": org,
+                    "debt_id": debt.get("debt_id"),
+                    "debt_type": debt.get("debt_type"),
+                    "severity": debt.get("severity"),
+                    "subject": debt.get("subject", {}),
+                    "required_artifact": debt.get("required_artifact"),
+                    "eligible_lanes": debt.get("eligible_lanes", []),
+                }
+                material_debt.append(debt_summary)
+                tickets.append(
+                    {
+                        "schema": "org.next_action_ticket.v1",
+                        "ticket_id": "ticket_" + uuid.uuid4().hex,
+                        "priority": debt.get("severity", "P2"),
+                        "org": org,
+                        "subject": debt.get("subject", {}),
+                        "reason": debt.get("debt_type"),
+                        "required_artifact": debt.get("required_artifact"),
+                        "success_condition": f"{debt.get('debt_type')} resolved by verified evidence",
+                        "eligible_lanes": debt.get("eligible_lanes", []),
+                        "invalid_lanes": debt.get("invalid_lanes", ["CEO", "founder"]),
+                        "protected_boundary": bool(debt.get("protected_boundary", False)),
+                        "expires_when": ["subject moves", "subject closes", "required evidence promotes"],
+                    }
+                )
+        _write_json(
+            projection_root / "watchdog-summary.json",
+            {
+                "schema": "org.watchdog_summary_projection.v1",
+                "computed_at": _now(),
+                "orgs": orgs,
+                "totals": totals,
+                "org_summaries": org_summaries,
+                "material_debt": material_debt,
+                "non_claims": ["not_deployed", "not_accepted", "not_landed", "not_live"],
+            },
+        )
+        _write_json(
+            projection_root / "dispatch-tickets.json",
+            {
+                "schema": "org.dispatch_ticket_projection.v1",
+                "computed_at": _now(),
+                "ticket_count": len(tickets),
+                "tickets": tickets,
+            },
+        )
 
     def _write_verifier_run(self, org: str) -> None:
         _write_json(
