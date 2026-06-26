@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -57,7 +57,7 @@ def receipt_command(args: argparse.Namespace) -> int:
     evidence = {"head_sha": args.head, "base_sha": args.base}
     if args.evidence_json:
         evidence.update(_load_json(args.evidence_json))
-    claims = []
+    claims: list[Mapping[str, Any]] = []
     for claim in args.claim:
         claims.append({"type": claim, "status": "candidate", "evidence": evidence})
     path = write_agent_closeout_receipt(
