@@ -1,6 +1,6 @@
 # Org Evidence Fabric Control Loop
 
-Hermes Agent includes a policy-driven, all-org evidence fabric for delivery-control receipts. The loop is intentionally local/repo-native: it does **not** claim production cron, protected branch mutation, live deployment, external notification delivery, money movement, banking readiness, accepted delivery, or landed delivery.
+Hermes Agent includes a policy-driven, all-org evidence fabric for delivery-control receipts. The loop is intentionally local/repo-native: it does **not** claim production cron, protected branch mutation, live deployment, external notification delivery, accepted delivery, or landed delivery.
 
 ## Flow
 
@@ -48,4 +48,4 @@ Ready/green states include source event IDs, subject binding, verifier/policy ha
 
 ## Production limitations / non-claims
 
-This code implements the repo-native control loop and file projections. It does not install cron, mutate branch protection, send Slack/email/Telegram notifications, deploy services, mark any org live/deployed/accepted/landed, bypass required checks, or activate customer/money/banking readiness.
+This code implements the repo-native control loop and file projections. It does not install cron, mutate branch protection, send Slack/email/Telegram notifications, deploy services, mark any org live/deployed/accepted/landed, bypass required checks, or activate any external business-operation readiness.
