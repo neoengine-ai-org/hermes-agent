@@ -233,3 +233,64 @@ def test_cancelled_required_check_rejects_green_claim_and_records_contradiction(
     assert contradiction["items"][0]["contradiction"]["conflicting_fact"] == "required_check_cancelled:Mac App"
     debt = json.loads((tmp_path / "projections" / "neoengine" / "proof-debt.json").read_text())
     assert any(item["debt_type"] == "REQUIRED_CHECK_CANCELLED" for item in debt["items"])
+
+
+def test_sidecar_claim_requires_artifact_binding(tmp_path: Path) -> None:
+    root = tmp_path / "org-evidence"
+    write_agent_closeout_receipt(
+        root,
+        org="neoengine",
+        lane="NE-SONNET-01",
+        agent="sonnet",
+        work_packet="roadmap-os-726-closeout",
+        repo="neoengine-ai-org/neoengine",
+        subject={"type": "pull_request", "number": 726, "head_sha": "abc123", "base_sha": "base123"},
+        claims=[{"type": "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND", "status": "candidate", "evidence": {}}],
+        non_claims=["not_accepted", "not_landed"],
+    )
+
+    result = OrgEvidenceFabric(root=root, policies={"neoengine": _policy("neoengine")}).verify_all(
+        live_state={"neoengine": {"pull_requests": {726: {"head_sha": "abc123", "base_sha": "base123", "state": "OPEN", "checks": {"Mac App": "SUCCESS"}}}}}
+    )
+
+    assert result["neoengine"]["promoted"] == 0
+    debt = json.loads((root / "projections/neoengine/proof-debt.json").read_text())
+    assert {item["debt_type"] for item in debt["items"]} >= {"SIDECAR_RECEIPT_ARTIFACT_MISSING"}
+
+
+def test_base_sha_mismatch_creates_current_base_debt(tmp_path: Path) -> None:
+    root = tmp_path / "org-evidence"
+    write_agent_closeout_receipt(
+        root,
+        org="neoengine",
+        lane="NE-SONNET-01",
+        agent="sonnet",
+        work_packet="roadmap-os-726-closeout",
+        repo="neoengine-ai-org/neoengine",
+        subject={"type": "pull_request", "number": 726, "head_sha": "abc123", "base_sha": "oldbase"},
+        claims=[{"type": "PR_REBASED", "status": "candidate", "evidence": {}}],
+        non_claims=["not_accepted", "not_landed"],
+    )
+
+    result = OrgEvidenceFabric(root=root, policies={"neoengine": _policy("neoengine")}).verify_all(
+        live_state={"neoengine": {"pull_requests": {726: {"head_sha": "abc123", "base_sha": "newbase", "state": "OPEN", "checks": {"Mac App": "SUCCESS"}}}}}
+    )
+
+    assert result["neoengine"]["rejected"] == 1
+    debt = json.loads((root / "projections/neoengine/proof-debt.json").read_text())
+    assert {item["debt_type"] for item in debt["items"]} >= {"CURRENT_BASE_RECEIPT_REQUIRED"}
+
+
+def test_subject_pr_number_cannot_escape_evidence_root(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        write_agent_closeout_receipt(
+            tmp_path / "org-evidence",
+            org="neoengine",
+            lane="NE-SONNET-01",
+            agent="sonnet",
+            work_packet="packet",
+            repo="neoengine-ai-org/neoengine",
+            subject={"type": "pull_request", "number": "../../escaped", "head_sha": "head", "base_sha": "base"},
+            claims=[{"type": "PR_REBASED", "status": "candidate", "evidence": {}}],
+            non_claims=[],
+        )

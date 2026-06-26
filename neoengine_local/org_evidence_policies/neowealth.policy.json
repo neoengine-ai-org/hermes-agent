@@ -11,6 +11,6 @@
       "eligible_lanes": ["NW-SONNET-01", "NW-SONNET-02", "NW-CODEX-01"]
     }
   ],
-  "required_checks": [],
+  "required_checks": ["CI"],
   "forbidden_claims_without_verified_ladder": ["live", "deployed", "accepted", "landed"]
 }

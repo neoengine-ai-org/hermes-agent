@@ -68,6 +68,26 @@ def _critical_pr_numbers(policy: Mapping[str, Any]) -> set[Any]:
     return {item.get("number") for item in policy.get("critical_path", []) or [] if item.get("kind") == "pull_request"}
 
 
+def _validate_pr_number(number: Any) -> int:
+    if isinstance(number, bool):
+        raise ValueError("invalid pull request number")
+    if isinstance(number, int):
+        if number <= 0:
+            raise ValueError("invalid pull request number")
+        return number
+    if isinstance(number, str) and number.isdecimal() and int(number) > 0:
+        return int(number)
+    raise ValueError(f"invalid pull request number: {number!r}")
+
+
+def _sidecar_evidence_bound(claim: Mapping[str, Any]) -> bool:
+    evidence = claim.get("evidence", {})
+    if not isinstance(evidence, Mapping):
+        return False
+    has_artifact = bool(evidence.get("sidecar_receipt") or evidence.get("evidence_url_or_path") or evidence.get("receipt_path"))
+    return has_artifact and bool(evidence.get("diff_hash") or evidence.get("head_sha"))
+
+
 def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -107,7 +127,7 @@ def write_agent_closeout_receipt(
         "protected_boundary": protected_boundary,
         "human_decision_required": human_decision_required,
     }
-    pr = subject.get("number") or subject.get("pr") or "subject"
+    pr = _validate_pr_number(subject.get("number") or subject.get("pr"))
     path = Path(root) / "inbox" / org / "candidate" / f"{receipt['created_at'].replace(':', '-')}-{_slug(lane)}-pr{pr}-{receipt['receipt_id']}.json"
     _write_json(path, receipt)
     return path
@@ -217,13 +237,17 @@ class OrgEvidenceFabric:
         if claim_type == "CURRENT_HEAD_CHECKS_GREEN":
             return not self._required_check_debts(org, live_pr)
         if claim_type == "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND":
-            return True
+            return _sidecar_evidence_bound(next((claim for claim in receipt.get("claims", []) if claim.get("type") == claim_type), {}))
         return True
 
     def _required_check_debts(self, org: str, live_pr: Mapping[str, Any]) -> list[tuple[str, str, str]]:
         checks = live_pr.get("checks", {}) if isinstance(live_pr.get("checks"), Mapping) else {}
         debts: list[tuple[str, str, str]] = []
-        for check_name in self.policies.get(org, {}).get("required_checks", []) or []:
+        required_checks = self.policies.get(org, {}).get("required_checks")
+        if not required_checks:
+            debts.append(("REQUIRED_CHECK_POLICY_MISSING", "required_checks", "org policy does not define required checks"))
+            return debts
+        for check_name in required_checks:
             status = checks.get(check_name)
             normalized = str(status or "").upper()
             if not status:
@@ -232,8 +256,6 @@ class OrgEvidenceFabric:
                 debts.append(("REQUIRED_CHECK_CANCELLED", check_name, "required check was cancelled"))
             elif normalized != "SUCCESS":
                 debts.append(("REQUIRED_CHECK_NOT_SUCCESS", check_name, f"required check status is {status}"))
-        if not checks and not self.policies.get(org, {}).get("required_checks"):
-            debts.append(("CURRENT_HEAD_CHECKS_MISSING", "checks", "no current-head checks were observed"))
         return debts
 
     def _handle_rejection(self, org: str, receipt: Mapping[str, Any], claim: Mapping[str, Any], live_pr: Mapping[str, Any]) -> None:
@@ -264,6 +286,30 @@ class OrgEvidenceFabric:
                 eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
             )
             return
+        if subject.get("base_sha") and live_pr.get("base_sha") and subject.get("base_sha") != live_pr.get("base_sha"):
+            self._add_debt(
+                org,
+                "CURRENT_BASE_RECEIPT_REQUIRED",
+                subject={
+                    "kind": "pull_request",
+                    "number": subject.get("number"),
+                    "head_sha": subject.get("head_sha"),
+                    "receipt_base_sha": subject.get("base_sha"),
+                    "current_base_sha": live_pr.get("base_sha"),
+                },
+                severity="P0",
+                required_artifact="receipt rebound to current PR base SHA and diff",
+                eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
+            )
+        if claim_type == "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND" and not _sidecar_evidence_bound(claim):
+            self._add_debt(
+                org,
+                "SIDECAR_RECEIPT_ARTIFACT_MISSING",
+                subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha")},
+                severity="P0",
+                required_artifact="sidecar artifact URL/path plus head or diff hash evidence",
+                eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
+            )
         for debt_type, check_name, reason in self._required_check_debts(org, live_pr):
             self._add_contradiction(
                 org,
@@ -281,7 +327,7 @@ class OrgEvidenceFabric:
             )
     def _append_event(self, org: str, receipt: Mapping[str, Any], claim: Mapping[str, Any], live_pr: Mapping[str, Any]) -> dict[str, Any] | None:
         subject = receipt.get("subject", {})
-        idempotency_key = f"{org}:{receipt.get('repo')}:pr:{subject.get('number')}:head:{subject.get('head_sha')}:{claim.get('type')}"
+        idempotency_key = f"{org}:{receipt.get('repo')}:pr:{subject.get('number')}:head:{subject.get('head_sha')}:base:{subject.get('base_sha')}:{claim.get('type')}"
         if any(event.get("idempotency_key") == idempotency_key for event in self._load_events(org)):
             return None
         previous_hash = self._last_event_hash(org)
@@ -450,7 +496,8 @@ class OrgEvidenceFabric:
         )
         _write_json(projection_root / "proof-debt.json", {"schema": "org.proof_debt_projection.v1", "org": org, "computed_at": _now(), "open_debt": len(debts), "items": debts})
         _write_json(projection_root / "contradiction-ledger.json", {"schema": "org.contradiction_projection.v1", "org": org, "computed_at": _now(), "contradictions": len(contradictions), "items": contradictions})
-        _write_json(projection_root / "release-readiness.json", {"schema": "org.release_readiness_projection.v1", "org": org, "computed_at": _now(), "ready": False if debts or contradictions else bool(events), "blocking_debt": [d["debt_type"] for d in debts], "forbidden_claims": ["accepted", "landed", "deployed"] if debts or contradictions else []})
+        readiness_verified = any(event.get("event_type") == "RELEASE_READY_VERIFIED" for event in events)
+        _write_json(projection_root / "release-readiness.json", {"schema": "org.release_readiness_projection.v1", "org": org, "computed_at": _now(), "ready": readiness_verified and not debts and not contradictions, "blocking_debt": [d["debt_type"] for d in debts], "forbidden_claims": sorted(FORBIDDEN_DELIVERY_CLAIMS) if debts or contradictions or not readiness_verified else []})
 
     def _write_verifier_run(self, org: str) -> None:
         _write_json(
