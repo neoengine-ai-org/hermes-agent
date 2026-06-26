@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.release_gate.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "gate",
+    "org",
+    "subject",
+    "result"
+  ],
+  "title": "org.release_gate.v1",
+  "type": "object"
+}

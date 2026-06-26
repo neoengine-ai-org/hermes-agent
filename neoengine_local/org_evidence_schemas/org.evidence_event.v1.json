@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.evidence_event.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "event_id",
+    "idempotency_key",
+    "event_type",
+    "event_status",
+    "org",
+    "subject",
+    "integrity"
+  ],
+  "title": "org.evidence_event.v1",
+  "type": "object"
+}
