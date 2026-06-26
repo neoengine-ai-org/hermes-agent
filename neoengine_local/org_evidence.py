@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import uuid
 from copy import deepcopy
@@ -22,6 +23,15 @@ VERIFIER_VERSION = "0.1.0"
 EVENT_SCHEMA = "org.evidence_event.v1"
 CLOSEOUT_SCHEMA = "org.agent_closeout.v1"
 PROOF_DEBT_SCHEMA = "org.proof_debt.v1"
+ORG_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{1,63}$")
+PROMOTABLE_CLAIM_TYPES = {
+    "PR_REBASED",
+    "PR_OPENED",
+    "CURRENT_HEAD_CHECKS_GREEN",
+    "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND",
+    "POST_MERGE_VALIDATED",
+}
+FORBIDDEN_DELIVERY_CLAIMS = {"accepted", "landed", "deployed", "live", "release_ready", "closeout_ready"}
 
 
 def _now() -> str:
@@ -48,6 +58,16 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _validate_org(org: str) -> str:
+    if not ORG_NAME_RE.fullmatch(org):
+        raise ValueError(f"invalid org name: {org!r}")
+    return org
+
+
+def _critical_pr_numbers(policy: Mapping[str, Any]) -> set[Any]:
+    return {item.get("number") for item in policy.get("critical_path", []) or [] if item.get("kind") == "pull_request"}
+
+
 def _write_json(path: Path, data: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -70,6 +90,7 @@ def write_agent_closeout_receipt(
 ) -> Path:
     """Write a schema-shaped candidate closeout receipt to an org inbox."""
 
+    org = _validate_org(org)
     receipt = {
         "schema": CLOSEOUT_SCHEMA,
         "receipt_id": "rcpt_" + uuid.uuid4().hex,
@@ -97,7 +118,7 @@ class OrgEvidenceFabric:
 
     def __init__(self, root: str | Path, *, policies: Mapping[str, Mapping[str, Any]] | None = None) -> None:
         self.root = Path(root)
-        self.policies = {org: dict(policy) for org, policy in (policies or {}).items()}
+        self.policies = {_validate_org(org): dict(policy) for org, policy in (policies or {}).items()}
         self._events: dict[str, list[dict[str, Any]]] = {}
         self._debts: dict[str, list[dict[str, Any]]] = {}
         self._contradictions: dict[str, list[dict[str, Any]]] = {}
@@ -111,7 +132,7 @@ class OrgEvidenceFabric:
         """
 
         live_state = live_state or {}
-        orgs = set(self.policies) | {p.parent.name for p in (self.root / "inbox").glob("*/candidate")}
+        orgs = set(self.policies) | {_validate_org(p.parent.name) for p in (self.root / "inbox").glob("*/candidate")}
         for org in sorted(orgs):
             self._verify_org(org, live_state.get(org, {}))
             self._apply_policy_debt(org, live_state.get(org, {}))
@@ -155,10 +176,11 @@ class OrgEvidenceFabric:
             rejected_any = False
             for claim in receipt.get("claims", []):
                 claim_type = claim.get("type")
-                if self._claim_promotable(claim_type, live_pr, receipt):
-                    self._append_event(org, receipt, claim, live_pr)
-                    result["promoted"] += 1
-                    promoted_any = True
+                if self._claim_promotable(org, claim_type, live_pr, receipt):
+                    event = self._append_event(org, receipt, claim, live_pr)
+                    if event:
+                        result["promoted"] += 1
+                        promoted_any = True
                 else:
                     rejected_any = True
                     result["rejected"] += 1
@@ -182,48 +204,91 @@ class OrgEvidenceFabric:
     def _is_stale(self, subject: Mapping[str, Any], live_pr: Mapping[str, Any]) -> bool:
         return bool(live_pr.get("head_sha") and subject.get("head_sha") and live_pr.get("head_sha") != subject.get("head_sha"))
 
-    def _claim_promotable(self, claim_type: str | None, live_pr: Mapping[str, Any], receipt: Mapping[str, Any]) -> bool:
+    def _claim_promotable(self, org: str, claim_type: str | None, live_pr: Mapping[str, Any], receipt: Mapping[str, Any]) -> bool:
         if not claim_type or not live_pr:
+            return False
+        if str(claim_type).lower() in FORBIDDEN_DELIVERY_CLAIMS or claim_type not in PROMOTABLE_CLAIM_TYPES:
             return False
         subject = receipt.get("subject", {})
         if subject.get("base_sha") and live_pr.get("base_sha") and subject.get("base_sha") != live_pr.get("base_sha"):
             return False
+        if subject.get("head_sha") != live_pr.get("head_sha"):
+            return False
         if claim_type == "CURRENT_HEAD_CHECKS_GREEN":
-            checks = live_pr.get("checks", {}) if isinstance(live_pr.get("checks"), Mapping) else {}
-            return bool(checks) and all(str(status).upper() == "SUCCESS" for status in checks.values())
+            return not self._required_check_debts(org, live_pr)
         if claim_type == "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND":
-            return bool(receipt.get("subject", {}).get("head_sha") == live_pr.get("head_sha"))
-        # Structural/current-head claims can be promoted when bound to live PR.
-        return subject.get("head_sha") == live_pr.get("head_sha")
+            return True
+        return True
+
+    def _required_check_debts(self, org: str, live_pr: Mapping[str, Any]) -> list[tuple[str, str, str]]:
+        checks = live_pr.get("checks", {}) if isinstance(live_pr.get("checks"), Mapping) else {}
+        debts: list[tuple[str, str, str]] = []
+        for check_name in self.policies.get(org, {}).get("required_checks", []) or []:
+            status = checks.get(check_name)
+            normalized = str(status or "").upper()
+            if not status:
+                debts.append(("REQUIRED_CHECK_MISSING", check_name, "required check result is absent"))
+            elif normalized == "CANCELLED":
+                debts.append(("REQUIRED_CHECK_CANCELLED", check_name, "required check was cancelled"))
+            elif normalized != "SUCCESS":
+                debts.append(("REQUIRED_CHECK_NOT_SUCCESS", check_name, f"required check status is {status}"))
+        if not checks and not self.policies.get(org, {}).get("required_checks"):
+            debts.append(("CURRENT_HEAD_CHECKS_MISSING", "checks", "no current-head checks were observed"))
+        return debts
 
     def _handle_rejection(self, org: str, receipt: Mapping[str, Any], claim: Mapping[str, Any], live_pr: Mapping[str, Any]) -> None:
-        claim_type = claim.get("type")
-        checks = live_pr.get("checks", {}) if isinstance(live_pr.get("checks"), Mapping) else {}
-        for check_name, status in checks.items():
-            if str(status).upper() == "CANCELLED" and claim_type == "CURRENT_HEAD_CHECKS_GREEN":
-                subject = receipt.get("subject", {})
-                self._add_contradiction(
-                    org,
-                    subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha")},
-                    contradiction={"claim": claim_type, "conflicting_fact": f"required_check_cancelled:{check_name}"},
-                    required_resolution="rerun required check or record active policy disposition",
-                )
-                self._add_debt(
-                    org,
-                    "REQUIRED_CHECK_CANCELLED",
-                    subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha")},
-                    severity="P0",
-                    required_artifact=f"terminal valid result or non-blocking active-policy evidence for {check_name}",
-                    eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
-                )
-
-    def _append_event(self, org: str, receipt: Mapping[str, Any], claim: Mapping[str, Any], live_pr: Mapping[str, Any]) -> dict[str, Any]:
+        claim_type = str(claim.get("type") or "")
         subject = receipt.get("subject", {})
+        if claim_type.lower() in FORBIDDEN_DELIVERY_CLAIMS or claim_type not in PROMOTABLE_CLAIM_TYPES:
+            self._add_contradiction(
+                org,
+                subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha")},
+                contradiction={"claim": claim_type or "missing", "conflicting_fact": "claim_type_not_independently_promotable"},
+                required_resolution="submit a supported evidence claim or satisfy the delivery proof ladder before delivery-state claims",
+            )
+            self._add_debt(
+                org,
+                "FORBIDDEN_OR_UNKNOWN_CLAIM_REJECTED",
+                subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha"), "claim_type": claim_type or "missing"},
+                severity="P0" if claim_type.lower() in FORBIDDEN_DELIVERY_CLAIMS else "P2",
+                required_artifact="verifier-supported claim type with non-claims; delivery-state claims require verified proof ladder",
+                eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
+            )
+        if not live_pr:
+            self._add_debt(
+                org,
+                "LIVE_PR_STATE_MISSING",
+                subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha")},
+                severity="P0",
+                required_artifact="live GitHub PR state bound to current head/base",
+                eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
+            )
+            return
+        for debt_type, check_name, reason in self._required_check_debts(org, live_pr):
+            self._add_contradiction(
+                org,
+                subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha")},
+                contradiction={"claim": claim_type, "conflicting_fact": f"{debt_type.lower()}:{check_name}"},
+                required_resolution=reason,
+            )
+            self._add_debt(
+                org,
+                debt_type,
+                subject={"kind": "pull_request", "number": subject.get("number"), "head_sha": subject.get("head_sha"), "check": check_name},
+                severity="P0",
+                required_artifact=f"terminal SUCCESS for required check {check_name} or active-policy non-blocking evidence",
+                eligible_lanes=self._eligible_lanes_for_pr(org, subject.get("number")),
+            )
+    def _append_event(self, org: str, receipt: Mapping[str, Any], claim: Mapping[str, Any], live_pr: Mapping[str, Any]) -> dict[str, Any] | None:
+        subject = receipt.get("subject", {})
+        idempotency_key = f"{org}:{receipt.get('repo')}:pr:{subject.get('number')}:head:{subject.get('head_sha')}:{claim.get('type')}"
+        if any(event.get("idempotency_key") == idempotency_key for event in self._load_events(org)):
+            return None
         previous_hash = self._last_event_hash(org)
         event = {
             "schema": EVENT_SCHEMA,
             "event_id": "evt_" + uuid.uuid4().hex,
-            "idempotency_key": f"{org}:{receipt.get('repo')}:pr:{subject.get('number')}:head:{subject.get('head_sha')}:{claim.get('type')}",
+            "idempotency_key": idempotency_key,
             "event_type": claim.get("type"),
             "event_status": "verified",
             "org": org,
@@ -250,7 +315,7 @@ class OrgEvidenceFabric:
         event["integrity"]["event_hash"] = _sha256({k: v for k, v in event.items() if k != "integrity"} | {"previous_event_hash": previous_hash})
         event_path = self.root / "events" / org / "events.jsonl"
         event_path.parent.mkdir(parents=True, exist_ok=True)
-        with event_path.open("a") as fh:
+        with event_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(event, sort_keys=True) + "\n")
         self._events.setdefault(org, []).append(event)
         return event
@@ -259,7 +324,7 @@ class OrgEvidenceFabric:
         path = self.root / "events" / org / "events.jsonl"
         if not path.exists():
             return None
-        lines = [line for line in path.read_text().splitlines() if line.strip()]
+        lines = [line for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         if not lines:
             return None
         try:
@@ -274,8 +339,27 @@ class OrgEvidenceFabric:
                 continue
             number = item.get("number")
             live_pr = self._live_pr(org_live_state, number)
-            if not live_pr or str(live_pr.get("state", "OPEN")).upper() == "CLOSED":
+            if not live_pr:
+                self._add_debt(
+                    org,
+                    "LIVE_PR_STATE_MISSING",
+                    subject={"kind": "pull_request", "number": number},
+                    severity="P0",
+                    required_artifact="live GitHub PR state bound to current head/base",
+                    eligible_lanes=item.get("eligible_lanes", []),
+                )
                 continue
+            if str(live_pr.get("state", "OPEN")).upper() == "CLOSED":
+                continue
+            for debt_type, check_name, reason in self._required_check_debts(org, live_pr):
+                self._add_debt(
+                    org,
+                    debt_type,
+                    subject={"kind": "pull_request", "number": number, "head_sha": live_pr.get("head_sha"), "check": check_name},
+                    severity="P0",
+                    required_artifact=f"{reason}; provide terminal SUCCESS for required check {check_name} or active-policy non-blocking evidence",
+                    eligible_lanes=item.get("eligible_lanes", []),
+                )
             required_claims = set(item.get("required_claims", []))
             existing_types = {event.get("event_type") for event in self._load_events(org) if event.get("subject", {}).get("number") == number and event.get("subject", {}).get("head_sha") == live_pr.get("head_sha")}
             if "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND" in required_claims and "CURRENT_HEAD_SIDECAR_RECEIPT_BOUND" not in existing_types:
@@ -294,7 +378,7 @@ class OrgEvidenceFabric:
         path = self.root / "events" / org / "events.jsonl"
         events: list[dict[str, Any]] = []
         if path.exists():
-            for line in path.read_text().splitlines():
+            for line in path.read_text(encoding="utf-8").splitlines():
                 try:
                     events.append(json.loads(line))
                 except Exception:

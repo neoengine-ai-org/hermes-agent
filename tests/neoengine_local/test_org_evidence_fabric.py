@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from neoengine_local.org_evidence import OrgEvidenceFabric, write_agent_closeout_receipt
 
 
@@ -20,6 +22,99 @@ def _policy(org: str, pr: int = 726) -> dict:
         "required_checks": ["Mac App"],
     }
 
+
+
+def test_forbidden_claims_are_rejected_and_do_not_make_release_ready(tmp_path: Path) -> None:
+    root = tmp_path / "org-evidence"
+    policy = _policy("neoengine")
+    write_agent_closeout_receipt(
+        root,
+        org="neoengine",
+        lane="NE-SONNET-01",
+        agent="sonnet",
+        work_packet="roadmap-os-726-closeout",
+        repo="neoengine-ai-org/neoengine",
+        subject={"type": "pull_request", "number": 726, "head_sha": "abc123", "base_sha": "base123"},
+        claims=[{"type": "accepted", "status": "candidate", "evidence": {}}],
+        non_claims=[],
+    )
+
+    result = OrgEvidenceFabric(root=root, policies={"neoengine": policy}).verify_all(
+        live_state={
+            "neoengine": {
+                "pull_requests": {
+                    "726": {
+                        "head_sha": "abc123",
+                        "base_sha": "base123",
+                        "checks": {"Mac App": "SUCCESS"},
+                    }
+                }
+            }
+        }
+    )
+
+    assert result["neoengine"]["promoted"] == 0
+    assert result["neoengine"]["rejected"] == 1
+    readiness = json.loads((root / "projections/neoengine/release-readiness.json").read_text())
+    assert readiness["ready"] is False
+    assert "accepted" in readiness["forbidden_claims"]
+
+
+def test_missing_live_state_and_required_checks_are_fail_closed(tmp_path: Path) -> None:
+    root = tmp_path / "org-evidence"
+    policy = _policy("neoengine")
+    fabric = OrgEvidenceFabric(root=root, policies={"neoengine": policy})
+
+    missing_result = fabric.verify_all(live_state={})
+    assert missing_result["neoengine"]["proof_debt"]
+    missing_debt = json.loads((root / "projections/neoengine/proof-debt.json").read_text())
+    assert {item["debt_type"] for item in missing_debt["items"]} >= {"LIVE_PR_STATE_MISSING"}
+    assert json.loads((root / "projections/neoengine/release-readiness.json").read_text())["ready"] is False
+
+    write_agent_closeout_receipt(
+        root,
+        org="neoengine",
+        lane="NE-SONNET-01",
+        agent="sonnet",
+        work_packet="roadmap-os-726-closeout",
+        repo="neoengine-ai-org/neoengine",
+        subject={"type": "pull_request", "number": 726, "head_sha": "abc123", "base_sha": "base123"},
+        claims=[{"type": "CURRENT_HEAD_CHECKS_GREEN", "status": "candidate", "evidence": {}}],
+        non_claims=["not_accepted", "not_landed"],
+    )
+
+    result = fabric.verify_all(
+        live_state={
+            "neoengine": {
+                "pull_requests": {
+                    "726": {
+                        "head_sha": "abc123",
+                        "base_sha": "base123",
+                        "checks": {"Unit": "SUCCESS"},
+                    }
+                }
+            }
+        }
+    )
+    assert result["neoengine"]["promoted"] == 0
+    assert result["neoengine"]["rejected"] == 1
+    proof_debt = json.loads((root / "projections/neoengine/proof-debt.json").read_text())
+    assert {item["debt_type"] for item in proof_debt["items"]} >= {"REQUIRED_CHECK_MISSING"}
+
+
+def test_org_names_cannot_escape_evidence_root(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        write_agent_closeout_receipt(
+            tmp_path / "org-evidence",
+            org="../../escape",
+            lane="NE-SONNET-01",
+            agent="sonnet",
+            work_packet="packet",
+            repo="neoengine-ai-org/neoengine",
+            subject={"type": "pull_request", "number": 1, "head_sha": "head", "base_sha": "base"},
+            claims=[{"type": "PR_REBASED", "status": "candidate", "evidence": {}}],
+            non_claims=[],
+        )
 
 def test_agent_receipt_is_candidate_until_verifier_promotes_exact_live_subject(tmp_path: Path):
     fabric = OrgEvidenceFabric(tmp_path, policies={"neoengine": _policy("neoengine")})
