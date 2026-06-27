@@ -348,6 +348,25 @@ def yesno(value: bool) -> str:
     return "yes" if value else "no"
 
 
+
+def _completion_text_exceeds_non_claims(value: Any) -> bool:
+    allowed_negative = {claim.lower() for claim in NON_CLAIMS}
+    positive_terms = ("deployed", "live", "accepted", "merged")
+
+    def walk(item: Any) -> bool:
+        if isinstance(item, dict):
+            return any(walk(v) for v in item.values())
+        if isinstance(item, list):
+            return any(walk(v) for v in item)
+        if not isinstance(item, str):
+            return False
+        text = item.strip().lower()
+        if not text or text in allowed_negative or text.startswith("not ") or text.startswith("no "):
+            return False
+        return any(term in text for term in positive_terms)
+
+    return walk(value)
+
 def verify_post_run(
     *,
     repo: str,
@@ -417,12 +436,18 @@ def verify_post_run(
         elif resolved_sha != head_sha:
             blockers.append("commit_sha claimed but does not match observed HEAD")
         show_rc, commit_stat, show_err = run(["git", "show", "--stat", "--oneline", "--name-only", claimed_commit])
+        files_rc, commit_files, files_err = run(["git", "diff-tree", "--no-commit-id", "--name-only", "-r", claimed_commit])
         if show_rc != 0 or not commit_stat.strip():
             blockers.append("commit_sha claimed but commit diff was not independently inspected")
+        if files_rc != 0:
+            blockers.append(f"commit_sha claimed but commit file list could not be inspected: {files_err or commit_files}")
+        elif not commit_files.strip():
+            blockers.append("commit_sha claimed but commit has no changed files")
         if not blockers:
             claimed_commit_verified = True
             payload["verified_commit_sha"] = resolved_sha
             payload["verified_commit_stat"] = commit_stat
+            payload["verified_commit_files"] = [line for line in commit_files.splitlines() if line.strip()]
 
     claimed_pr = completion.get("pr_url")
     if claimed_pr:
@@ -431,7 +456,7 @@ def verify_post_run(
             blockers.append("pr_url claimed but PR was not independently verified")
     if completion.get("tests_run") and not completion.get("test_results"):
         blockers.append("tests_run claimed without test_results")
-    if any(term in json.dumps(completion).lower() for term in ["deployed", "live", "accepted", "merged"]):
+    if _completion_text_exceeds_non_claims(completion):
         blockers.append("completion text may exceed non-claim ceiling")
 
     if terminal == "FAILED_TOOLING_OR_CONTEXT":

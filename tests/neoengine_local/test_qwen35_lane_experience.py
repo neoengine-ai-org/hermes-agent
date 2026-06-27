@@ -404,3 +404,50 @@ def test_render_operator_summary_shape_and_non_claim_boundary() -> None:
     ]:
         assert non_claim in NON_CLAIMS
         assert non_claim in summary
+
+
+
+def test_post_run_rejects_matching_empty_commit_without_changed_files(tmp_path: Path) -> None:
+    receipt = tmp_path / "completion.json"
+    receipt.write_text(json.dumps({"terminal_status": "PRODUCTIVE_DIFF_WITH_EVIDENCE", "commit_sha": "abc123"}))
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "status"]:
+            return 0, "", ""
+        if command[:2] == ["git", "diff"] and "diff-tree" not in command:
+            return 0, "", ""
+        if command[:2] == ["git", "rev-parse"] and command[-1] == "HEAD":
+            return 0, "abc123", ""
+        if command[:2] == ["git", "cat-file"]:
+            return 0, "", ""
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc123", ""
+        if command[:2] == ["git", "show"]:
+            return 0, "abc123 empty commit message", ""
+        if command[:2] == ["git", "diff-tree"]:
+            return 0, "", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
+
+    assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
+    assert "commit_sha claimed but commit has no changed files" in result["blockers"]
+
+
+def test_post_run_preserved_negative_non_claims_do_not_trigger_overclaim_blocker(tmp_path: Path) -> None:
+    receipt = tmp_path / "completion.json"
+    receipt.write_text(json.dumps({"terminal_status": "NO_CHANGE_WITH_EVIDENCE", "non_claims_preserved": NON_CLAIMS}))
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "status"]:
+            return 0, "", ""
+        if command[:2] == ["git", "diff"]:
+            return 0, "", ""
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc123", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
+
+    assert result["verdict"] == "VERIFIED_NO_CHANGE_WITH_EVIDENCE"
+    assert result["blockers"] == []
