@@ -10,10 +10,14 @@ from neoengine_local.qwen35_lane_experience import (
     Qwen35Registry,
     build_bounded_prompt,
     classify_anti_loop,
+    classify_qwen35_task,
+    get_qwen35_task_recipe,
     main,
     render_lane_dashboard,
+    render_operator_receipt,
     render_operator_summary,
     run_preflight_canary,
+    score_qwen35_diff_risk,
     verify_post_run,
 )
 
@@ -627,3 +631,83 @@ def test_post_run_productive_commit_proof_rejects_dirty_untracked_worktree(tmp_p
 
     assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
     assert "dirty worktree status blocks positive verifier outcome" in result["blockers"]
+
+
+def test_work_picker_allows_low_risk_docs_and_blocks_protected_surfaces() -> None:
+    safe = classify_qwen35_task("Refresh docs/runbook receipts for stale Qwen35 adoption notes")
+    forbidden = classify_qwen35_task("Deploy production cron and update branch protection for billing auth")
+    broad = classify_qwen35_task("Refactor the whole runtime service architecture")
+
+    assert safe["classification"] == "QWEN35_SAFE_LOW_RISK"
+    assert safe["allowed"] is True
+    assert "docs/runbook maintenance" in safe["matched_safe_classes"]
+    assert forbidden["classification"] == "QWEN35_FORBIDDEN_PROTECTED_SURFACE"
+    assert forbidden["allowed"] is False
+    assert "deployments" in forbidden["matched_red_lines"]
+    assert "financial/security-sensitive logic" in forbidden["matched_red_lines"]
+    assert broad["classification"] == "QWEN35_BAD_FIT_TOO_BROAD"
+
+
+def test_task_menu_recipes_define_bounded_commands_status_and_change_patterns() -> None:
+    recipe = get_qwen35_task_recipe("receipt_nonclaim_audit")
+
+    assert recipe["task_type"] == "receipt_nonclaim_audit"
+    assert recipe["max_wall_time"] == "10m"
+    assert recipe["max_tool_calls"] <= 20
+    assert recipe["expected_terminal_statuses"] == [
+        "NO_CHANGE_WITH_EVIDENCE",
+        "PRODUCTIVE_DIFF_WITH_EVIDENCE",
+        "FAILED_TOOLING_OR_CONTEXT",
+    ]
+    assert "git status --porcelain" in recipe["allowed_commands"]
+    assert "git push" in recipe["forbidden_commands"]
+    assert recipe["allowed_changed_file_globs"] == ["docs/**", "*.md", "**/*.md"]
+    assert "verifier_rule" in recipe
+
+
+def test_operator_receipt_normalizes_verifier_output_and_preserves_non_claims() -> None:
+    receipt = render_operator_receipt(
+        repo="neoengine-ai-org/hermes-agent",
+        branch="qwen35/receipt-audit",
+        head_sha="abc123",
+        task_type="receipt_nonclaim_audit",
+        terminal_status="NO_CHANGE_WITH_EVIDENCE",
+        changed_files=[],
+        commands_observed=[["git", "status", "--porcelain"], ["git", "rev-parse", "HEAD"]],
+        verifier_result="VERIFIED_NO_CHANGE_WITH_EVIDENCE",
+        operator_action_needed="None; preserve as no-op candidate evidence.",
+    )
+
+    assert receipt.startswith("QWEN35_CANDIDATE_ASSISTANT_RECEIPT")
+    assert "repo: neoengine-ai-org/hermes-agent" in receipt
+    assert "changed_files: none" in receipt
+    assert "commands_observed:" in receipt
+    assert "- git status --porcelain" in receipt
+    assert "non_claims:" in receipt
+    assert "not merged" in receipt
+    assert "QWEN35 remains candidate-only" in receipt
+
+
+def test_diff_risk_scoring_classifies_safe_docs_tests_tooling_and_forbidden_paths() -> None:
+    assert score_qwen35_diff_risk([])["risk"] == "RISK_0_NO_CHANGE"
+    assert score_qwen35_diff_risk(["docs/qwen35.md"])["risk"] == "RISK_1_DOCS_ONLY"
+    assert score_qwen35_diff_risk(["tests/neoengine_local/test_qwen35_lane_experience.py"])["risk"] == "RISK_2_TEST_OR_FIXTURE_ONLY"
+    assert score_qwen35_diff_risk(["neoengine_local/qwen35_lane_experience.py"])["risk"] == "RISK_3_LOCAL_TOOLING_ONLY"
+    forbidden = score_qwen35_diff_risk([".github/workflows/deploy-site.yml", "src/auth/session.py"])
+    assert forbidden["risk"] == "RISK_5_FORBIDDEN_PROTECTED_SURFACE"
+    assert "deployment/production workflow" in forbidden["matched_forbidden_surfaces"]
+    assert "auth/security path" in forbidden["matched_forbidden_surfaces"]
+
+
+def test_cli_exposes_work_picker_recipe_and_diff_risk(capsys) -> None:
+    assert main(["pick-task", "--description", "Refresh docs runbook receipts"]) == 0
+    picked = json.loads(capsys.readouterr().out)
+    assert picked["classification"] == "QWEN35_SAFE_LOW_RISK"
+
+    assert main(["recipe", "--task-type", "receipt_nonclaim_audit"]) == 0
+    recipe = json.loads(capsys.readouterr().out)
+    assert recipe["task_type"] == "receipt_nonclaim_audit"
+
+    assert main(["risk", "--changed-file", ".github/workflows/deploy-site.yml"]) == 2
+    risk = json.loads(capsys.readouterr().out)
+    assert risk["risk"] == "RISK_5_FORBIDDEN_PROTECTED_SURFACE"

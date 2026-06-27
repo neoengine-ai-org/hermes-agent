@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -40,6 +42,108 @@ NON_CLAIMS = [
     "no external notification delivery without separate authorization",
     "QWEN35 remains candidate-only",
 ]
+
+OPERATOR_RECEIPT_NON_CLAIMS = [
+    "not merged",
+    *NON_CLAIMS,
+]
+
+QWEN35_SAFE_TASK_CLASSES: dict[str, tuple[str, ...]] = {
+    "scout work": ("stale", "duplicated", "dead end", "dead-link", "inventory", "scan"),
+    "reproducer work": ("repro", "reproducer", "flake", "test failure", "cli issue", "sandbox"),
+    "test hygiene": ("regression test", "fixture", "smoke", "canary", "test hygiene"),
+    "docs/runbook maintenance": ("docs", "documentation", "runbook", "readme", "receipt"),
+    "evidence assistant work": ("evidence", "status", "diff summary", "nonclaim", "non-claim", "verification matrix"),
+    "safe scaffolds": ("template", "validator", "local-only", "utility", "scaffold"),
+    "triage lane work": ("triage", "blocker", "classify", "tooling", "base-inherited"),
+    "local automation apprentice work": ("preflight", "registry", "log parsing", "watcher", "launch wrapper"),
+}
+
+QWEN35_FORBIDDEN_TASK_CLASSES: dict[str, tuple[str, ...]] = {
+    "protected runtime changes": ("protected runtime", "customer behavior", "live behavior"),
+    "deployments": ("deploy", "deployment", "release to prod", "production rollout"),
+    "branch protection": ("branch protection", "ruleset", "required status check"),
+    "production cron": ("production cron", "prod cron", "scheduler"),
+    "financial/security-sensitive logic": ("billing", "payment", "financial", "auth", "security", "rls", "credential"),
+    "merge/acceptance authority": ("merge", "accept", "accepted", "approve", "mark live"),
+}
+
+QWEN35_BROAD_TASK_TERMS = (
+    "whole",
+    "entire",
+    "all repos",
+    "broad refactor",
+    "refactor the whole",
+    "rewrite",
+    "re-architect",
+    "architecture",
+)
+
+QWEN35_TASK_RECIPES: dict[str, dict[str, Any]] = {
+    "docs_link_check": {
+        "allowed_commands": ["git status --porcelain", "find docs -type f", "python -m pytest tests -q"],
+        "allowed_changed_file_globs": ["docs/**", "*.md", "**/*.md"],
+        "verifier_rule": "docs-only diff plus post-run verifier; no external link mutation claims without receipt",
+    },
+    "test_inventory_summary": {
+        "allowed_commands": ["git status --porcelain", "find tests -type f", "python -m pytest --collect-only -q"],
+        "allowed_changed_file_globs": ["docs/**", "tests/**", "*.md", "**/*.md"],
+        "verifier_rule": "inventory summary only unless tests/docs diff is independently observed",
+    },
+    "flake_reproducer": {
+        "allowed_commands": ["git status --porcelain", "python -m pytest -q", "python -m pytest -vv"],
+        "allowed_changed_file_globs": ["tests/**", "fixtures/**", "docs/**", "*.md", "**/*.md"],
+        "verifier_rule": "reproducer evidence must include exact command and failure/pass output sample",
+    },
+    "worktree_hygiene_report": {
+        "allowed_commands": ["git status --porcelain", "git rev-parse HEAD", "git diff --stat"],
+        "allowed_changed_file_globs": ["docs/**", "*.md", "**/*.md"],
+        "verifier_rule": "prefer no-change receipt; any mutation must be docs-only",
+    },
+    "receipt_nonclaim_audit": {
+        "allowed_commands": ["git status --porcelain", "git rev-parse HEAD", "rg -n deployed|live|accepted|merged"],
+        "allowed_changed_file_globs": ["docs/**", "*.md", "**/*.md"],
+        "verifier_rule": "receipt edits must preserve non-claims and avoid merge/live/acceptance assertions",
+    },
+    "runbook_gap_scan": {
+        "allowed_commands": ["git status --porcelain", "find . -name '*runbook*' -o -name '*README*'", "rg -n TODO|FIXME|gap"],
+        "allowed_changed_file_globs": ["docs/**", "skills/**", "*.md", "**/*.md"],
+        "verifier_rule": "gap scan can propose or docs-patch only; no runtime authority claims",
+    },
+    "fixture_sanity_check": {
+        "allowed_commands": ["git status --porcelain", "find tests -type f", "python -m pytest tests -q"],
+        "allowed_changed_file_globs": ["tests/**", "fixtures/**"],
+        "verifier_rule": "fixture-only or test-only diff; no production runtime mutation",
+    },
+    "dead_script_candidate_scan": {
+        "allowed_commands": ["git status --porcelain", "find scripts -type f", "rg -n scripts/"],
+        "allowed_changed_file_globs": ["docs/**", "scripts/**", "*.md", "**/*.md"],
+        "verifier_rule": "identify candidates; deletion requires separate human scope",
+    },
+    "local_cli_smoke_repro": {
+        "allowed_commands": ["git status --porcelain", "python -m pytest -q", "qwen --version"],
+        "allowed_changed_file_globs": ["docs/**", "tests/**", "neoengine_local/**", "*.md", "**/*.md"],
+        "verifier_rule": "local tooling only; no deploy/merge/external notification actions",
+    },
+}
+
+DEFAULT_RECIPE_FIELDS: dict[str, Any] = {
+    "max_wall_time": "10m",
+    "max_tool_calls": 20,
+    "expected_terminal_statuses": [
+        "NO_CHANGE_WITH_EVIDENCE",
+        "PRODUCTIVE_DIFF_WITH_EVIDENCE",
+        "FAILED_TOOLING_OR_CONTEXT",
+    ],
+    "forbidden_commands": [
+        "git push",
+        "gh pr merge",
+        "gh pr review --approve",
+        "kubectl apply",
+        "terraform apply",
+        "curl -X POST",
+    ],
+}
 
 Runner = Callable[[list[str], Path], tuple[int, str, str]]
 
@@ -93,6 +197,159 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     os.replace(tmp, path)
+
+
+def _matches_any(text: str, vocabulary: dict[str, tuple[str, ...]]) -> list[str]:
+    lowered = text.lower()
+    return [label for label, terms in vocabulary.items() if any(term in lowered for term in terms)]
+
+
+def classify_qwen35_task(task_description: str) -> dict[str, Any]:
+    """Decide whether a requested task is safe for Qwen35 candidate execution."""
+
+    lowered = task_description.lower()
+    matched_red_lines = _matches_any(task_description, QWEN35_FORBIDDEN_TASK_CLASSES)
+    matched_safe_classes = _matches_any(task_description, QWEN35_SAFE_TASK_CLASSES)
+    broad_terms = [term for term in QWEN35_BROAD_TASK_TERMS if term in lowered]
+
+    if matched_red_lines:
+        classification = "QWEN35_FORBIDDEN_PROTECTED_SURFACE"
+        allowed = False
+        reason = "Task touches protected surfaces outside Qwen35 authority."
+    elif broad_terms:
+        classification = "QWEN35_BAD_FIT_TOO_BROAD"
+        allowed = False
+        reason = "Task is too broad for one bounded low-risk Qwen35 lane."
+    elif matched_safe_classes:
+        classification = "QWEN35_SAFE_LOW_RISK"
+        allowed = True
+        reason = "Task matches bounded low-risk assistant classes."
+    else:
+        classification = "QWEN35_NEEDS_HUMAN_SCOPE"
+        allowed = False
+        reason = "Task does not match a known safe recipe; human/protected scope required."
+
+    return {
+        "classification": classification,
+        "allowed": allowed,
+        "reason": reason,
+        "matched_safe_classes": matched_safe_classes,
+        "matched_red_lines": matched_red_lines,
+        "broad_terms": broad_terms,
+        "non_claims_preserved": OPERATOR_RECEIPT_NON_CLAIMS,
+    }
+
+
+def get_qwen35_task_recipe(task_type: str) -> dict[str, Any]:
+    if task_type not in QWEN35_TASK_RECIPES:
+        raise KeyError(f"unknown Qwen35 task recipe: {task_type}")
+    recipe = dict(DEFAULT_RECIPE_FIELDS)
+    recipe.update(QWEN35_TASK_RECIPES[task_type])
+    recipe["task_type"] = task_type
+    recipe["non_claims_preserved"] = OPERATOR_RECEIPT_NON_CLAIMS
+    return recipe
+
+
+def render_operator_receipt(
+    *,
+    repo: str,
+    branch: str,
+    head_sha: str,
+    task_type: str,
+    terminal_status: str,
+    changed_files: Iterable[str],
+    commands_observed: Iterable[str | list[str]],
+    verifier_result: str,
+    operator_action_needed: str,
+) -> str:
+    def render_command(command: str | list[str]) -> str:
+        if isinstance(command, str):
+            return command
+        return shlex.join(command)
+
+    changed = list(changed_files)
+    commands = [render_command(command) for command in commands_observed]
+    lines = [
+        "QWEN35_CANDIDATE_ASSISTANT_RECEIPT",
+        "",
+        f"repo: {repo}",
+        f"branch: {branch}",
+        f"head_sha: {head_sha}",
+        f"task_type: {task_type}",
+        f"terminal_status: {terminal_status}",
+        f"changed_files: {', '.join(changed) if changed else 'none'}",
+        "commands_observed:",
+    ]
+    lines.extend([f"- {command}" for command in commands] or ["- none"])
+    lines.extend(
+        [
+            f"verifier_result: {verifier_result}",
+            f"operator_action_needed: {operator_action_needed}",
+            "non_claims:",
+        ]
+    )
+    lines.extend(f"- {claim}" for claim in OPERATOR_RECEIPT_NON_CLAIMS)
+    return "\n".join(lines) + "\n"
+
+
+def _normalize_repo_path(path: str) -> str:
+    normalized = path.strip()
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def _path_matches_any(path: str, patterns: Iterable[str]) -> bool:
+    normalized = _normalize_repo_path(path)
+    return any(fnmatch.fnmatch(normalized, pattern) for pattern in patterns)
+
+
+def score_qwen35_diff_risk(changed_files: Iterable[str]) -> dict[str, Any]:
+    files = [_normalize_repo_path(file) for file in changed_files if file.strip()]
+    forbidden_surfaces: dict[str, tuple[str, ...]] = {
+        "deployment/production workflow": (
+            ".github/workflows/*deploy*",
+            ".github/workflows/*release*",
+            "**/deploy/**",
+            "**/deployment/**",
+            "k8s/**",
+            "terraform/**",
+        ),
+        "auth/security path": ("**/auth/**", "**/security/**", "src/auth/**", "src/security/**", "**/*credential*"),
+        "billing/financial path": ("**/billing/**", "**/payment/**", "**/financial/**", "src/billing/**"),
+        "production cron/scheduler path": ("**/cron/**production*", "**/prod*cron*", "**/scheduler/**"),
+        "branch protection/governance mutation": (".github/rulesets/**", "**/branch-protection/**"),
+    }
+    matched_forbidden = [
+        label for label, patterns in forbidden_surfaces.items() if any(_path_matches_any(file, patterns) for file in files)
+    ]
+
+    if not files:
+        risk = "RISK_0_NO_CHANGE"
+        rationale = "No changed files observed."
+    elif matched_forbidden:
+        risk = "RISK_5_FORBIDDEN_PROTECTED_SURFACE"
+        rationale = "Diff touches surfaces forbidden for Qwen35 candidate lanes."
+    elif all(_path_matches_any(file, ("docs/**", "*.md", "**/*.md")) for file in files):
+        risk = "RISK_1_DOCS_ONLY"
+        rationale = "Diff is limited to Markdown/docs files."
+    elif all(_path_matches_any(file, ("tests/**", "fixtures/**", "**/fixtures/**")) for file in files):
+        risk = "RISK_2_TEST_OR_FIXTURE_ONLY"
+        rationale = "Diff is limited to tests or fixtures."
+    elif all(_path_matches_any(file, ("neoengine_local/**", "scripts/**", "tools/**", "hermes_cli/**")) for file in files):
+        risk = "RISK_3_LOCAL_TOOLING_ONLY"
+        rationale = "Diff is limited to local tooling/control-plane assistant surfaces."
+    else:
+        risk = "RISK_4_RUNTIME_ADJACENT_REQUIRES_REVIEW"
+        rationale = "Diff is outside safe docs/tests/local-tooling buckets and needs independent review."
+
+    return {
+        "risk": risk,
+        "changed_files": files,
+        "matched_forbidden_surfaces": matched_forbidden,
+        "rationale": rationale,
+        "non_claims_preserved": OPERATOR_RECEIPT_NON_CLAIMS,
+    }
 
 
 class Qwen35Registry:
@@ -564,6 +821,12 @@ def main(argv: list[str] | None = None) -> int:
     verify.add_argument("--repo", required=True)
     verify.add_argument("--worktree", required=True)
     verify.add_argument("--completion-receipt", required=True)
+    picker = sub.add_parser("pick-task")
+    picker.add_argument("--description", required=True)
+    recipe = sub.add_parser("recipe")
+    recipe.add_argument("--task-type", required=True, choices=sorted(QWEN35_TASK_RECIPES))
+    risk = sub.add_parser("risk")
+    risk.add_argument("--changed-file", action="append", default=[])
     args = parser.parse_args(argv)
     if args.command == "preflight":
         result = run_preflight_canary(
@@ -582,6 +845,18 @@ def main(argv: list[str] | None = None) -> int:
         result = verify_post_run(repo=args.repo, worktree=args.worktree, completion_receipt=args.completion_receipt)
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["verdict"] in POSITIVE_VERIFIER_VERDICTS else 2
+    if args.command == "pick-task":
+        result = classify_qwen35_task(args.description)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0 if result["allowed"] else 2
+    if args.command == "recipe":
+        result = get_qwen35_task_recipe(args.task_type)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    if args.command == "risk":
+        result = score_qwen35_diff_risk(args.changed_file)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 2 if result["risk"] == "RISK_5_FORBIDDEN_PROTECTED_SURFACE" else 0
     return 2
 
 
