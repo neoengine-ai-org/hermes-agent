@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.watchdog_summary_projection.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "computed_at",
+    "orgs"
+  ],
+  "title": "org.watchdog_summary_projection.v1",
+  "type": "object"
+}

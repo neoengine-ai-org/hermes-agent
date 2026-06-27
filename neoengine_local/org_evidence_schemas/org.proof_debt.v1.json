@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.proof_debt.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "debt_id",
+    "org",
+    "debt_type",
+    "subject",
+    "required_artifact",
+    "status"
+  ],
+  "title": "org.proof_debt.v1",
+  "type": "object"
+}

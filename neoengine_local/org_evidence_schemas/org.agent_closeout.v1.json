@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.agent_closeout.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "receipt_id",
+    "org",
+    "repo",
+    "subject",
+    "claims"
+  ],
+  "title": "org.agent_closeout.v1",
+  "type": "object"
+}
