@@ -24,15 +24,21 @@ VERIFIER_VERDICTS = {
     "CLAIMS_EXCEED_EVIDENCE",
 }
 
+POSITIVE_VERIFIER_VERDICTS = {
+    "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF",
+    "VERIFIED_NO_CHANGE_WITH_EVIDENCE",
+}
+
 NON_CLAIMS = [
     "not deployed",
     "not live",
     "not accepted",
-    "not landed unless independently verified",
+    "not merged unless independently verified",
     "not merge evidence unless PR/CI/merge state are independently verified",
     "no branch-protection mutation",
     "no production cron",
     "no external notification delivery without separate authorization",
+    "QWEN35 remains candidate-only",
 ]
 
 Runner = Callable[[list[str], Path], tuple[int, str, str]]
@@ -164,6 +170,8 @@ def run_preflight_canary(
     receipt_path: str | Path,
     runner: Runner = default_runner,
     now: str | None = None,
+    registry_path: str | Path | None = None,
+    enforce_registry: bool = False,
 ) -> dict[str, Any]:
     root = Path(worktree)
     receipt = Path(receipt_path)
@@ -185,7 +193,19 @@ def run_preflight_canary(
         "observed_at": observed_at,
         "non_claims_preserved": NON_CLAIMS,
         "commands": commands,
+        "registry_enforced": enforce_registry,
+        "registry_path": str(registry_path) if registry_path else None,
     }
+
+    if enforce_registry:
+        if not registry_path:
+            return _finish_canary(receipt, base, "FAILED_TOOLING_OR_CONTEXT", "INVOCATION_REGISTRY_REQUIRED", "--registry is required when registry enforcement is enabled")
+        registry = Qwen35Registry(registry_path)
+        entry = registry.get(repo)
+        base["registry_entry_found"] = entry is not None
+        base["registry_known_good_invocation"] = entry.get("known_good_invocation") if entry else None
+        if not registry.allowed_invocation(repo, invocation):
+            return _finish_canary(receipt, base, "FAILED_TOOLING_OR_CONTEXT", "INVOCATION_NOT_ALLOWED_FOR_REPO", "invocation does not match the repo-specific known-good registry entry")
 
     rc, repo_root, err = run(["git", "rev-parse", "--show-toplevel"])
     if rc != 0:
@@ -369,12 +389,41 @@ def verify_post_run(
         payload.update({"verdict": "INVALID_TERMINAL_RETURN", "blockers": [f"invalid terminal status: {terminal!r}"]})
         return payload
 
-    _, git_status, _ = run(["git", "status", "--porcelain"])
-    _, git_diff, _ = run(["git", "diff", "--stat"])
-    _, head_sha, _ = run(["git", "rev-parse", "HEAD"])
+    status_rc, git_status, status_err = run(["git", "status", "--porcelain"])
+    diff_rc, git_diff, diff_err = run(["git", "diff", "--stat"])
+    head_rc, head_sha, head_err = run(["git", "rev-parse", "HEAD"])
     payload.update({"git_status": git_status, "git_diff_stat": git_diff, "head_sha": head_sha})
 
     blockers: list[str] = []
+    if status_rc != 0:
+        blockers.append(f"git status failed: {status_err or git_status}")
+    if diff_rc != 0:
+        blockers.append(f"git diff failed: {diff_err or git_diff}")
+    if head_rc != 0 or not head_sha:
+        blockers.append(f"git HEAD detection failed: {head_err or head_sha}")
+    if blockers:
+        payload.update({"verdict": "VERIFIED_TOOLING_OR_CONTEXT_FAILURE", "blockers": blockers})
+        return payload
+
+    claimed_commit = str(completion.get("commit_sha") or "").strip()
+    claimed_commit_verified = False
+    if claimed_commit:
+        exists_rc, _, exists_err = run(["git", "cat-file", "-e", f"{claimed_commit}^{{commit}}"])
+        if exists_rc != 0:
+            blockers.append("commit_sha claimed but commit does not exist")
+        resolved_rc, resolved_sha, resolved_err = run(["git", "rev-parse", claimed_commit])
+        if resolved_rc != 0 or not resolved_sha:
+            blockers.append(f"commit_sha claimed but could not be resolved: {resolved_err or resolved_sha}")
+        elif resolved_sha != head_sha:
+            blockers.append("commit_sha claimed but does not match observed HEAD")
+        show_rc, commit_stat, show_err = run(["git", "show", "--stat", "--oneline", "--name-only", claimed_commit])
+        if show_rc != 0 or not commit_stat.strip():
+            blockers.append("commit_sha claimed but commit diff was not independently inspected")
+        if not blockers:
+            claimed_commit_verified = True
+            payload["verified_commit_sha"] = resolved_sha
+            payload["verified_commit_stat"] = commit_stat
+
     claimed_pr = completion.get("pr_url")
     if claimed_pr:
         rc, _, _ = run(["gh", "pr", "view", str(claimed_pr), "--json", "url,state,headRefOid"])
@@ -382,17 +431,25 @@ def verify_post_run(
             blockers.append("pr_url claimed but PR was not independently verified")
     if completion.get("tests_run") and not completion.get("test_results"):
         blockers.append("tests_run claimed without test_results")
-    if any(term in json.dumps(completion).lower() for term in ["deployed", "live", "accepted"]):
+    if any(term in json.dumps(completion).lower() for term in ["deployed", "live", "accepted", "merged"]):
         blockers.append("completion text may exceed non-claim ceiling")
 
     if terminal == "FAILED_TOOLING_OR_CONTEXT":
         verdict = "VERIFIED_TOOLING_OR_CONTEXT_FAILURE"
     elif blockers:
         verdict = "CLAIMS_EXCEED_EVIDENCE"
-    elif terminal == "NO_CHANGE_WITH_EVIDENCE" and not git_status and not git_diff:
-        verdict = "VERIFIED_NO_CHANGE_WITH_EVIDENCE"
-    elif terminal == "PRODUCTIVE_DIFF_WITH_EVIDENCE" and (git_diff or completion.get("commit_sha")):
-        verdict = "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
+    elif terminal == "NO_CHANGE_WITH_EVIDENCE":
+        if not git_status and not git_diff and not claimed_commit and not claimed_pr:
+            verdict = "VERIFIED_NO_CHANGE_WITH_EVIDENCE"
+        else:
+            verdict = "CLAIMS_EXCEED_EVIDENCE"
+            blockers.append("NO_CHANGE_WITH_EVIDENCE does not match independently observed artifacts")
+    elif terminal == "PRODUCTIVE_DIFF_WITH_EVIDENCE":
+        if git_diff or claimed_commit_verified:
+            verdict = "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
+        else:
+            verdict = "CLAIMS_EXCEED_EVIDENCE"
+            blockers.append("PRODUCTIVE_DIFF_WITH_EVIDENCE lacks independently verified diff or matching HEAD commit evidence")
     else:
         verdict = "CLAIMS_EXCEED_EVIDENCE"
         blockers.append("terminal status does not match independently observed artifacts")
@@ -442,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
     canary.add_argument("--model", required=True)
     canary.add_argument("--invocation", nargs="+", required=True)
     canary.add_argument("--receipt", required=True)
+    canary.add_argument("--registry")
+    canary.add_argument("--enforce-registry", action="store_true")
     verify = sub.add_parser("verify")
     verify.add_argument("--repo", required=True)
     verify.add_argument("--worktree", required=True)
@@ -455,13 +514,15 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             invocation=args.invocation,
             receipt_path=args.receipt,
+            registry_path=args.registry,
+            enforce_registry=args.enforce_registry,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["status"] == "PASS" else 2
     if args.command == "verify":
         result = verify_post_run(repo=args.repo, worktree=args.worktree, completion_receipt=args.completion_receipt)
         print(json.dumps(result, indent=2, sort_keys=True))
-        return 0 if result["verdict"] in VERIFIER_VERDICTS else 2
+        return 0 if result["verdict"] in POSITIVE_VERIFIER_VERDICTS else 2
     return 2
 
 
