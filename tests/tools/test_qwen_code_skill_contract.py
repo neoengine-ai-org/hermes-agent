@@ -53,3 +53,23 @@ def test_repo_qwen_headless_invocations_do_not_reintroduce_legacy_yolo_flags() -
                     bad_invocations.append(f"{path.relative_to(ROOT)}:{line_number}:{line.strip()}")
 
     assert bad_invocations == []
+
+
+def test_qwen_watchdog_display_contract_is_documented() -> None:
+    text = QWEN_SKILL.read_text(encoding="utf-8")
+    reference = (
+        ROOT
+        / "skills"
+        / "autonomous-ai-agents"
+        / "qwen-code"
+        / "references"
+        / "qwen-watchdog-display-evidence.md"
+    )
+    reference_text = reference.read_text(encoding="utf-8")
+
+    assert "qwen-watchdog-display-evidence.md" in text
+    assert "Qwen 1/1" in reference_text
+    assert "qwen-ops-runner-conductor" in reference_text
+    assert "qwen-ops-unified-pr-ci-controller.py" in reference_text
+    assert "do not inflate" in reference_text
+    assert "not product progress" in reference_text
