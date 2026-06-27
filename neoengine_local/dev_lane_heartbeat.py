@@ -442,7 +442,8 @@ class DevLaneStore:
         if valid_events:
             event = sorted(valid_events, key=lambda e: e.get("created_at", ""), reverse=True)[0]
             return f"event:{event['event_type']}"
-        if hb and utc_parse(now) >= utc_parse(hb.get("next_eligible_wake_at", "1970-01-01T00:00:00Z")):
+        next_wake = (hb or {}).get("next_eligible_wake_at") or "1970-01-01T00:00:00Z"
+        if hb and utc_parse(now) >= utc_parse(next_wake):
             return "timer:fallback"
         if not hb:
             return "event:fresh_session"
@@ -469,6 +470,8 @@ def utc_now() -> str:
 
 
 def utc_parse(value: str) -> datetime:
+    if not value:
+        value = "1970-01-01T00:00:00Z"
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     parsed = datetime.fromisoformat(value)
