@@ -581,7 +581,7 @@ def test_post_run_productive_diff_requires_claimed_files_match_observed_diff(tmp
     assert "PRODUCTIVE_DIFF_WITH_EVIDENCE changed_files do not match independently observed diff files" in result["blockers"]
 
 
-def test_post_run_productive_diff_accepts_matching_claimed_files(tmp_path: Path) -> None:
+def test_post_run_productive_diff_rejects_uncommitted_diff_even_when_claimed_files_match(tmp_path: Path) -> None:
     receipt = tmp_path / "completion.json"
     receipt.write_text(json.dumps({"terminal_status": "PRODUCTIVE_DIFF_WITH_EVIDENCE", "changed_files": ["actual.py"]}))
 
@@ -598,5 +598,6 @@ def test_post_run_productive_diff_accepts_matching_claimed_files(tmp_path: Path)
 
     result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
 
-    assert result["verdict"] == "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
+    assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
+    assert "PRODUCTIVE_DIFF_WITH_EVIDENCE has uncommitted diff evidence but lacks matching HEAD commit proof" in result["blockers"]
     assert result["git_diff_files"] == ["actual.py"]

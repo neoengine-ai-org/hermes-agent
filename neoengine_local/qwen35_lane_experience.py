@@ -496,16 +496,17 @@ def verify_post_run(
             blockers.append("NO_CHANGE_WITH_EVIDENCE does not match independently observed artifacts")
     elif terminal == "PRODUCTIVE_DIFF_WITH_EVIDENCE":
         if observed_changed_files:
-            if sorted(claimed_changed_files) == sorted(observed_changed_files):
-                verdict = "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
-            else:
+            if sorted(claimed_changed_files) != sorted(observed_changed_files):
                 verdict = "CLAIMS_EXCEED_EVIDENCE"
                 blockers.append("PRODUCTIVE_DIFF_WITH_EVIDENCE changed_files do not match independently observed diff files")
+            else:
+                verdict = "CLAIMS_EXCEED_EVIDENCE"
+                blockers.append("PRODUCTIVE_DIFF_WITH_EVIDENCE has uncommitted diff evidence but lacks matching HEAD commit proof")
         elif claimed_commit_verified:
             verdict = "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
         else:
             verdict = "CLAIMS_EXCEED_EVIDENCE"
-            blockers.append("PRODUCTIVE_DIFF_WITH_EVIDENCE lacks independently verified diff or matching HEAD commit evidence")
+            blockers.append("PRODUCTIVE_DIFF_WITH_EVIDENCE lacks independently verified matching HEAD commit evidence")
     else:
         verdict = "CLAIMS_EXCEED_EVIDENCE"
         blockers.append("terminal status does not match independently observed artifacts")
