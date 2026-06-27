@@ -1,9 +1,20 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Spawned multiprocessing workers can inherit sys.path entries inserted by
+# deployed-script integration tests.  Keep this checkout first so workers test
+# the PR code, not an older live deployment checkout.
+try:
+    sys.path.remove(str(REPO_ROOT))
+except ValueError:
+    pass
+sys.path.insert(0, str(REPO_ROOT))
 
 from neoengine_local.dev_lane_heartbeat import DevLaneStore, utc_parse
 
@@ -75,7 +86,7 @@ def test_reserved_history_work_item_id_does_not_overwrite_claim_history(tmp_path
 def test_unsafe_lane_ids_are_rejected_before_writing_lane_files(tmp_path: Path, lane_id: str) -> None:
     store = DevLaneStore(tmp_path)
 
-    with pytest.raises(ValueError, match="lane_id must be a safe slug"):
+    with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
         store.emit_heartbeat(
             lane_id=lane_id,
             agent_session_id="session-a",
@@ -90,17 +101,75 @@ def test_unsafe_lane_ids_are_rejected_before_writing_lane_files(tmp_path: Path, 
     assert list((tmp_path / "heartbeats").iterdir()) == []
 
 
-def test_claim_file_paths_are_collision_resistant_for_sanitized_work_item_ids(tmp_path: Path) -> None:
+def test_claim_file_paths_use_non_colliding_namespace_for_valid_ids(tmp_path: Path) -> None:
     store = DevLaneStore(tmp_path)
-    store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "PR-36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
     store.add_work_item({"work_item_id": "PR_36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
-    store.claim_work("PR:36", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/colon.json")
+    store.claim_work("PR-36", "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/dash.json")
 
     assert store.active_claim_for_work("PR_36", now="2026-06-24T00:01:00Z") is None
     store.claim_work("PR_36", "lane-b", "session-b", "2026-06-24T00:01:00Z", 3600, "claims/underscore.json")
 
-    claim_files = sorted(path.name for path in (tmp_path / "claims").glob("*.json"))
-    assert claim_files == ["PR%3A36.json", "PR_36.json"]
+    claim_files = sorted(path.name for path in (tmp_path / "claims" / "by-work-item").glob("*.json"))
+    assert claim_files == ["PR-36.json", "PR_36.json"]
+
+
+
+@pytest.mark.parametrize("work_item_id", ["../x", "a/b", "/abs", "claims", "history.json", "caf\u0301"])
+def test_unsafe_work_item_ids_are_rejected_without_mutating_history(tmp_path: Path, work_item_id: str) -> None:
+    store = DevLaneStore(tmp_path)
+    original_history = [{"work_item_id": "prior", "claim_status": "completed"}]
+    store.write_json("claims/history.json", original_history)
+
+    with pytest.raises(ValueError, match="unsafe|reserved|stable safe slug"):
+        store.add_work_item({"work_item_id": work_item_id, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+
+    assert store.read_json("claims/history.json") == original_history
+
+
+def test_legacy_active_claim_is_visible_and_closes_without_leaving_active_copy(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-1", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    legacy_claim = {
+        "schema_version": "dev_lane_claim.v1",
+        "work_item_id": "work-1",
+        "lane_id": "lane-a",
+        "claim_owner_session_id": "session-old",
+        "claim_started_at": "2026-06-24T00:00:00Z",
+        "claim_expires_at": "2026-06-24T01:00:00Z",
+        "claim_status": "active",
+        "claim_evidence_path": "claims/work-1.json",
+    }
+    store.write_json("claims/work-1.json", legacy_claim)
+
+    assert store.active_claim_for_work("work-1", now="2026-06-24T00:10:00Z") is not None
+    closed = store.close_claim("work-1", "completed", "receipts/done.md", "2026-06-24T00:20:00Z")
+    report = store.status_report(now="2026-06-24T00:21:00Z")
+
+    assert closed["claim_status"] == "completed"
+    assert store.read_json("claims/work-1.json")["claim_status"] == "completed"
+    assert report["lanes"][0]["active_claims"] == []
+
+
+def test_legacy_percent_encoded_claim_can_be_read_without_reopening_unsafe_id_admission(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    legacy_claim = {
+        "schema_version": "dev_lane_claim.v1",
+        "work_item_id": "PR:36",
+        "lane_id": "lane-a",
+        "claim_owner_session_id": "session-old",
+        "claim_started_at": "2026-06-24T00:00:00Z",
+        "claim_expires_at": "2026-06-24T01:00:00Z",
+        "claim_status": "active",
+        "claim_evidence_path": "claims/PR%3A36.json",
+    }
+    store.write_json("claims/PR%3A36.json", legacy_claim)
+
+    assert store.claim_for_work("PR:36") == legacy_claim
+    assert store.active_claim_for_work("PR:36", now="2026-06-24T00:10:00Z") == legacy_claim
+    store.add_work_item({"work_item_id": "PR:36", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    assert (tmp_path / "work" / "items.json").exists()
 
 
 def test_stale_claims_can_be_recovered_with_evidence(tmp_path: Path) -> None:
@@ -301,3 +370,413 @@ def test_governance_bypass_cases_are_preserved(tmp_path: Path) -> None:
         "human": "awaiting_human_review",
         "refused": "refused_without_sidecar_evidence",
     }
+
+
+def test_canonical_terminal_does_not_hide_legacy_active_claim(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-2", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    legacy_active = {
+        "schema_version": "dev_lane_claim.v1",
+        "work_item_id": "work-2",
+        "lane_id": "lane-a",
+        "claim_owner_session_id": "old",
+        "claim_started_at": "2026-06-24T00:00:00Z",
+        "claim_expires_at": "2026-06-24T01:00:00Z",
+        "claim_status": "active",
+        "claim_evidence_path": "claims/work-2.json",
+    }
+    canonical_closed = {**legacy_active, "claim_status": "completed", "closed_at": "2026-06-24T00:10:00Z"}
+    store.write_json("claims/by-work-item/work-2.json", canonical_closed)
+    store.write_json("claims/work-2.json", legacy_active)
+
+    assert store.active_claim_for_work("work-2", now="2026-06-24T00:20:00Z") == legacy_active
+    with pytest.raises(ValueError, match="active claim already exists"):
+        store.claim_work("work-2", "lane-b", "new", "2026-06-24T00:20:00Z", 3600, "evidence")
+
+
+def _file_backed_claim_worker(args: tuple[str, str]) -> dict[str, str]:
+    root, lane_id = args
+    store = DevLaneStore(Path(root))
+    try:
+        claim = store.claim_work(
+            "work-concurrent",
+            lane_id,
+            f"session-{lane_id}",
+            "2099-06-24T00:00:00Z",
+            3600,
+            f"claims/{lane_id}.json",
+        )
+        return {"lane_id": lane_id, "claimed": "true", "claim_owner_session_id": claim["claim_owner_session_id"]}
+    except ValueError as exc:
+        return {"lane_id": lane_id, "claimed": "false", "error": str(exc)}
+
+
+def test_file_backed_blocked_closeout_baselines_event_across_lanes(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-blocked", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    event = store.record_event("work-blocked", "failed_ci_transition", "2026-06-24T00:00:00Z", event_id="e1")
+
+    first = store.pick_next_work("lane-a", "session-a", now="2026-06-24T00:01:00Z")
+    assert first["action"] == "claimed"
+    store.close_claim("work-blocked", "blocked", "receipts/blocked.md", "2026-06-24T00:02:00Z")
+
+    item = store.read_json("work/items.json")["work-blocked"]
+    assert item["status"] == "blocked"
+    assert item["blocked_at_event_id"] == event["event_id"]
+
+    second = store.pick_next_work("lane-b", "session-b", now="2026-06-24T00:03:00Z")
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_claim_work_is_serialized_across_processes(tmp_path: Path) -> None:
+    import multiprocessing as mp
+
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-concurrent", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=4) as pool:
+        results = pool.map(_file_backed_claim_worker, [(str(tmp_path), f"lane-{idx}") for idx in range(4)])
+
+    assert sum(1 for result in results if result["claimed"] == "true") == 1
+    assert sum(1 for result in results if "active claim already exists" in result.get("error", "")) == 3
+    claims = [path for path in (tmp_path / "claims" / "by-work-item").glob("*.json")]
+    assert len(claims) == 1
+
+
+def test_colon_work_item_id_uses_encoded_non_colliding_claim_path(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    work_item_id = "neowealth:startup-proof:codex"
+    store.add_work_item({"work_item_id": work_item_id, "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    claim = store.claim_work(work_item_id, "lane-a", "session-a", "2026-06-24T00:00:00Z", 3600, "claims/colon.json")
+
+    assert claim["work_item_id"] == work_item_id
+    assert store.active_claim_for_work(work_item_id, now="2026-06-24T00:01:00Z") is not None
+    claim_files = sorted(path.name for path in (tmp_path / "claims" / "by-work-item").glob("*.json"))
+    assert claim_files == ["neowealth%3Astartup-proof%3Acodex.json"]
+    assert not (tmp_path / "claims" / "history.json").exists()
+
+
+def test_file_backed_refresh_preserves_active_claimed_status_and_terminal_closeout(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item({"work_item_id": "work-refresh-active", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.claim_work("work-refresh-active", "lane-a", "session-a", "2099-06-24T00:00:00Z", 3600, "claims/a.json")
+
+    refreshed = store.add_work_item({"work_item_id": "work-refresh-active", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "queued"})
+    status = store.status_report(now="2099-06-24T00:05:00Z")
+    store.close_claim("work-refresh-active", "completed", "receipts/done.md", "2099-06-24T00:06:00Z")
+    closed = store.read_json("work/items.json")["work-refresh-active"]
+
+    assert refreshed["status"] == "claimed"
+    assert status["lanes"] == [] or "work-refresh-active" not in [item.get("work_item_id") for item in status["lanes"]]
+    assert closed["status"] == "completed"
+
+
+def test_file_backed_blocked_baseline_survives_refresh_until_new_valid_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-blocked-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked"})
+    e1 = store.record_event("work-blocked-refresh", "new_repair_packet", "2026-06-24T00:00:00Z", event_id="E1")
+    store.claim_work("work-blocked-refresh", "lane-a", "session-a", "2026-06-24T00:01:00Z", 3600, "claims/a.json")
+    store.close_claim("work-blocked-refresh", "blocked", "receipts/blocked.md", "2026-06-24T00:02:00Z")
+
+    refreshed = store.add_work_item({"work_item_id": "work-blocked-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked"})
+    denied = store.pick_next_work("lane-a", "session-b", now="2026-06-24T00:03:00Z")
+    e2 = store.record_event("work-blocked-refresh", "governance_unblock", "2026-06-24T00:04:00Z", event_id="E2")
+    picked = store.pick_next_work("lane-a", "session-c", now="2026-06-24T00:05:00Z")
+
+    assert e1["event_id"] == "E1"
+    assert refreshed["blocked_at_event_id"] == "E1"
+    assert denied["action"] == "idle-no-work"
+    assert e2["event_id"] == "E2"
+    assert picked["action"] == "claimed"
+    assert picked["claim"]["claimed_event_id"] == "E2"
+
+
+def test_file_backed_claim_consumes_prior_same_work_item_events_only(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-events", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "work-other", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-events", "new_repair_packet", "2026-06-24T00:00:00Z", event_id="E1")
+    store.record_event("work-other", "new_repair_packet", "2026-06-24T00:01:00Z", event_id="O1")
+    store.record_event("work-events", "followup_repair_packet", "2026-06-24T00:02:00Z", event_id="E2")
+
+    claim = store.claim_work("work-events", "lane-a", "session-a", "2026-06-24T00:03:00Z", 3600, "claims/a.json")
+    store.record_event("work-events", "governance_unblock", "2026-06-24T00:04:00Z", event_id="E3")
+    items = store.read_json("work/items.json")
+    wake = store.pick_next_work("lane-b", "session-b", now="2026-06-24T00:05:00Z")
+
+    event_map = {event["event_id"]: event for event in items["work-events"]["events"]}
+    assert claim["claimed_event_id"] == "E2"
+    assert event_map["E1"]["consumed_at"] == "2026-06-24T00:03:00Z"
+    assert event_map["E2"]["consumed_at"] == "2026-06-24T00:03:00Z"
+    assert "consumed_at" not in event_map["E3"]
+    assert wake["action"] == "claimed"
+    assert wake["work_item_id"] == "work-other"
+
+
+def test_event_vocabulary_matches_sqlite_backend() -> None:
+    from hermes_cli import kanban_db as kb
+    from neoengine_local import dev_lane_heartbeat as hb
+
+    assert kb.LANE_VALID_WAKE_EVENTS == hb.VALID_WAKE_EVENTS
+
+
+def test_file_backed_scanner_rejects_invalid_event_without_unblocking_blocked_item(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({
+        "work_item_id": "work-invalid-scanner-event",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "blocked",
+        "blocked_at_event_id": "E1",
+        "events": [{"event_id": "E1", "event_type": "new_repair_packet", "created_at": "2099-06-24T00:00:00Z"}],
+    })
+
+    initial = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    with pytest.raises(ValueError, match="invalid wake event"):
+        store.add_work_item({
+            "work_item_id": "work-invalid-scanner-event",
+            "repo_scope": "repo",
+            "authorized_scopes": ["**"],
+            "status": "blocked",
+            "events": [{"event_id": "BAD", "event_type": "unauthorized_closeout", "created_at": "2099-06-24T00:02:00Z"}],
+        })
+    after_invalid = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:03:00Z")
+    item = store.read_json("work/items.json")["work-invalid-scanner-event"]
+
+    assert initial["action"] == "idle-no-work"
+    assert after_invalid["action"] == "idle-no-work"
+    assert [event["event_id"] for event in item["events"]] == ["E1"]
+    assert item["blocked_at_event_id"] == "E1"
+
+
+def test_file_backed_same_timestamp_followup_event_is_stale_for_active_claim(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-same-ts", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-same-ts", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    first = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    with pytest.raises(ValueError, match="older than"):
+        store.record_event("work-same-ts", "followup_repair_packet", "2099-06-24T00:00:00Z", event_id="E2")
+    store.close_claim("work-same-ts", "blocked", "receipts/blocked.md", "2099-06-24T00:02:00Z")
+    second = store.pick_next_work("lane-b", "session-b", now="2099-06-24T00:03:00Z")
+
+    assert first["claim"]["claimed_event_id"] == "E1"
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_legacy_claim_recovery_closes_legacy_path(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-old", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-new", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-legacy-recovery", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    legacy_claim = {
+        "work_item_id": "work-legacy-recovery",
+        "lane_id": "lane-old",
+        "claim_owner_session_id": "session-old",
+        "claim_status": "active",
+        "claimed_at": "2099-06-24T00:00:00Z",
+        "claim_expires_at": "2099-06-24T00:01:00Z",
+    }
+    store.write_json("claims/work-legacy-recovery.json", legacy_claim)
+
+    new_claim = store.claim_work(
+        "work-legacy-recovery",
+        "lane-new",
+        "session-new",
+        "2099-06-24T00:02:00Z",
+        3600,
+        "claims/new.json",
+        recovery_evidence_path="receipts/recovered.md",
+    )
+    report = store.status_report(now="2099-06-24T00:03:00Z")
+    legacy_after = store.read_json("claims/work-legacy-recovery.json")
+
+    assert new_claim["claim_status"] == "active"
+    assert legacy_after["claim_status"] == "expired/recovered"
+    rows = {row["lane_id"]: row for row in report["lanes"]}
+    assert rows["lane-new"]["active_claims"] == ["work-legacy-recovery"]
+    assert rows["lane-old"]["stale_claims"] == []
+
+
+def test_file_backed_blocked_item_without_event_list_fails_closed(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({
+        "work_item_id": "work-missing-events",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "blocked",
+        "blocked_at_event_id": "E1",
+    })
+
+    result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:00:00Z")
+
+    assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_blocked_refresh_ignores_older_valid_injected_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-old-event", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-old-event", "failed_ci_transition", "2099-06-24T00:10:00Z", event_id="E1")
+    first = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    store.close_claim("work-old-event", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+
+    refreshed = store.add_work_item({
+        "work_item_id": "work-old-event",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "blocked",
+        "events": [{"event_id": "OLD", "event_type": "governance_unblock", "created_at": "2099-06-24T00:00:00Z"}],
+    })
+    second = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+
+    assert first["claim"]["claimed_event_id"] == "E1"
+    assert [event["event_id"] for event in refreshed["events"]] == ["E1"]
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_pickup_evidence_path_points_to_canonical_claim(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-evidence", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-evidence", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+
+    result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    heartbeat = store.latest_heartbeat("lane-a")
+
+    assert result["claim"]["claim_evidence_path"] == "claims/by-work-item/work-evidence.json"
+    assert heartbeat["evidence_pointer"] == "claims/by-work-item/work-evidence.json"
+    assert (tmp_path / heartbeat["evidence_pointer"]).exists()
+
+
+def test_file_backed_record_event_rejects_backdated_blocked_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-backdated", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-backdated", "failed_ci_transition", "2099-06-24T00:10:00Z", event_id="E1")
+    first = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    store.close_claim("work-backdated", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+
+    with pytest.raises(ValueError, match="older than blocked baseline"):
+        store.record_event("work-backdated", "governance_unblock", "2099-06-24T00:00:00Z", event_id="OLD")
+    second = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+
+    assert first["claim"]["claimed_event_id"] == "E1"
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_blocked_refresh_rejects_same_timestamp_followup(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-same-refresh", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-same-refresh", "failed_ci_transition", "2099-06-24T00:10:00Z", event_id="E1")
+    store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    store.close_claim("work-same-refresh", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+
+    refreshed = store.add_work_item({
+        "work_item_id": "work-same-refresh",
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "blocked",
+        "events": [{"event_id": "E2", "event_type": "governance_unblock", "created_at": "2099-06-24T00:10:00Z"}],
+    })
+    second = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+
+    assert [event["event_id"] for event in refreshed["events"]] == ["E1"]
+    assert second["action"] == "idle-no-work"
+
+
+def test_file_backed_record_event_rejects_backdated_active_claim_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-claimed-backdated", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-claimed-backdated", "new_repair_packet", "2099-06-24T00:10:00Z", event_id="E1")
+    store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    with pytest.raises(ValueError, match="older than"):
+        store.record_event("work-claimed-backdated", "governance_unblock", "2099-06-24T00:00:00Z", event_id="OLD")
+    store.close_claim("work-claimed-backdated", "blocked", "receipts/blocked.md", "2099-06-24T00:12:00Z")
+    result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:13:00Z")
+    assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_legacy_claim_null_baseline_preserves_newer_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("lane-b", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-legacy-null", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-legacy-null", "new_repair_packet", "2099-06-24T00:10:00Z", event_id="E1")
+    claim_result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:11:00Z")
+    claim = store.claim_for_work("work-legacy-null")
+    claim.pop("claimed_event_id", None)
+    store.write_json(str(store._claim_path("work-legacy-null")), claim)
+    with pytest.raises(ValueError, match="older than"):
+        store.record_event("work-legacy-null", "governance_unblock", "2099-06-24T00:00:00Z", event_id="OLD")
+    store.record_event("work-legacy-null", "governance_unblock", "2099-06-24T00:12:00Z", event_id="E2")
+    store.close_claim("work-legacy-null", "blocked", "receipts/blocked.md", "2099-06-24T00:13:00Z")
+    item = store.read_json("work/items.json", {})["work-legacy-null"]
+    next_pick = store.pick_next_work("lane-b", "session-b", now="2099-06-24T00:14:00Z")
+    assert claim_result["claim"]["claimed_event_id"] == "E1"
+    assert item.get("blocked_at_event_id") is None
+    assert item["blocked_at"] == "2099-06-24T00:13:00Z"
+    assert next_pick["action"] == "idle-no-work"
+
+
+def test_file_backed_legacy_claimed_at_baseline_blocks_repick(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-legacy-claimed-at", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("work-legacy-claimed-at", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:01:00Z")
+    claim = store.claim_for_work("work-legacy-claimed-at")
+    claim.pop("claimed_event_id", None)
+    claim["claimed_at"] = claim.pop("claim_started_at")
+    store.write_json(str(store._claim_path("work-legacy-claimed-at")), claim)
+    store.close_claim("work-legacy-claimed-at", "blocked", "receipts/blocked.md", "2099-06-24T00:02:00Z")
+    item = store.read_json("work/items.json", {})["work-legacy-claimed-at"]
+    result = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:03:00Z")
+    assert item.get("blocked_at_event_id") is None
+    assert item["blocked_at"] == "2099-06-24T00:02:00Z"
+    assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_blocked_missing_event_baseline_fails_closed(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-missing-baseline", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked", "blocked_at_event_id": "MISSING"})
+    with pytest.raises(ValueError, match="missing blocked event baseline"):
+        store.record_event("work-missing-baseline", "governance_unblock", "2099-06-24T00:01:00Z", event_id="E2")
+    result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:02:00Z")
+    assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_refresh_preserves_blocked_when_event_baseline_missing(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "work-refresh-missing-baseline", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "blocked", "blocked_at_event_id": "MISSING", "events": [{"event_id": "E2", "event_type": "governance_unblock", "created_at": "2099-06-24T00:01:00Z"}]})
+    refreshed = store.add_work_item({"work_item_id": "work-refresh-missing-baseline", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    result = store.pick_next_work("lane-a", "session-a", now="2099-06-24T00:02:00Z")
+    assert refreshed["status"] == "blocked"
+    assert result["action"] == "idle-no-work"
+
+
+def test_file_backed_legacy_bare_consumed_event_id_does_not_hide_other_work(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item({"work_item_id": "A", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.add_work_item({"work_item_id": "B", "repo_scope": "repo", "authorized_scopes": ["**"], "status": "open"})
+    store.record_event("A", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    store.record_event("B", "new_repair_packet", "2099-06-24T00:00:00Z", event_id="E1")
+    store.emit_heartbeat("lane-a", "session-a", "repo", "idle-no-work", None, "2099-06-24T00:01:00Z", "2099-06-24T00:06:00Z", "receipt.md", last_event_consumed="E1")
+    picked = store.pick_next_work("lane-a", "session-b", now="2099-06-24T00:02:00Z")
+    assert picked["action"] == "claimed"
+    assert picked["work_item_id"] in {"A", "B"}

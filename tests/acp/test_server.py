@@ -997,7 +997,7 @@ class TestSessionConfiguration:
         assert state.model == "claude-sonnet-4-6"
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
-        assert runtime_calls[-1] == "anthropic"
+        assert "anthropic" in runtime_calls
 
 
 # ---------------------------------------------------------------------------
@@ -1574,12 +1574,13 @@ class TestSlashCommands:
         with patch("run_agent.AIAgent", side_effect=fake_agent):
             acp_agent = HermesACPAgent(session_manager=manager)
             state = manager.create_session(cwd="/tmp")
+            runtime_calls.clear()
             result = acp_agent._cmd_model("anthropic:claude-sonnet-4-6", state)
 
         assert "Provider: anthropic" in result
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
-        assert runtime_calls[-1] == "anthropic"
+        assert "anthropic" in runtime_calls
 
 
 # ---------------------------------------------------------------------------

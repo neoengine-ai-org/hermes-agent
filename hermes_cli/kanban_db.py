@@ -997,6 +997,7 @@ CREATE TABLE IF NOT EXISTS lane_work_items (
     governance_state      TEXT,
     capability            TEXT,
     blocked_event_id      INTEGER,
+    blocked_at            INTEGER,
     last_event_id         INTEGER,
     created_at            INTEGER NOT NULL,
     updated_at            INTEGER NOT NULL
@@ -1011,6 +1012,7 @@ CREATE TABLE IF NOT EXISTS lane_claims (
     claim_expires_at      INTEGER NOT NULL,
     claim_status          TEXT NOT NULL,
     claim_evidence_path   TEXT NOT NULL,
+    claimed_event_id      INTEGER,
     closed_at             INTEGER,
     recovery_of_claim_id  INTEGER,
     close_message         TEXT
@@ -1101,6 +1103,18 @@ class KanbanDbCorruptError(RuntimeError):
         super().__init__(
             f"Refusing to open corrupt kanban DB at {db_path}: {reason}. "
             f"Original preserved; backup at {backup_str}."
+        )
+
+
+class LaneControlMigrationConflictError(RuntimeError):
+    """Raised when legacy lane-control rows violate fail-closed invariants."""
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        super().__init__(
+            "Refusing to initialize kanban DB because existing lane-control "
+            "rows violate current safety constraints; quarantine or recover "
+            f"duplicate active lane claims before startup: {db_path}"
         )
 
 
@@ -1294,7 +1308,10 @@ def connect(
                     # here via the file lock above; without that, simultaneous first
                     # connects can interleave WAL/schema setup and leave malformed
                     # sqlite_master metadata.
-                    conn.executescript(SCHEMA_SQL)
+                    try:
+                        conn.executescript(SCHEMA_SQL)
+                    except sqlite3.IntegrityError as exc:
+                        raise LaneControlMigrationConflictError(path) from exc
                     _migrate_add_optional_columns(conn)
                     _INITIALIZED_PATHS.add(resolved)
         except Exception:
@@ -1432,6 +1449,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "current_step_key", "current_step_key TEXT"
         )
+
+    lane_claim_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_claims)")}
+    if lane_claim_cols and "claimed_event_id" not in lane_claim_cols:
+        _add_column_if_missing(conn, "lane_claims", "claimed_event_id", "claimed_event_id INTEGER")
+    lane_work_item_cols = {row["name"] for row in conn.execute("PRAGMA table_info(lane_work_items)")}
+    if lane_work_item_cols and "blocked_at" not in lane_work_item_cols:
+        _add_column_if_missing(conn, "lane_work_items", "blocked_at", "blocked_at INTEGER")
     if "skills" not in cols:
         # JSON array of skill names the dispatcher force-loads into the
         # worker (additive to the built-in `kanban-worker`). NULL is fine
@@ -1596,6 +1620,28 @@ LANE_TERMINAL_CLAIM_STATUSES = {
     "completed", "blocked", "refused", "superseded", "no-op with evidence", "expired/recovered"
 }
 LANE_GOVERNANCE_HOLDS = {"do-not-merge", "awaiting-human", "held", "human-review"}
+LANE_VALID_WAKE_EVENTS = {
+    "new_repair_packet",
+    "pr_status_check_change",
+    "review_request",
+    "queue_priority_change",
+    "stale_claim_expiry",
+    "failed_ci_transition",
+    "governance_unblock",
+    "explicit_operator_command",
+    "followup_repair_packet",
+}
+
+
+def _lane_claim_result(claimed: bool, result: str, **extra: Any) -> dict[str, Any]:
+    """Return a stable public lane-claim domain result.
+
+    ``reason`` is kept for older callers/tests; ``result`` is the canonical
+    all-caps domain code used by convergence receipts and adapters.
+    """
+    out: dict[str, Any] = {"claimed": claimed, "result": result, "reason": result.lower()}
+    out.update(extra)
+    return out
 
 
 def _dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
@@ -1725,40 +1771,83 @@ def claim_lane_work_item(
     expires = ts + max(1, int(ttl_seconds))
     if not evidence_path:
         raise ValueError("claim_evidence_path is required")
-    with write_txn(conn):
-        existing = conn.execute(
-            "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
-            (work_item_id,),
-        ).fetchone()
-        if existing is not None:
-            return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing)}
-        work_item = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
-        if work_item is None:
-            return {"claimed": False, "reason": "work_item_missing"}
-        if work_item["status"] not in {"open", "blocked"}:
-            return {"claimed": False, "reason": "work_item_not_claimable"}
-        if work_item["governance_state"] in {"do-not-merge", "awaiting-human", "held", "human-review"}:
-            return {"claimed": False, "reason": "governance_held"}
-        if work_item["status"] == "blocked" and not (
-            work_item["last_event_id"]
-            and (work_item["blocked_event_id"] is None or work_item["last_event_id"] != work_item["blocked_event_id"])
-        ):
-            return {"claimed": False, "reason": "blocked_without_new_event"}
-        try:
+    try:
+        with write_txn(conn):
+            existing = conn.execute(
+                "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
+                (work_item_id,),
+            ).fetchone()
+            if existing is not None:
+                return _lane_claim_result(False, "ACTIVE_CLAIM_EXISTS", active_claim=dict(existing))
+            work_item = conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
+            if work_item is None:
+                return _lane_claim_result(False, "WORK_ITEM_NOT_FOUND", reason="work_item_missing")
+            if work_item["status"] not in {"open", "blocked"}:
+                return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="work_item_not_claimable")
+            if work_item["governance_state"] in LANE_GOVERNANCE_HOLDS:
+                return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="governance_held", governance_state=work_item["governance_state"])
+            if work_item["status"] == "blocked":
+                newer_event = None
+                if work_item["blocked_event_id"] is None:
+                    # Null-baseline blocked closeout has no immutable event id,
+                    # so the closeout timestamp (lane_work_items.blocked_at) is
+                    # the fail-closed frontier. Only a valid wake event strictly
+                    # newer than that closeout may make the item claimable.
+                    newer_event = conn.execute(
+                        "SELECT id FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND created_at <= ? AND (? IS NULL OR created_at > ?) ORDER BY created_at DESC, id DESC LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                        (work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), ts, work_item["blocked_at"], work_item["blocked_at"]),
+                    ).fetchone()
+                else:
+                    newer_event = conn.execute(
+                        """
+                        SELECT e.id FROM lane_events e
+                        LEFT JOIN lane_events b ON b.id=? AND b.work_item_id=e.work_item_id
+                         WHERE e.work_item_id=?
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({})
+                           AND e.created_at <= ?
+                           AND (
+                                (b.id IS NOT NULL AND e.created_at > b.created_at)
+                           )
+                         ORDER BY e.created_at DESC, e.id DESC LIMIT 1
+                        """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                        (work_item["blocked_event_id"], work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), ts),
+                    ).fetchone()
+                if newer_event is None:
+                    return _lane_claim_result(False, "WORK_ITEM_INELIGIBLE", reason="blocked_without_new_event", detail="blocked_without_new_event")
             cur = conn.execute(
                 """
                 INSERT INTO lane_claims(
                     work_item_id, lane_id, claim_owner, claim_started_at,
                     claim_expires_at, claim_status, claim_evidence_path,
-                    recovery_of_claim_id
-                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+                    claimed_event_id, recovery_of_claim_id
+                ) VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
-                (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, recovery_of_claim_id),
+                (work_item_id, lane_id, claim_owner, ts, expires, evidence_path, None, recovery_of_claim_id),
             )
+            claimed_event_row = conn.execute(
+                """
+                SELECT id, created_at FROM lane_events
+                 WHERE work_item_id=?
+                   AND event_type IN ({})
+                   AND consumed_at IS NULL
+                   AND created_at <= ?
+                 ORDER BY created_at DESC, id DESC LIMIT 1
+                """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                (work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), ts),
+            ).fetchone()
+            claimed_event_id = claimed_event_row["id"] if claimed_event_row else None
+            claimed_event_created_at = claimed_event_row["created_at"] if claimed_event_row else None
+            conn.execute("UPDATE lane_claims SET claimed_event_id=? WHERE id=?", (claimed_event_id, cur.lastrowid))
             update = conn.execute(
                 """
                 UPDATE lane_work_items
-                   SET status='claimed', updated_at=?
+                   SET status='claimed',
+                       updated_at=?,
+                       blocked_event_id=CASE
+                           WHEN status='blocked' THEN last_event_id
+                           ELSE blocked_event_id
+                       END
                  WHERE work_item_id=?
                    AND status IN ('open', 'blocked')
                 """,
@@ -1766,13 +1855,27 @@ def claim_lane_work_item(
             )
             if update.rowcount != 1:
                 raise sqlite3.IntegrityError("work item claim status update failed")
-        except sqlite3.IntegrityError:
-            existing = conn.execute(
-                "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
-                (work_item_id,),
-            ).fetchone()
-            return {"claimed": False, "reason": "active_claim_exists", "active_claim": dict(existing) if existing else None}
-    return {"claimed": True, "claim_id": cur.lastrowid, "claim_expires_at": expires}
+            if claimed_event_id:
+                conn.execute(
+                    """
+                    UPDATE lane_events
+                       SET consumed_at=?
+                     WHERE work_item_id=?
+                       AND event_type IN ({})
+                       AND created_at <= ?
+                       AND consumed_at IS NULL
+                    """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                    (ts, work_item_id, *sorted(LANE_VALID_WAKE_EVENTS), claimed_event_created_at),
+                )
+    except sqlite3.IntegrityError:
+        existing = conn.execute(
+            "SELECT * FROM lane_claims WHERE work_item_id=? AND claim_status='active'",
+            (work_item_id,),
+        ).fetchone()
+        if existing is not None:
+            return _lane_claim_result(False, "ACTIVE_CLAIM_EXISTS", active_claim=dict(existing))
+        return _lane_claim_result(False, "CLAIM_TRANSACTION_FAILED")
+    return _lane_claim_result(True, "CLAIMED", claim_id=cur.lastrowid, claim_expires_at=expires, claimed_event_id=claimed_event_id)
 
 
 def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, evidence_path: str, message: Optional[str] = None, now: Optional[int] = None) -> bool:
@@ -1790,17 +1893,36 @@ def close_lane_claim(conn: sqlite3.Connection, claim_id: int, *, status: str, ev
         "expired/recovered": "open",
     }
     with write_txn(conn):
-        row = conn.execute("SELECT work_item_id FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
+        row = conn.execute("SELECT work_item_id, lane_id, claimed_event_id, claim_started_at FROM lane_claims WHERE id=? AND claim_status='active'", (claim_id,)).fetchone()
         res = conn.execute(
             "UPDATE lane_claims SET claim_status=?, claim_evidence_path=?, closed_at=?, close_message=? "
             "WHERE id=? AND claim_status='active'",
             (status, evidence_path, ts, message, claim_id),
         )
         if res.rowcount == 1 and row is not None:
-            conn.execute(
-                "UPDATE lane_work_items SET status=?, updated_at=? WHERE work_item_id=? AND status='claimed'",
-                (status_by_close[status], ts, row["work_item_id"]),
-            )
+            if status_by_close[status] == "blocked":
+                # A blocked closeout may only anchor to the immutable event
+                # captured when the claim was opened. If legacy/direct state has
+                # no claimed_event_id, keep a null baseline and use blocked_at as
+                # the closeout frontier; do not reconstruct authority from older
+                # consumed rows or backdated durable events.
+                processed_event_id = row["claimed_event_id"]
+                conn.execute(
+                    "UPDATE lane_work_items SET status=?, updated_at=?, blocked_at=?, "
+                    "blocked_event_id=? "
+                    "WHERE work_item_id=? AND status='claimed'",
+                    (status_by_close[status], ts, ts, processed_event_id, row["work_item_id"]),
+                )
+                if processed_event_id:
+                    conn.execute(
+                        "UPDATE lane_events SET consumed_at=? WHERE id=? AND consumed_at IS NULL",
+                        (ts, processed_event_id),
+                    )
+            else:
+                conn.execute(
+                    "UPDATE lane_work_items SET status=?, updated_at=? WHERE work_item_id=? AND status='claimed'",
+                    (status_by_close[status], ts, row["work_item_id"]),
+                )
     return res.rowcount == 1
 
 
@@ -1846,7 +1968,68 @@ def record_lane_event(
     now: Optional[int] = None,
 ) -> dict[str, Any]:
     ts = _now(now)
+    if event_type not in LANE_VALID_WAKE_EVENTS:
+        return {
+            "event_id": None,
+            "event_type": event_type,
+            "work_item_id": work_item_id,
+            "recorded": False,
+            "result": "INVALID_EVENT_TYPE",
+            "reason": "invalid_event_type",
+        }
     with write_txn(conn):
+        if work_item_id:
+            item = conn.execute("SELECT status, blocked_event_id, blocked_at, updated_at FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()
+            if item is None:
+                return {
+                    "event_id": None,
+                    "event_type": event_type,
+                    "work_item_id": work_item_id,
+                    "recorded": False,
+                    "result": "WORK_ITEM_NOT_FOUND",
+                    "reason": "work_item_not_found",
+                }
+            boundary_event_id = None
+            boundary_created_at = None
+            reject_equal_boundary = False
+            if item["status"] == "blocked":
+                if item["blocked_event_id"] is not None:
+                    boundary_event_id = item["blocked_event_id"]
+                    reject_equal_boundary = True
+                elif item["blocked_at"] is not None:
+                    # Null-baseline blocked closeouts record blocked_at as the
+                    # durable frontier. Older legacy blocked rows without
+                    # blocked_at predate this contract and may be reopened by
+                    # the next valid event.
+                    boundary_created_at = float(item["blocked_at"])
+                    reject_equal_boundary = True
+            elif item["status"] == "claimed":
+                claim = conn.execute("SELECT claimed_event_id, claim_started_at FROM lane_claims WHERE work_item_id=? AND claim_status='active' ORDER BY id DESC LIMIT 1", (work_item_id,)).fetchone()
+                boundary_event_id = claim["claimed_event_id"] if claim is not None else None
+                boundary_created_at = float(claim["claim_started_at"]) if claim is not None and boundary_event_id is None else None
+                reject_equal_boundary = claim is not None and boundary_event_id is None
+            if boundary_event_id is not None:
+                boundary = conn.execute("SELECT created_at FROM lane_events WHERE id=? AND work_item_id=?", (boundary_event_id, work_item_id)).fetchone()
+                if boundary is None:
+                    return {
+                        "event_id": None,
+                        "event_type": event_type,
+                        "work_item_id": work_item_id,
+                        "recorded": False,
+                        "result": "STALE_EVENT",
+                        "reason": "missing blocked event baseline",
+                    }
+                boundary_created_at = float(boundary["created_at"])
+            if boundary_created_at is not None:
+                if ts < boundary_created_at or (reject_equal_boundary and ts == boundary_created_at):
+                    return {
+                        "event_id": None,
+                        "event_type": event_type,
+                        "work_item_id": work_item_id,
+                        "recorded": False,
+                        "result": "STALE_EVENT",
+                        "reason": "event_not_newer_than_claim_or_block_baseline",
+                    }
         cur = conn.execute(
             "INSERT INTO lane_events(lane_id, event_type, work_item_id, evidence_path, created_at) VALUES (?, ?, ?, ?, ?)",
             (lane_id, event_type, work_item_id, evidence_path, ts),
@@ -1861,9 +2044,36 @@ def next_lane_wake(conn: sqlite3.Connection, lane_id: str, *, now: Optional[int]
     ts = _now(now)
     hb = _lane_row(conn, lane_id)
     last_event_id = int(hb.get("last_event_id") or 0) if hb else 0
+    event_placeholders = ",".join("?" for _ in LANE_VALID_WAKE_EVENTS)
     ev = conn.execute(
-        "SELECT * FROM lane_events WHERE (lane_id=? OR lane_id IS NULL) AND id > ? AND consumed_at IS NULL ORDER BY id LIMIT 1",
-        (lane_id, last_event_id),
+        f"""
+        SELECT e.*
+          FROM lane_events e
+          LEFT JOIN lane_work_items w ON w.work_item_id = e.work_item_id
+          LEFT JOIN lane_events b ON b.id = w.blocked_event_id AND b.work_item_id = w.work_item_id
+         WHERE (e.lane_id=? OR e.lane_id IS NULL)
+           AND (e.work_item_id IS NOT NULL OR e.id > ?)
+           AND e.consumed_at IS NULL
+           AND e.created_at <= ?
+           AND e.event_type IN ({event_placeholders})
+           AND (
+                 e.work_item_id IS NULL
+                 OR (
+                    w.work_item_id IS NOT NULL
+                    AND w.status != 'claimed'
+                    AND NOT (
+                        w.status='blocked'
+                        AND (
+                            (w.blocked_event_id IS NOT NULL
+                             AND (b.id IS NULL OR e.id = w.blocked_event_id OR e.created_at <= b.created_at))
+                            OR (w.blocked_event_id IS NULL AND w.blocked_at IS NOT NULL AND e.created_at <= w.blocked_at)
+                        )
+                    )
+                 )
+           )
+         ORDER BY e.id LIMIT 1
+        """,
+        (lane_id, last_event_id, ts, *sorted(LANE_VALID_WAKE_EVENTS)),
     ).fetchone()
     if ev is not None:
         return {"eligible_now": True, "wake_reason": f"event:{ev['event_type']}", "event_id": ev["id"]}
@@ -1890,38 +2100,127 @@ def upsert_lane_work_item(
 ) -> dict[str, Any]:
     ts = _now(now)
     with write_txn(conn):
+        wake_event_placeholders = ",".join("?" for _ in LANE_VALID_WAKE_EVENTS)
         conn.execute(
-            """
+            f"""
             INSERT INTO lane_work_items(
                 work_item_id, repo_scope, status, priority, failed_required_ci,
                 stale_open_pr, governance_blocker, review_gap, dependency_unblocked,
-                governance_state, capability, blocked_event_id, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                governance_state, capability, blocked_event_id, blocked_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(work_item_id) DO UPDATE SET
-                repo_scope=excluded.repo_scope, status=excluded.status, priority=excluded.priority,
+                repo_scope=excluded.repo_scope,
+                status=CASE
+                    WHEN lane_work_items.status='claimed'
+                     AND EXISTS (SELECT 1 FROM lane_claims WHERE work_item_id=lane_work_items.work_item_id AND claim_status='active')
+                    THEN lane_work_items.status
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NOT NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                        LEFT JOIN lane_events b ON b.id=lane_work_items.blocked_event_id AND b.work_item_id=e.work_item_id
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
+                           AND b.id IS NOT NULL
+                           AND e.created_at > b.created_at
+                     )
+                    THEN lane_work_items.status
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
+                           AND (lane_work_items.blocked_at IS NULL OR e.created_at > lane_work_items.blocked_at)
+                     )
+                    THEN lane_work_items.status
+                    ELSE excluded.status
+                END,
+                priority=excluded.priority,
                 failed_required_ci=excluded.failed_required_ci, stale_open_pr=excluded.stale_open_pr,
                 governance_blocker=excluded.governance_blocker, review_gap=excluded.review_gap,
                 dependency_unblocked=excluded.dependency_unblocked, governance_state=excluded.governance_state,
-                capability=excluded.capability, blocked_event_id=excluded.blocked_event_id, updated_at=excluded.updated_at
+                capability=excluded.capability,
+                blocked_event_id=COALESCE(excluded.blocked_event_id, lane_work_items.blocked_event_id),
+                blocked_at=CASE
+                    WHEN lane_work_items.status='blocked' THEN lane_work_items.blocked_at
+                    WHEN excluded.status='blocked' THEN COALESCE(excluded.blocked_at, excluded.updated_at)
+                    ELSE excluded.blocked_at
+                END,
+                updated_at=CASE
+                    WHEN lane_work_items.status='claimed'
+                     AND EXISTS (SELECT 1 FROM lane_claims WHERE work_item_id=lane_work_items.work_item_id AND claim_status='active')
+                    THEN lane_work_items.updated_at
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NOT NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                        LEFT JOIN lane_events b ON b.id=lane_work_items.blocked_event_id AND b.work_item_id=e.work_item_id
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
+                           AND b.id IS NOT NULL
+                           AND e.created_at > b.created_at
+                     )
+                    THEN lane_work_items.updated_at
+                    WHEN lane_work_items.status='blocked'
+                     AND lane_work_items.blocked_event_id IS NULL
+                     AND NOT EXISTS (
+                        SELECT 1 FROM lane_events e
+                         WHERE e.work_item_id=lane_work_items.work_item_id
+                           AND e.consumed_at IS NULL
+                           AND e.event_type IN ({wake_event_placeholders})
+                           AND e.created_at <= excluded.updated_at
+                           AND (lane_work_items.blocked_at IS NULL OR e.created_at > lane_work_items.blocked_at)
+                     )
+                    THEN lane_work_items.updated_at
+                    ELSE excluded.updated_at
+                END
             """,
             (work_item_id, repo_scope, status, int(priority), int(failed_required_ci), int(stale_open_pr),
              int(governance_blocker), int(review_gap), int(dependency_unblocked), governance_state,
-             capability, blocked_event_id, ts, ts),
+             capability, blocked_event_id, None, ts, ts, *sorted(LANE_VALID_WAKE_EVENTS), *sorted(LANE_VALID_WAKE_EVENTS),
+             *sorted(LANE_VALID_WAKE_EVENTS), *sorted(LANE_VALID_WAKE_EVENTS)),
         )
     return _dict(conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (work_item_id,)).fetchone()) or {}
 
 
-def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capabilities: Optional[Iterable[str]], conn: sqlite3.Connection) -> bool:
+def _work_item_pickable(row: sqlite3.Row, authorized_scopes: Iterable[str], capabilities: Optional[Iterable[str]], conn: sqlite3.Connection, *, now: Optional[int] = None) -> bool:
     if row["repo_scope"] not in set(authorized_scopes):
         return False
     if capabilities is not None and row["capability"] and row["capability"] not in set(capabilities):
         return False
     if row["governance_state"] in LANE_GOVERNANCE_HOLDS:
         return False
+    ts = _now(now)
     if row["status"] == "blocked":
         # Blocked work becomes eligible only after a new event beyond the event
         # that originally caused/recorded the block.
-        if not (row["last_event_id"] and (row["blocked_event_id"] is None or row["last_event_id"] != row["blocked_event_id"])):
+        if row["blocked_event_id"] is None:
+            newer = conn.execute(
+                "SELECT 1 FROM lane_events WHERE work_item_id=? AND consumed_at IS NULL AND event_type IN ({}) AND created_at <= ? AND (? IS NULL OR created_at > ?) LIMIT 1".format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                (row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), ts, row["blocked_at"], row["blocked_at"]),
+            ).fetchone()
+        else:
+            newer = conn.execute(
+                """
+                SELECT 1 FROM lane_events e
+                LEFT JOIN lane_events b ON b.id=? AND b.work_item_id=e.work_item_id
+                 WHERE e.work_item_id=?
+                   AND e.consumed_at IS NULL
+                   AND e.event_type IN ({})
+                   AND e.created_at <= ?
+                   AND ((b.id IS NOT NULL AND e.created_at > b.created_at))
+                 LIMIT 1
+                """.format(",".join("?" for _ in LANE_VALID_WAKE_EVENTS)),
+                (row["blocked_event_id"], row["work_item_id"], *sorted(LANE_VALID_WAKE_EVENTS), ts),
+            ).fetchone()
+        if newer is None:
             return False
     if conn.execute("SELECT 1 FROM lane_claims WHERE work_item_id=? AND claim_status='active'", (row["work_item_id"],)).fetchone():
         return False
@@ -1950,14 +2249,24 @@ def pickup_next_lane_work(
         """
     ).fetchall()
     for row in rows:
-        if not _work_item_pickable(row, authorized_scopes, capabilities, conn):
+        if not _work_item_pickable(row, authorized_scopes, capabilities, conn, now=ts):
             continue
         evidence = evidence_path or f"lane-claims/{lane_id}/{row['work_item_id']}-{ts}.json"
         claim = claim_lane_work_item(conn, row["work_item_id"], lane_id=lane_id, claim_owner=agent_session_id, ttl_seconds=ttl_seconds, evidence_path=evidence, now=ts)
         if claim.get("claimed"):
-            conn.execute("UPDATE lane_work_items SET status='claimed', updated_at=? WHERE work_item_id=?", (ts, row["work_item_id"]))
-            hb = record_lane_heartbeat(conn, lane_id=lane_id, agent_session_id=agent_session_id, repo_scope=row["repo_scope"], state="working", claimed_work_item_id=row["work_item_id"], evidence_path=evidence, now=ts)
-            item = dict(row)
+            event_id = claim.get("claimed_event_id")
+            hb = record_lane_heartbeat(
+                conn,
+                lane_id=lane_id,
+                agent_session_id=agent_session_id,
+                repo_scope=row["repo_scope"],
+                state="working",
+                claimed_work_item_id=row["work_item_id"],
+                evidence_path=evidence,
+                last_event_id=event_id,
+                now=ts,
+            )
+            item = _dict(conn.execute("SELECT * FROM lane_work_items WHERE work_item_id=?", (row["work_item_id"],)).fetchone()) or dict(row)
             item.update({"claim": claim, "heartbeat": hb})
             return item
     record_lane_heartbeat(conn, lane_id=lane_id, agent_session_id=agent_session_id, repo_scope=authorized_scopes[0] if authorized_scopes else "", state="idle-no-work", now=ts)
