@@ -78,4 +78,6 @@ qwen --bare --approval-mode yolo \
 8. If the target PR already merged, rerun a small aftercare checkpoint from current `origin/main` instead of reopening implementation scope.
 9. If the user says to make the fix “land in org CI merge,” do not leave it as local config/memory only. Convert the durable lesson into a repo-bundled skill/library update, open a PR, satisfy classifier-required CI/review lanes, merge under policy, and verify the artifact from `origin/main`.
 
+Reference: `references/qwen-watchdog-display-evidence.md` captures the pattern for adding Qwen visibility to founder/watchdog status reports without inflating Codex/Sonnet build-lane counts: report Qwen separately from process-backed controller/conductor evidence, and keep product/CI readiness non-claims explicit.
+
 Non-claims: a successful Qwen aftercare run or merged runbook is not deployment, live, accepted, landed, or product-outcome evidence unless those receipts are independently verified.
