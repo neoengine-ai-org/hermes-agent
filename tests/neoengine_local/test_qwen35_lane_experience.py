@@ -578,7 +578,7 @@ def test_post_run_productive_diff_requires_claimed_files_match_observed_diff(tmp
     result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
 
     assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
-    assert "PRODUCTIVE_DIFF_WITH_EVIDENCE changed_files do not match independently observed diff files" in result["blockers"]
+    assert "dirty worktree status blocks positive verifier outcome" in result["blockers"]
 
 
 def test_post_run_productive_diff_rejects_uncommitted_diff_even_when_claimed_files_match(tmp_path: Path) -> None:
@@ -599,5 +599,31 @@ def test_post_run_productive_diff_rejects_uncommitted_diff_even_when_claimed_fil
     result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
 
     assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
-    assert "PRODUCTIVE_DIFF_WITH_EVIDENCE has uncommitted diff evidence but lacks matching HEAD commit proof" in result["blockers"]
+    assert "dirty worktree status blocks positive verifier outcome" in result["blockers"]
     assert result["git_diff_files"] == ["actual.py"]
+
+
+
+def test_post_run_productive_commit_proof_rejects_dirty_untracked_worktree(tmp_path: Path) -> None:
+    receipt = tmp_path / "completion.json"
+    receipt.write_text(json.dumps({"terminal_status": "PRODUCTIVE_DIFF_WITH_EVIDENCE", "commit_sha": "abc123"}))
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "status"]:
+            return 0, "?? stray.txt", ""
+        if command[:2] == ["git", "diff"]:
+            return 0, "", ""
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc123", ""
+        if command[:2] == ["git", "cat-file"]:
+            return 0, "", ""
+        if command[:2] == ["git", "show"]:
+            return 0, "abc123 message\nactual.py", ""
+        if command[:2] == ["git", "diff-tree"]:
+            return 0, "actual.py\n", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
+
+    assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
+    assert "dirty worktree status blocks positive verifier outcome" in result["blockers"]

@@ -483,6 +483,8 @@ def verify_post_run(
         blockers.append("tests_run claimed without test_results")
     if _completion_text_exceeds_non_claims(completion):
         blockers.append("completion text may exceed non-claim ceiling")
+    if git_status.strip() and terminal in {"PRODUCTIVE_DIFF_WITH_EVIDENCE", "NO_CHANGE_WITH_EVIDENCE"}:
+        blockers.append("dirty worktree status blocks positive verifier outcome")
 
     if terminal == "FAILED_TOOLING_OR_CONTEXT":
         verdict = "VERIFIED_TOOLING_OR_CONTEXT_FAILURE"
