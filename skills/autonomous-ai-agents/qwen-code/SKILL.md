@@ -72,6 +72,7 @@ qwen --bare --approval-mode yolo \
 ```
 
 5. Verify tool execution, not just exit code: make the lane create or edit a harmless sentinel file and read it back. Qwen may still print stale warnings that mention `-y`, so the file/readback is the authority.
+   Use the bundled preflight before headless lanes when available: `scripts/qwen_headless_tool_preflight.sh`.
 6. If native file tools still do not produce the expected artifact under `--approval-mode yolo`, instruct the run to use `run_shell_command` only and avoid native `glob` / `list_directory`.
 7. Bound reruns with `--max-wall-time` and `--max-tool-calls`; do not leave an unbounded agent lane running.
 8. If the target PR already merged, rerun a small aftercare checkpoint from current `origin/main` instead of reopening implementation scope.
