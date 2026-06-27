@@ -1,0 +1,2370 @@
+{
+  "generated_at": "2026-06-27T15:03:58.716459+00:00",
+  "scores": {
+    "operational": 8.9,
+    "technical": 8.7,
+    "convergence_discipline": 8.8
+  },
+  "repos": {
+    "neoengine-ai-org/neoengine": {
+      "open_active_prs": [
+        632,
+        689,
+        705,
+        709,
+        710,
+        717,
+        722,
+        725,
+        726,
+        729,
+        744,
+        746,
+        747,
+        748,
+        752
+      ],
+      "merged_last_48h": [
+        {
+          "number": 750,
+          "title": "OCR-001 live runtime supervisor wiring",
+          "merged_at": "2026-06-26T21:57:57Z",
+          "head_sha": "42dedcc37f58877e4742de2f05da40e894839e93"
+        },
+        {
+          "number": 749,
+          "title": "OCR-001 full runtime auto-merge policy",
+          "merged_at": "2026-06-26T20:33:50Z",
+          "head_sha": "0d7fd7bd7d91e30c27148e33ce5f15406aa68f15"
+        },
+        {
+          "number": 745,
+          "title": "test(host): close engine function-coverage gate with real hook tests",
+          "merged_at": "2026-06-26T16:02:24Z",
+          "head_sha": "390020e2ff5ee985f076b7e4666aa939d2d4c73f"
+        },
+        {
+          "number": 743,
+          "title": "feat(host): Objective Convergence operator surface (OCR-001 \u00a715)",
+          "merged_at": "2026-06-26T15:31:35Z",
+          "head_sha": "d4a5801412a7edbb6885beeed3f1e87205a6a4c8"
+        },
+        {
+          "number": 742,
+          "title": "fix(host): regenerate host-v1 OpenAPI spec to clear drift gate",
+          "merged_at": "2026-06-26T15:21:59Z",
+          "head_sha": "b3856740fcbae9e12e57a3b77aaf8dc0e6f215e5"
+        },
+        {
+          "number": 741,
+          "title": "feat(roadmap-os-web): Roadmap OS founder board (React+Vite) + Priority/Dispatch third-tab fold",
+          "merged_at": "2026-06-26T16:59:28Z",
+          "head_sha": "122791316332d942a8d14d425fcf236c5a3c4d5e"
+        },
+        {
+          "number": 740,
+          "title": "feat(ocr-001): \u00a720 staged rollout / canary admission gate (Stage 1)",
+          "merged_at": "2026-06-26T18:19:40Z",
+          "head_sha": "a862df6ecbf50a75c934f08c07d9403696262241"
+        },
+        {
+          "number": 739,
+          "title": "feat(ocr-001): PR E \u2014 governed Hermes worker adapter + continuity monitor (do not merge)",
+          "merged_at": "2026-06-26T17:13:25Z",
+          "head_sha": "162d537112c9b201f37cccb14b121f492ade9fa9"
+        },
+        {
+          "number": 738,
+          "title": "feat(ocr-001): PR F \u2014 cross-org execution profiles + metrics (do not merge)",
+          "merged_at": "2026-06-26T18:02:26Z",
+          "head_sha": "ba43cae8d076e3f886fa1d54dd1e149f11acced4"
+        },
+        {
+          "number": 737,
+          "title": "feat(ocr-001): PR D \u2014 human-gate continuation + completion\u2192acceptance + role boundary (do not merge)",
+          "merged_at": "2026-06-26T16:41:06Z",
+          "head_sha": "421108d5dc5ae89fc730f00025b3d9a3f3a0974a"
+        },
+        {
+          "number": 736,
+          "title": "feat(ocr-001): PR B \u2014 shared execution adapters + claim-to-executor-start + e2e proof (do not merge)",
+          "merged_at": "2026-06-26T15:57:02Z",
+          "head_sha": "b6fa272cc8a7e9f686ef6963e62ff288ea4fcfa8"
+        },
+        {
+          "number": 735,
+          "title": "feat(ocr-001): Objective Convergence Runtime \u2014 PR A foundation (shadow-only, do not merge)",
+          "merged_at": "2026-06-26T15:03:50Z",
+          "head_sha": "0569576efc34d822d9ed52cc302040229d18d653"
+        },
+        {
+          "number": 734,
+          "title": "Retire Mac Docker Linux CI pool",
+          "merged_at": "2026-06-25T17:10:51Z",
+          "head_sha": "22e767cc307fbe30a0d4e3d8a7ca4ce0027ff78e"
+        },
+        {
+          "number": 733,
+          "title": "fix(hermes): route request-review handoff feedback safely",
+          "merged_at": "2026-06-25T14:05:00Z",
+          "head_sha": "08072c577d364f060ec606633d3996c9d87c14a2"
+        },
+        {
+          "number": 732,
+          "title": "[codex] enforce developer lane frontier escalation",
+          "merged_at": "2026-06-25T08:09:29Z",
+          "head_sha": "4bac66a3bf2f24588761eb99cc94ef32636fde14"
+        },
+        {
+          "number": 731,
+          "title": "[codex] add Hermes gateway health watch timers",
+          "merged_at": "2026-06-25T04:14:51Z",
+          "head_sha": "3cced82e91d7672429f226f26deedcf9984c609c"
+        },
+        {
+          "number": 730,
+          "title": "fix(review): distinguish missing primary alias from unresolvable alias",
+          "merged_at": "2026-06-25T14:21:19Z",
+          "head_sha": "bcae4d3bb073af15d423137e83fb54a686874430"
+        },
+        {
+          "number": 728,
+          "title": "feat(roadmap-os): fail-close accepted delivery proofs",
+          "merged_at": "2026-06-25T14:31:34Z",
+          "head_sha": "ce700d314138e9e1799fe7cc8ce4a2cfeda45d20"
+        },
+        {
+          "number": 716,
+          "title": "docs(ggb): tighten T-GGB-005-B1 control-plane posture",
+          "merged_at": "2026-06-25T03:39:42Z",
+          "head_sha": "a8d0c5940f2f394d6243bc6a376418d22de81ae8"
+        },
+        {
+          "number": 711,
+          "title": "fix(ci): fail closed at exactly the 3000-file PR Files API cap (pr-changed-files.ts)",
+          "merged_at": "2026-06-25T03:37:44Z",
+          "head_sha": "a3608994deb5b3a1490dcc2187bac602e7c5efc7"
+        }
+      ],
+      "blocked": [
+        632,
+        705,
+        709,
+        710,
+        717,
+        752
+      ],
+      "ready": [
+        689,
+        722,
+        725,
+        726,
+        729,
+        744,
+        746,
+        747,
+        748
+      ],
+      "top_risk": "OCR live supervisor PR #752 has current-head required classifier red; many older CI/governance PRs conflict/overlap."
+    },
+    "neoengine-ai-org/neowealth": {
+      "open_active_prs": [
+        613,
+        625,
+        649,
+        651
+      ],
+      "merged_last_48h": [
+        {
+          "number": 650,
+          "title": "fix(backend): register /api/workbook/net-worth in route catalog + engine-error mapper",
+          "merged_at": "2026-06-26T21:07:08Z",
+          "head_sha": "8a74434ca428f4ff68a07f361a8bf52d10fba78e"
+        },
+        {
+          "number": 648,
+          "title": "Lane B: Net Worth live render island",
+          "merged_at": "2026-06-26T19:44:32Z",
+          "head_sha": "6c08afff77aabf21f8bcb3d0cd8d65dd39244d16"
+        },
+        {
+          "number": 647,
+          "title": "Lane B: workbook net worth backend route",
+          "merged_at": "2026-06-26T13:45:52Z",
+          "head_sha": "37b013649c7427e7d2398ceada82c8c2b789ffbc"
+        },
+        {
+          "number": 646,
+          "title": "Lane B: backend net worth durable route extraction",
+          "merged_at": "2026-06-26T13:38:41Z",
+          "head_sha": "f3cd86f673c46608d62d73e91334d22c03c0bd60"
+        },
+        {
+          "number": 645,
+          "title": "feat(everarc): extract net-worth runtime client kernel",
+          "merged_at": "2026-06-25T04:13:54Z",
+          "head_sha": "ecc927e1d634d609db61d3bbee08505a70b68877"
+        },
+        {
+          "number": 644,
+          "title": "Guard NeoWealth provider canary Homebrew dylib drift",
+          "merged_at": "2026-06-25T04:07:25Z",
+          "head_sha": "3696c8a249db95d44eb0caabbb7cf32699f767b7"
+        },
+        {
+          "number": 643,
+          "title": "feat(workbook): Lane B PR-first net-worth durable slice extraction",
+          "merged_at": "2026-06-25T03:37:31Z",
+          "head_sha": "e13566bd08828edce225ad0cfbdad58c7c0cbd5d"
+        },
+        {
+          "number": 636,
+          "title": "fix(books): exact scale-10000 BigInt DR=CR balance, no float tolerance (W6)",
+          "merged_at": "2026-06-25T03:31:39Z",
+          "head_sha": "73709dcae0421bc90313c3d48fdf865d8a30e7f7"
+        }
+      ],
+      "blocked": [
+        613,
+        625,
+        649,
+        651
+      ],
+      "ready": [],
+      "top_risk": "Net Worth train has clear backend #651 + UI #649 but both conflict and classifier body gates are red; drafts #625/#613 remain reference-only overlap."
+    },
+    "neoengine-ai-org/hermes-agent": {
+      "open_active_prs": [
+        37,
+        39
+      ],
+      "merged_last_48h": [
+        {
+          "number": 52,
+          "title": "feat(qwen35): add governed assistant controls",
+          "merged_at": "2026-06-27T14:55:52Z",
+          "head_sha": "b25c3bf286949a6644552ceec9c7b8582b85cdda"
+        },
+        {
+          "number": 51,
+          "title": "Show Qwen lanes in NeoEngine watchdog",
+          "merged_at": "2026-06-27T14:38:06Z",
+          "head_sha": "578c6af050f60a457bdd4705f1206580a791472a"
+        },
+        {
+          "number": 50,
+          "title": "docs(qwen): document watchdog display evidence",
+          "merged_at": "2026-06-27T14:33:34Z",
+          "head_sha": "68c51bf71d56117016b6c83ad1584f5cb4860dd2"
+        },
+        {
+          "number": 49,
+          "title": "Guard Qwen headless preflight artifact",
+          "merged_at": "2026-06-27T02:18:34Z",
+          "head_sha": "39215e259230c608793e0de1efd4da7ef7da0e66"
+        },
+        {
+          "number": 48,
+          "title": "Guard Qwen headless approval-mode contract",
+          "merged_at": "2026-06-27T02:02:46Z",
+          "head_sha": "88f110053e97ab3ff990edcce74357035ef82201"
+        },
+        {
+          "number": 47,
+          "title": "Document Qwen approval-mode yolo tool execution",
+          "merged_at": "2026-06-27T01:41:50Z",
+          "head_sha": "6981d24a518ed05e4f3cd1b96b72064d02280611"
+        },
+        {
+          "number": 46,
+          "title": "Add Qwen Code headless lane skill",
+          "merged_at": "2026-06-27T00:30:53Z",
+          "head_sha": "798623d8c772c81edf3bba4381e6114c26f78ec7"
+        },
+        {
+          "number": 45,
+          "title": "feat(qwen35): harden candidate lane experience",
+          "merged_at": "2026-06-27T04:06:39Z",
+          "head_sha": "8d049fc8902e228788e05b494975304d12d96e30"
+        },
+        {
+          "number": 44,
+          "title": "Complete all-org evidence fabric control loop",
+          "merged_at": "2026-06-26T21:51:28Z",
+          "head_sha": "03368d54c795c387a3b0129435ab7c0caf0e60b5"
+        },
+        {
+          "number": 43,
+          "title": "Wire all-org evidence fabric projections",
+          "merged_at": "2026-06-26T18:17:54Z",
+          "head_sha": "624f9104accab00cbd6379a825011f8490a07aca"
+        },
+        {
+          "number": 42,
+          "title": "Harden cron observability collector",
+          "merged_at": "2026-06-26T18:23:33Z",
+          "head_sha": "a8fa75aa6977887a09df98dc746be78d0f774254"
+        },
+        {
+          "number": 41,
+          "title": "Codify NeoWealth watchdog runtime repair",
+          "merged_at": "2026-06-26T17:20:02Z",
+          "head_sha": "458a0b54ce8a0859f91d16807530ca8978beeb1d"
+        },
+        {
+          "number": 40,
+          "title": "Add org verified evidence fabric",
+          "merged_at": "2026-06-26T17:56:29Z",
+          "head_sha": "fa63cd1d9c879568283932bcaefd33f5e6339bec"
+        },
+        {
+          "number": 38,
+          "title": "Guard provider canary Homebrew dylib drift",
+          "merged_at": "2026-06-25T03:56:15Z",
+          "head_sha": "2cdb33854cfb3f2f3d9f47c1fcb8c6e554470a73"
+        }
+      ],
+      "blocked": [
+        39
+      ],
+      "ready": [
+        37
+      ],
+      "top_risk": "Qwen watchdog work largely merged, but #39 has required test failure and protected classifier gate."
+    },
+    "neoengine-ai-org/ai-org": {
+      "open_active_prs": [
+        157,
+        163,
+        179,
+        181,
+        182,
+        185,
+        186
+      ],
+      "merged_last_48h": [
+        {
+          "number": 187,
+          "title": "feat(ocr-001): PR C \u2014 Roadmap runtime materializer + 3-level outcome taxonomy (do not merge)",
+          "merged_at": "2026-06-26T14:17:35Z",
+          "head_sha": "50918a3070cd5c9e70a46516d52564d7d5eca772"
+        }
+      ],
+      "blocked": [
+        179,
+        185,
+        186
+      ],
+      "ready": [
+        157,
+        163,
+        181,
+        182
+      ],
+      "top_risk": "Qwen movement semantics PR #182 is green but unmerged/human-gated; draft follow-ups must not count as movement."
+    }
+  },
+  "prs": [
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 632,
+      "title": "TB2-007: session-class-attribution",
+      "state": "BLOCKED_BY_OVERLAP",
+      "current_head_sha": "c12cf2b645d1ce1d1aecfd16470b728cca595df7",
+      "base_sha": "1c9d423fd5a1ccc654d2c3b33a9ceb45a922243d",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 39,
+      "additions": 2303,
+      "deletions": 78,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28028280510/job/83125110089"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28028281081/job/82961706821"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28028280420/job/82961703933"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:1, cancel:4",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "conflicting",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "branch conflicts with current main or overlap train",
+      "next_actor": "PR author/agent",
+      "next_action": "rebase_behind_dependency or close_as_superseded",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "rebase_behind_dependency",
+      "files": [
+        ".neo/runs/TB2-007-20260611-2239.yaml",
+        "cockpit/package.json",
+        "cockpit/src/app/api/host/v1/burn/route.ts",
+        "cockpit/src/lib/host-v1/SOURCE_HASH.txt",
+        "cockpit/src/lib/host-v1/__tests__/routes.test.ts",
+        "cockpit/src/lib/host-v1/__tests__/session-class-burn.test.ts",
+        "cockpit/src/lib/host-v1/contracts.ts",
+        "cockpit/src/lib/host-v1/schemas.ts",
+        "cockpit/src/lib/host-v1/session-class-burn.ts",
+        "deploy/smoke-startup.sh",
+        "docs/decisions/deltas/2026-06-12-tb2-rt-3.md",
+        "host/docs/contracts/host-v1.openapi.json",
+        "host/src/components/tokenburn/SessionClassSplit.tsx",
+        "host/src/components/tokenburn/__tests__/tokenburn-components.test.tsx",
+        "host/src/data/__dev__/burn.ts",
+        "host/src/lib/engine/__fixtures__/burn.NEO.json",
+        "host/src/lib/engine/contracts.ts",
+        "host/src/pages/TokenBurn.tsx",
+        "host/src/pages/__tests__/TokenBurn.test.tsx",
+        "neoengine-operating-manual/agents/human-gates.mdx",
+        "neoengine-operating-manual/architecture/human-gates-and-permissions.mdx",
+        "neoengine-operating-manual/decision-doctrine/approval-authority.mdx",
+        "neoengine-operating-manual/decision-doctrine/canon-vs-proposed.mdx",
+        "neoengine-operating-manual/decision-doctrine/overview.mdx",
+        "neoengine-operating-manual/decisions/decision-deltas.mdx",
+        "neoengine-operating-manual/decisions/decision-register.mdx",
+        "neoengine-operating-manual/decisions/open-decisions.mdx",
+        "neoengine-operating-manual/gates/docs-gate.mdx",
+        "packages/contracts/src/ai-stack.ts",
+        "sql/ddl/167_llm_call_attribution_session_class.sql",
+        "src/agentos/__tests__/pr-impact-classifier.test.ts",
+        "src/agentos/policy/pr-impact-classifier.ts",
+        "src/ai-control/__tests__/burn-attribution.test.ts",
+        "src/ai-control/burn-attribution.ts",
+        "src/execution/__tests__/trace-collector.tenant-id.test.ts",
+        "src/execution/trace-collector.ts",
+        "src/llm/__tests__/llm-cache-coalescer-attribution-guards.test.ts",
+        "src/llm/attribution-context.ts",
+        "src/llm/token-tracker.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 689,
+      "title": "feat(neowealth): automate backend propagation control plane",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "e126b112339f9f3f24c0218ee81e5a9856ad762e",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 104,
+      "additions": 14472,
+      "deletions": 75,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28292638691/job/83827144809"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28292638661/job/83827144804"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28292638647/job/83827144725"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:13",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        ".github/workflows/neowealth-propagation-advisory.yml",
+        "config/product-orgs.registry.json",
+        "docs/evidence/backend-preflight-latest.json",
+        "docs/evidence/backend-preflight-latest.md",
+        "docs/evidence/neowealth-canon-propagation-latest.json",
+        "docs/evidence/neowealth-canon-propagation-latest.md",
+        "docs/evidence/neowealth-propagation-status-latest.json",
+        "docs/evidence/neowealth-propagation-status-latest.md",
+        "docs/evidence/neowealth-required-adoption-latest.json",
+        "docs/evidence/neowealth-required-adoption-latest.md",
+        "docs/evidence/neowealth-root-resolution-latest.json",
+        "docs/evidence/neowealth-root-resolution-latest.md",
+        "docs/evidence/orgfeedback-ingest-latest.json",
+        "docs/evidence/orgfeedback-ingest-latest.md",
+        "docs/evidence/orgfeedback-ingest-receipt-latest.json",
+        "docs/evidence/orgfeedback-ingest-receipt-latest.md",
+        "docs/evidence/reinforcement-readiness-latest.json",
+        "docs/evidence/reinforcement-readiness-latest.md",
+        "docs/evidence/routine-ledger-latest.json",
+        "docs/evidence/routine-ledger-latest.md",
+        "docs/evidence/shared-skill-binding-latest.json",
+        "docs/evidence/shared-skill-binding-latest.md",
+        "docs/plans/backend-propagation-10x-audit-2026-06-20.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/BOARD_DIGEST.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/COCKPIT_VISIBILITY.json",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/DRIFT.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/EXECUTION_LANE.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/KNOWLEDGE_VAULT_DELTA.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/PATTERNS.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/PEOS_STAGE_STATUS.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/QA_LANE.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/RELEASE_LANE.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/RESEARCH_LANE.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/ROLE_DISPATCH_INDEX.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/ROUTINE_HEARTBEAT.md",
+        "docs/plans/epochs/XR-WORK-ORCH-M1-B1-EXEC-DISPATCH-RUNTIME-PROOF-001/TRACE.md",
+        "docs/test-inventory.json",
+        "neoengine-operating-manual/agents/agent-registry.mdx",
+        "neoengine-operating-manual/agents/human-gates.mdx",
+        "neoengine-operating-manual/agents/permissions.mdx"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 705,
+      "title": "fix(ci): fail closed on shallow-clone abort in three policy gates",
+      "state": "BLOCKED_BY_OVERLAP",
+      "current_head_sha": "3b442730f8012580f8ea57b942ee9a8cb81ea8a6",
+      "base_sha": "7be1bb24c93ea2d458bc911a72da2e92409a0ddb",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 8,
+      "additions": 542,
+      "deletions": 34,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/27989260617/job/82837887069"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/27989260600/job/82837887097"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/27989260646/job/82837887348"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "cancel:3, pass:4",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "conflicting",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "branch conflicts with current main or overlap train",
+      "next_actor": "PR author/agent",
+      "next_action": "rebase_behind_dependency or close_as_superseded",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "rebase_behind_dependency",
+      "files": [
+        ".github/workflows/ci.yml",
+        ".github/workflows/org-enablement-rails.yml",
+        "scripts/__tests__/assert-no-tmp-worktree-instructions.test.sh",
+        "scripts/__tests__/pr-authority-gate.test.ts",
+        "scripts/ci/assert-no-tmp-worktree-instructions.sh",
+        "scripts/ci/assert-pr-authority-gate.ts",
+        "scripts/generated/__tests__/check-generated-boundaries.test.ts",
+        "scripts/generated/check-generated-boundaries.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 709,
+      "title": "ci(governance): convert assert-pr-authority-gate fail-OPEN to fail-CLOSED (Site 2 \u2014 PARKED, protected human + security review required)",
+      "state": "BLOCKED_BY_OVERLAP",
+      "current_head_sha": "f89d89ae9a89fb58e9a476cb69c3775e3fe127b0",
+      "base_sha": "c815e72c6cd739a3b737d21a87e4bb2fd219a764",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 8,
+      "additions": 353,
+      "deletions": 63,
+      "required_checks": [],
+      "required_check_status": "UNKNOWN_NEEDS_FETCH: no checks reported on the 'ci/fail-open-policy-bypass-B' branch",
+      "advisory_checks": [],
+      "advisory_check_status": "UNKNOWN",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "conflicting",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "branch conflicts with current main or overlap train",
+      "next_actor": "PR author/agent",
+      "next_action": "rebase_behind_dependency or close_as_superseded",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "rebase_behind_dependency",
+      "files": [
+        ".github/workflows/neoengine-governance-required.yml",
+        "docs/test-inventory.json",
+        "package.json",
+        "scripts/__tests__/pr-authority-gate.test.ts",
+        "scripts/ci/__tests__/pr-changed-files.test.ts",
+        "scripts/ci/assert-pr-authority-gate.ts",
+        "scripts/ci/pr-changed-files.ts",
+        "src/agentos/__tests__/pr-impact-classifier.test.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 710,
+      "title": "fix(ci): fail closed on shallow-clone changed-files abort in remaining gates",
+      "state": "BLOCKED_BY_OVERLAP",
+      "current_head_sha": "bef7d8c781c5d212d6f2f803c128a47d428e7b1b",
+      "base_sha": "32fd8bdb2ae078fba133f94411175ab97971bf2e",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 12,
+      "additions": 885,
+      "deletions": 59,
+      "required_checks": [
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/27989584022/job/82845598668"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/27989584038/job/82845594244"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/27989584024/job/82840317237"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (ui-quality-gate=pass, neoengine-governance-required=pass, backend=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:4, cancel:4",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "conflicting",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "branch conflicts with current main or overlap train",
+      "next_actor": "PR author/agent",
+      "next_action": "rebase_behind_dependency or close_as_superseded",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "rebase_behind_dependency",
+      "files": [
+        ".github/workflows/neoengine-governance-required.yml",
+        ".github/workflows/pr-risk-classifier.yml",
+        "docs/test-inventory.json",
+        "package.json",
+        "scripts/__tests__/control-plane-archive-guard.test.sh",
+        "scripts/__tests__/ne-docs-impact-changed-files.test.ts",
+        "scripts/__tests__/org-rails-lib-tracked-fail-closed.test.ts",
+        "scripts/ci/__tests__/test_pr_risk_classifier_changed_files.py",
+        "scripts/ci/control-plane-archive-guard.sh",
+        "scripts/ci/pr_risk_classifier.py",
+        "scripts/ne-docs-impact",
+        "scripts/org-rails-lib.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 717,
+      "title": "docs(ggb): refresh T-GGB-005-B1 CTO decomposition packet",
+      "state": "BLOCKED_BY_OVERLAP",
+      "current_head_sha": "6cd3972853b3cd25f68d6e47de6b5ea542aa78a7",
+      "base_sha": "553b612687a5fa133a3ac6d79be6f808686c6287",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 12,
+      "additions": 717,
+      "deletions": 31,
+      "required_checks": [
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28145177114/job/83350760272"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28145177104/job/83350760150"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28145177111/job/83350760222"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (neoengine-governance-required=pass, backend=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:4",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "conflicting",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "branch conflicts with current main or overlap train",
+      "next_actor": "PR author/agent",
+      "next_action": "rebase_behind_dependency or close_as_superseded",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "rebase_behind_dependency",
+      "files": [
+        "docs/reviews/gstack-gbrain/2026-06-22-t-ggb-005-b1-claude-rescue-live-state-audit.md",
+        "docs/reviews/gstack-gbrain/2026-06-22-t-ggb-005-b1-control-plane-posture-tightening.md",
+        "docs/reviews/gstack-gbrain/2026-06-23-t-ggb-005-b1-claude-opposite-provider-refresh.md",
+        "docs/reviews/gstack-gbrain/2026-06-23-t-ggb-005-b1-codex-live-refresh-handoff.md",
+        "neoengine-operating-manual/playbooks/docs-update-playbook.mdx",
+        "neoengine-operating-manual/playbooks/pr-review-playbook.mdx",
+        "neoengine-operating-manual/reference/cli.mdx",
+        "neoengine-operating-manual/reference/pr-docs-gate.mdx",
+        "roadmap/cto-product-roadmap-packets/T-GGB-005-B1.json",
+        "roadmap/roadmap-command-prd.json",
+        "roadmap/ticket-queue-projection.json",
+        "roadmap/work-orchestration-model.json"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 722,
+      "title": "feat(roadmap-os): vNext Wave 1 \u2014 invariant engine + flow truth + Packet Passport (W1.1\u2013W1.7)",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "37708e4b42be475462a7ec053bda37250f7a6387",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 19,
+      "additions": 1359,
+      "deletions": 33,
+      "required_checks": [
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28292586454/job/83827012591"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28292586461/job/83827012474"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28292586464/job/83827012579"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (ui-quality-gate=pass, backend=pass, neoengine-governance-required=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:5, cancel:5",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "cockpit/src/lib/host-v1/SOURCE_HASH.txt",
+        "cockpit/src/lib/host-v1/contracts.ts",
+        "cockpit/src/lib/host-v1/empties.ts",
+        "cockpit/src/lib/host-v1/schemas.ts",
+        "docs/test-inventory.json",
+        "host/public/roadmap-os.html",
+        "host/public/roadmap-os.js",
+        "host/src/lib/engine/contracts.ts",
+        "package.json",
+        "src/roadmap-os/__tests__/flow-state.test.ts",
+        "src/roadmap-os/__tests__/invariants.test.ts",
+        "src/roadmap-os/__tests__/promotion-reducer-integration.test.ts",
+        "src/roadmap-os/__tests__/promotion-translator.test.ts",
+        "src/roadmap-os/__tests__/promotion.test.ts",
+        "src/roadmap-os/__tests__/scoring.test.ts",
+        "src/roadmap-os/flow-state.ts",
+        "src/roadmap-os/invariants.ts",
+        "src/roadmap-os/scoring.ts",
+        "src/roadmap-os/types.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 725,
+      "title": "feat(evidence): Wave 2 W2-E7 durable cascade retry \u2014 enqueue + dequeue worker (flag OFF)",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "b05e582c68144ba3d2a9ec0bfba5c32ac1fa0c28",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 7,
+      "additions": 921,
+      "deletions": 77,
+      "required_checks": [
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28278534322/job/83789810753"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28278534321/job/83789810722"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28278534317/job/83789810702"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (ui-quality-gate=pass, backend=pass, neoengine-governance-required=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:7, cancel:3",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "docs/test-inventory.json",
+        "package.json",
+        "sql/migrations/222__evidence_cascade_invalidation_jobs.sql",
+        "src/evidence/api/__tests__/evidence-api-cascade-triggers.test.ts",
+        "src/evidence/api/evidence-api.ts",
+        "src/evidence/cascade/__tests__/cascade-job-worker.test.ts",
+        "src/evidence/cascade/cascade-job-worker.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 726,
+      "title": "feat(roadmap-os): wire delivery state runtime projection",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "df90c9085b00be361c27aba8158264b3a24a4057",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 14,
+      "additions": 1776,
+      "deletions": 357,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28278288981/job/83789120954"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28278288988/job/83789120909"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28278288990/job/83789120915"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:10",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "cockpit/src/lib/host-v1/SOURCE_HASH.txt",
+        "cockpit/src/lib/host-v1/contracts.ts",
+        "cockpit/src/lib/host-v1/empties.ts",
+        "docs/test-inventory.json",
+        "host/src/lib/engine/__fixtures__/roadmap-os.NEO.json",
+        "host/src/lib/engine/contracts.ts",
+        "host/src/pages/RoadmapCommandCenter.tsx",
+        "package.json",
+        "src/roadmap-os/__tests__/promotion-reducer-integration.test.ts",
+        "src/roadmap-os/__tests__/promotion-translator.test.ts",
+        "src/roadmap-os/__tests__/promotion.test.ts",
+        "src/roadmap-os/__tests__/runtime-projection.test.ts",
+        "src/roadmap-os/scoring.ts",
+        "src/roadmap-os/types.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 729,
+      "title": "chore(ci): add actions cancellation incident canary",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "059a782b779a9bbb810beedcc2151d4c3ea3c651",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 4,
+      "additions": 462,
+      "deletions": 0,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28291926505/job/83825274583"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28291926489/job/83825274585"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28291926498/job/83825274595"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:5, cancel:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        ".github/workflows/actions-control-plane-canary.yml",
+        "docs/evidence/actions-control-plane-matrix-20260624.ndjson",
+        "docs/incidents/actions-control-plane-cancellation-20260624.md",
+        "scripts/run-actions-matrix.sh"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 744,
+      "title": "fix(db): bound embedded-Postgres startup with a wall-clock timeout",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "63b812acbd5d9e07b1bde1e896c85075f007d612",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 2,
+      "additions": 317,
+      "deletions": 4,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268287093/job/83760005153"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268287146/job/83760005540"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268287095/job/83760005300"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "cancel:1, pass:1",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "src/db/__tests__/embedded.test.ts",
+        "src/db/embedded.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 746,
+      "title": "test(host): de-flake Issues.deeplink source_epoch race",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "d7c7fa79a8f3aaabac4a6805f0261f250727212e",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 1,
+      "additions": 24,
+      "deletions": 10,
+      "required_checks": [
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268285673/job/83760000446"
+        },
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268285648/job/83760000266"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268285684/job/83760000378"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:5, cancel:1",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "host/src/pages/__tests__/Issues.deeplink.test.tsx"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 747,
+      "title": "Build Qwen Ops modular CI fabric",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "6c8fe416ededfabf96a60ff8272e8369b964f3e1",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 60,
+      "additions": 8695,
+      "deletions": 124,
+      "required_checks": [
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28275393604/job/83825088475"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28275389399/job/83780957408"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28275389316/job/83780957219"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (neoengine-governance-required=pass, backend=pass, ui-quality-gate=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:19, cancel:3",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        ".github/actions/qwen-npm-ci/action.yml",
+        ".github/actions/qwen-setup/action.yml",
+        ".github/workflows/ci.yml",
+        ".github/workflows/qwen-ci-repair.yml",
+        ".github/workflows/qwen-ci-shard.yml",
+        "docs/plans/2026-06-26-qwen-ops-modular-ci-build-plan.md",
+        "docs/plans/2026-06-26-qwen-ops-modular-ci-build-prompt.json",
+        "docs/plans/2026-06-26-qwen-ops-protected-gate-packet.md",
+        "docs/runbooks/ephemeral-linux-runner-supervisor.md",
+        "docs/runbooks/pr-sizing-ci-merge-drain.md",
+        "docs/runbooks/qwen-mac-postgres-ci.md",
+        "docs/test-inventory.json",
+        "neoengine-operating-manual/architecture/agent-skill-workflow-model.mdx",
+        "neoengine-operating-manual/architecture/backlog-execution-model.mdx",
+        "neoengine-operating-manual/control-plane/backlog-system.mdx",
+        "neoengine-operating-manual/evidence/ci-proof-requirements.mdx",
+        "neoengine-operating-manual/failure-modes/ci-fails.mdx",
+        "neoengine-operating-manual/gates/ci-gate.mdx",
+        "neoengine-operating-manual/playbooks/docs-update-playbook.mdx",
+        "neoengine-operating-manual/playbooks/pr-review-playbook.mdx",
+        "neoengine-operating-manual/reference/cli.mdx",
+        "neoengine-operating-manual/reference/pr-docs-gate.mdx",
+        "package-lock.json",
+        "package.json",
+        "scripts/__tests__/ephemeral-linux-runner-supervisor.test.ts",
+        "scripts/ci/__tests__/assert-qwen-shared-linux-policy.test.ts",
+        "scripts/ci/__tests__/qwen-mirror-prewarm-policy.test.ts",
+        "scripts/ci/__tests__/qwen-modular-ci-contract.test.ts",
+        "scripts/ci/__tests__/workspace-governance-lane.test.ts",
+        "scripts/ci/assert-qwen-shared-linux-policy.ts",
+        "scripts/ci/assert-self-hosted-runner-policy.ts",
+        "scripts/ci/ephemeral-linux-runner-supervisor.ts",
+        "scripts/ci/qwen-fetch-base.sh",
+        "scripts/qwen/qwen-lane-guard.mjs",
+        "scripts/qwen/qwen-policy-constants.mjs",
+        "scripts/qwen/setup-local-developer-lanes.sh",
+        "scripts/types/js-yaml.d.ts",
+        "src/qwen-ops/chaos/__tests__/qwen-fabric-chaos.test.ts",
+        "src/qwen-ops/chaos/qwen-fabric-chaos.ts",
+        "src/qwen-ops/repair-loop/__tests__/allowed-paths.test.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 748,
+      "title": "fix(ci): make auto-merge-approved failure legible + document billing root cause",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "8095f5d8fe1ec0470d2154ee944fb189991ccf3c",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 2,
+      "additions": 203,
+      "deletions": 2,
+      "required_checks": [
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268283658/job/83759993986"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268283631/job/83759993890"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28268283653/job/83759993750"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (neoengine-governance-required=pass, ui-quality-gate=pass, backend=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:3",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        ".github/workflows/auto-arm-auto-merge.yml",
+        "docs/runbooks/auto-merge-approved-label-operations.md"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neoengine",
+      "pr_number": 752,
+      "title": "Wire OCR live supervisor tick to runtime ports",
+      "state": "BLOCKED_BY_REQUIRED_CI",
+      "current_head_sha": "8acc7d67b70a7f550f941f7385e020760ccafbeb",
+      "base_sha": "02129f0d6be9f010b0a97ffc418cff742629e066",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 4,
+      "additions": 318,
+      "deletions": 13,
+      "required_checks": [
+        {
+          "name": "neoengine-governance-required",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28291911698/job/83825236489"
+        },
+        {
+          "name": "ui-quality-gate",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28291911702/job/83825236500"
+        },
+        {
+          "name": "backend",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neoengine/actions/runs/28291911696/job/83825236460"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (neoengine-governance-required=pass, ui-quality-gate=pass, backend=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "fail:1, cancel:1",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "required/policy classifier red",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "PR Risk Classifier merge_blocking_conditions/body contract failure",
+      "next_actor": "PR author/agent",
+      "next_action": "repair_pr_body",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "repair_pr_body",
+      "files": [
+        "src/conductor/objective-convergence/__tests__/live-runtime-supervisor.test.ts",
+        "src/conductor/objective-convergence/__tests__/objective-convergence-unit.test.ts",
+        "src/conductor/objective-convergence/live-runtime-supervisor.ts",
+        "src/conductor/objective-convergence/objective-convergence-supervisor.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neowealth",
+      "pr_number": 613,
+      "title": "DRAFT: EverArc tax/forecast \u2014 7 waves rebased onto main (succeeds closed #610)",
+      "state": "DRAFT_IN_PROGRESS",
+      "current_head_sha": "999daaa6a4a4904680b7bb511898d524d6d6a6ae",
+      "base_sha": "90b26bc5f5aef3ffc456e3a9aeb43316447af4a6",
+      "mergeable": "CONFLICTING",
+      "draft": true,
+      "changed_files": 46,
+      "additions": 2589,
+      "deletions": 112,
+      "required_checks": [
+        {
+          "name": "Classify PR risk, reviews, and CI lanes",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/27859138973/job/82452045544"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/27859138975/job/82452040042"
+        },
+        {
+          "name": "NeoWealth CI",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/27859138974/job/82452040274"
+        }
+      ],
+      "required_check_status": "skipping:2;pass:1 (Classify PR risk, reviews, and CI lanes=skipping, policy=pass, NeoWealth CI=skipping)",
+      "advisory_checks": [],
+      "advisory_check_status": "none",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "draft gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "draft PR not reviewable",
+      "next_actor": "author/agent",
+      "next_action": "mark_draft or finish PR body/tests",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "mark_draft",
+      "files": [
+        "apps/everarc-web/MIGRATION.md",
+        "apps/everarc-web/src/components/TaxPostureCard.tsx",
+        "apps/everarc-web/src/components/hero/MoneyMapHero.tsx",
+        "apps/everarc-web/src/components/view/BasisTwins.tsx",
+        "apps/everarc-web/src/components/view/BridgeBar.tsx",
+        "apps/everarc-web/src/components/view/DualValueSpark.tsx",
+        "apps/everarc-web/src/components/view/EvidenceBlocker.tsx",
+        "apps/everarc-web/src/components/view/ForecastToggleBar.tsx",
+        "apps/everarc-web/src/components/view/Waterfall.tsx",
+        "apps/everarc-web/src/components/view/labelDiscipline.ts",
+        "apps/everarc-web/src/contracts/forecast.ts",
+        "apps/everarc-web/src/data/evidence-posture.ts",
+        "apps/everarc-web/src/data/forecast-demo.ts",
+        "apps/everarc-web/src/data/nav.ts",
+        "apps/everarc-web/src/data/taxCopy.ts",
+        "apps/everarc-web/src/engine/everarcEngine.ts",
+        "apps/everarc-web/src/lib/api/forecastClient.ts",
+        "apps/everarc-web/src/main.tsx",
+        "apps/everarc-web/src/state/conceptFlags.ts",
+        "apps/everarc-web/src/state/engineContext.ts",
+        "apps/everarc-web/src/state/engineStore.tsx",
+        "apps/everarc-web/src/state/forecastToggleStore.ts",
+        "apps/everarc-web/src/state/proofVariant.ts",
+        "apps/everarc-web/src/state/viewContext.ts",
+        "apps/everarc-web/src/styles/everarc-tax.css",
+        "apps/everarc-web/src/telemetry/conceptLog.ts",
+        "apps/everarc-web/src/views/EvidenceView.tsx",
+        "apps/everarc-web/src/views/ForecastView.tsx",
+        "apps/everarc-web/src/views/OutcomeView.tsx",
+        "apps/everarc-web/src/views/TodayView.tsx",
+        "apps/everarc-web/src/views/detail/EngineDetailView.tsx",
+        "apps/everarc-web/src/views/detail/VehicleCockpitView.tsx",
+        "apps/everarc-web/src/views/detail/detailLabels.ts",
+        "apps/everarc-web/src/views/detail/detailRegistry.tsx",
+        "apps/everarc-web/src/views/detail/vehicle/CashFlowTab.tsx",
+        "apps/everarc-web/src/views/detail/vehicle/EquityValueTab.tsx",
+        "apps/everarc-web/src/views/detail/vehicle/ExitTab.tsx",
+        "apps/everarc-web/src/views/detail/vehicle/RealValueTab.tsx",
+        "apps/everarc-web/src/views/detail/vehicle/TaxesTab.tsx",
+        "apps/everarc-web/src/views/registry.tsx"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neowealth",
+      "pr_number": 625,
+      "title": "feat(workbook): live-data Waves 1\u20136 \u2014 durable path + identity + pilot + security posture (product NOT_READY)",
+      "state": "DRAFT_IN_PROGRESS",
+      "current_head_sha": "7d3f631ecb8c8704fc0cb1856efcb7eddf21218a",
+      "base_sha": "ba184aeb8be9b670dbe0db3e5d8e8de2fd4bdb46",
+      "mergeable": "CONFLICTING",
+      "draft": true,
+      "changed_files": 160,
+      "additions": 15123,
+      "deletions": 131,
+      "required_checks": [
+        {
+          "name": "Classify PR risk, reviews, and CI lanes",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/27926056331/job/82628574733"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/27926046614/job/82628545809"
+        },
+        {
+          "name": "NeoWealth CI",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/27926046603/job/82628547239"
+        }
+      ],
+      "required_check_status": "skipping:2;pass:1 (Classify PR risk, reviews, and CI lanes=skipping, policy=pass, NeoWealth CI=skipping)",
+      "advisory_checks": [],
+      "advisory_check_status": "none",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "draft gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "draft PR not reviewable",
+      "next_actor": "author/agent",
+      "next_action": "mark_draft or finish PR body/tests",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "mark_draft",
+      "files": [
+        "apps/everarc-web/.env.example",
+        "apps/everarc-web/.gitignore",
+        "apps/everarc-web/package-lock.json",
+        "apps/everarc-web/package.json",
+        "apps/everarc-web/src/components/panels/CopilotPanel.tsx",
+        "apps/everarc-web/src/hooks/useNetWorth.ts",
+        "apps/everarc-web/src/hooks/useNetWorthHistory.ts",
+        "apps/everarc-web/src/lib/api/client.ts",
+        "apps/everarc-web/src/lib/api/index.ts",
+        "apps/everarc-web/src/lib/api/net-worth-history-payload.ts",
+        "apps/everarc-web/src/lib/api/net-worth-payload.ts",
+        "apps/everarc-web/src/lib/api/session-purge.ts",
+        "apps/everarc-web/src/lib/api/workbook.ts",
+        "apps/everarc-web/src/lib/networth/net-worth-history-view-model.ts",
+        "apps/everarc-web/src/lib/networth/net-worth-state.ts",
+        "apps/everarc-web/src/lib/networth/net-worth-view-model.ts",
+        "apps/everarc-web/src/lib/workflow/workflow-view-state.ts",
+        "apps/everarc-web/src/views/NetWorthView.tsx",
+        "apps/everarc-web/test/networth/net-worth-view.test.tsx",
+        "apps/everarc-web/vite.config.ts",
+        "docs/implementation/adr/ADR-LD-001-origin-session-topology.md",
+        "docs/implementation/artifacts/wave-1/g10-codex-adversarial-review.md",
+        "docs/implementation/artifacts/wave-1/g2-durable-migrate-live-pg.txt",
+        "docs/implementation/artifacts/wave-1/g3-runtime-role-rls.txt",
+        "docs/implementation/artifacts/wave-2/g10-codex-adversarial-review.md",
+        "docs/implementation/artifacts/wave-2/g7-browser-har-sw-cache.md",
+        "docs/implementation/artifacts/wave-3/g10-codex-adversarial-review.md",
+        "docs/implementation/artifacts/wave-3/g7-logout-userswitch-cache-purge.md",
+        "docs/implementation/artifacts/wave-4/g10-codex-adversarial-review.md",
+        "docs/implementation/artifacts/wave-4/g8-browser-phone-workflow-ux.md",
+        "docs/implementation/artifacts/wave-5/g1-route-surface-lineage.md",
+        "docs/implementation/artifacts/wave-5/g10-613-merge-decision.md",
+        "docs/implementation/artifacts/wave-5a/conflict-resolution-plan.md",
+        "docs/implementation/artifacts/wave-5a/net-worth-history.md",
+        "docs/implementation/artifacts/wave-5a/verdict.md",
+        "docs/implementation/artifacts/wave-6/g10-launch-readiness-review.md",
+        "docs/implementation/artifacts/wave-6/g4-security-posture-review.md",
+        "docs/implementation/live-data-master-plan-v1.md",
+        "docs/implementation/live-data-wave-1-gate-results.json",
+        "docs/implementation/live-data-wave-1-report.md"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neowealth",
+      "pr_number": 649,
+      "title": "feat(everarc): live Net Worth Today KPI island",
+      "state": "BLOCKED_BY_REQUIRED_CI",
+      "current_head_sha": "c8fef6bbcb3d84851a10efded4bfef5db5753c3a",
+      "base_sha": "a0f90b9e4b6acc21670a591b6786e127498de18a",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 18,
+      "additions": 636,
+      "deletions": 48,
+      "required_checks": [
+        {
+          "name": "Classify PR risk, reviews, and CI lanes",
+          "bucket": "fail",
+          "state": "FAILURE",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/28265061192/job/83749646300"
+        },
+        {
+          "name": "NeoWealth CI",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/28265061156/job/83749646135"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/28265030558/job/83749545923"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_RED_REPAIR_NEEDED (Classify PR risk, reviews, and CI lanes=fail, NeoWealth CI=pass, policy=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "none",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "required/policy classifier red",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "PR Risk Classifier merge_blocking_conditions/body contract failure",
+      "next_actor": "PR author/agent",
+      "next_action": "repair_pr_body",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "repair_pr_body",
+      "files": [
+        "apps/everarc-web/src/components/KpiGrid.tsx",
+        "apps/everarc-web/src/lib/api/net-worth-client.ts",
+        "apps/everarc-web/src/lib/api/net-worth-payload.ts",
+        "apps/everarc-web/src/views/NetWorthView.tsx",
+        "apps/everarc-web/test/everarc/net-worth-today-kpi.test.tsx",
+        "docs/backend-review/first-50-closeout/fixture-retirement.md",
+        "docs/backend-review/first-50-closeout/non-claims.md",
+        "docs/backend-review/operator-everarc-vite-react-app-continuous-20260626/closeout-receipt.md",
+        "docs/backend-review/operator-everarc-vite-react-app-continuous-20260626/pr-body.md",
+        "repo/app/api/workbook/net-worth/route.ts",
+        "repo/docs/backend-review/ce-002-route-surface-convergence/route-catalog.json",
+        "repo/docs/backend-review/first-50-closeout-rebalance-001/route-catalog-adversarial-review.md",
+        "repo/docs/backend-review/first-50-closeout/fixture-retirement.md",
+        "repo/docs/backend-review/first-50-closeout/non-claims.md",
+        "repo/docs/backend-review/first-50-closeout/route-catalog.md",
+        "repo/docs/backend-review/nw-be-w12-001-current-main-proof-repair-20260615/refresh-receipt.md",
+        "repo/test/acceptance/nw-be-w12-001-route-catalog-freshness-restamp.test.ts",
+        "repo/test/spa-client/net-worth-client.test.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/neowealth",
+      "pr_number": 651,
+      "title": "feat(everarc): harden workbook net-worth backend adapter",
+      "state": "BLOCKED_BY_REQUIRED_CI",
+      "current_head_sha": "064a134baa5e5549d0b6a4a045e7c262e3fdb26e",
+      "base_sha": "a0f90b9e4b6acc21670a591b6786e127498de18a",
+      "mergeable": "CONFLICTING",
+      "draft": false,
+      "changed_files": 16,
+      "additions": 790,
+      "deletions": 47,
+      "required_checks": [
+        {
+          "name": "Classify PR risk, reviews, and CI lanes",
+          "bucket": "fail",
+          "state": "FAILURE",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/28265155175/job/83749957011"
+        },
+        {
+          "name": "NeoWealth CI",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/28265155179/job/83749956925"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/neowealth/actions/runs/28265155206/job/83749956971"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_RED_REPAIR_NEEDED (Classify PR risk, reviews, and CI lanes=fail, NeoWealth CI=pass, policy=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "none",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "required/policy classifier red",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "PR Risk Classifier merge_blocking_conditions/body contract failure",
+      "next_actor": "PR author/agent",
+      "next_action": "repair_pr_body",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "repair_pr_body",
+      "files": [
+        "docs/backend-review/first-50-closeout/fixture-retirement.md",
+        "docs/backend-review/first-50-closeout/non-claims.md",
+        "docs/backend-review/operator-everarc-operational-maturity-backend-continuous-20260626/adversarial-review.md",
+        "docs/backend-review/operator-everarc-operational-maturity-backend-continuous-20260626/implementation-evidence.md",
+        "docs/backend-review/operator-everarc-operational-maturity-backend-continuous-20260626/pr-body.md",
+        "repo/app/api/workbook/net-worth/route.ts",
+        "repo/docs/backend-review/ce-002-route-surface-convergence/route-catalog.json",
+        "repo/docs/backend-review/ce-002-route-surface-convergence/route-catalog.md",
+        "repo/docs/backend-review/first-50-closeout-rebalance-001/route-catalog-adversarial-review.md",
+        "repo/docs/backend-review/first-50-closeout/fixture-retirement.md",
+        "repo/docs/backend-review/first-50-closeout/non-claims.md",
+        "repo/docs/backend-review/first-50-closeout/route-catalog.md",
+        "repo/docs/backend-review/nw-be-w12-001-current-main-proof-repair-20260615/refresh-receipt.md",
+        "repo/test/acceptance/everarc-workbook-net-worth-route.test.ts",
+        "repo/test/acceptance/nw-be-w12-001-route-catalog-freshness-restamp.test.ts",
+        "repo/test/acceptance/pf-be-020-core-routes-smoke.test.ts"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/hermes-agent",
+      "pr_number": 37,
+      "title": "Harden dev lane claim convergence semantics",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "b370a916d377568dd0112908071bcb58e58e0703",
+      "base_sha": "8d592a17ba9d872982bc3f6e3f824b19449478d4",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 5,
+      "additions": 2256,
+      "deletions": 194,
+      "required_checks": [
+        {
+          "name": "Classify PR risk, reviews, and CI lanes",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28175935812/job/83452168875"
+        },
+        {
+          "name": "test (1)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867572"
+        },
+        {
+          "name": "ruff enforcement (blocking)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875052/job/83444867824"
+        },
+        {
+          "name": "ruff + ty diff",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875052/job/83444867847"
+        },
+        {
+          "name": "Scan PR for critical supply chain risks",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875030/job/83444867355"
+        },
+        {
+          "name": "Windows footguns (blocking)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875052/job/83444867830"
+        },
+        {
+          "name": "e2e",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867637"
+        },
+        {
+          "name": "Check PyPI dependency upper bounds",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875030/job/83444867352"
+        },
+        {
+          "name": "check-common-ancestor",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875003/job/83444867469"
+        },
+        {
+          "name": "test (5)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867565"
+        },
+        {
+          "name": "test (6)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867569"
+        },
+        {
+          "name": "test (4)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867564"
+        },
+        {
+          "name": "test (3)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867589"
+        },
+        {
+          "name": "test (2)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875019/job/83444867633"
+        },
+        {
+          "name": "check-attribution",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28173875094/job/83444867597"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (Classify PR risk, reviews, and CI lanes=pass, test (1)=pass, ruff enforcement (blocking)=pass, ruff + ty diff=pass, Scan PR for critical supply chain risks=pass, Windows footguns (blocking)=pass, e2e=pass, Check PyPI dependency upper bounds=pass, check-common-ancestor=pass, test (5)=pass, test (6)=pass, test (4)=pass, test (3)=pass, test (2)=pass, check-attribution=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:3, skipping:5",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "hermes_cli/kanban_db.py",
+        "neoengine_local/dev_lane_heartbeat.py",
+        "tests/hermes_cli/test_dev_lane_control_loop.py",
+        "tests/hermes_cli/test_lane_backend_conformance.py",
+        "tests/neoengine_local/test_dev_lane_heartbeat.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/hermes-agent",
+      "pr_number": 39,
+      "title": "Handle missing dev-lane wake timestamps",
+      "state": "BLOCKED_BY_PRODUCT_REPAIR",
+      "current_head_sha": "85493e06bcaf3a956c7511735a2cd9f5b6eb68d2",
+      "base_sha": "d1ff3ff809416d82f86f615334ecc343a184dac7",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 2,
+      "additions": 38,
+      "deletions": 1,
+      "required_checks": [
+        {
+          "name": "e2e",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215897"
+        },
+        {
+          "name": "test (4)",
+          "bucket": "fail",
+          "state": "FAILURE",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215904"
+        },
+        {
+          "name": "test (2)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215940"
+        },
+        {
+          "name": "check-attribution",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484077/job/83669215526"
+        },
+        {
+          "name": "test (1)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215891"
+        },
+        {
+          "name": "test (6)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215880"
+        },
+        {
+          "name": "test (5)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215810"
+        },
+        {
+          "name": "check-common-ancestor",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484057/job/83669215406"
+        },
+        {
+          "name": "test (3)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484073/job/83669215874"
+        },
+        {
+          "name": "Classify PR risk, reviews, and CI lanes",
+          "bucket": "fail",
+          "state": "FAILURE",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484041/job/83669215363"
+        },
+        {
+          "name": "ruff enforcement (blocking)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484035/job/83669215573"
+        },
+        {
+          "name": "Check PyPI dependency upper bounds",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484038/job/83669215359"
+        },
+        {
+          "name": "ruff + ty diff",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484035/job/83669215569"
+        },
+        {
+          "name": "Scan PR for critical supply chain risks",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484038/job/83669215362"
+        },
+        {
+          "name": "Windows footguns (blocking)",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/hermes-agent/actions/runs/28241484035/job/83669215523"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_RED_REPAIR_NEEDED (e2e=pass, test (4)=fail, test (2)=pass, check-attribution=pass, test (1)=pass, test (6)=pass, test (5)=pass, check-common-ancestor=pass, test (3)=pass, Classify PR risk, reviews, and CI lanes=fail, ruff enforcement (blocking)=pass, Check PyPI dependency upper bounds=pass, ruff + ty diff=pass, Scan PR for critical supply chain risks=pass, Windows footguns (blocking)=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "skipping:5, pass:3",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "required CI red",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "test (4) asserts provider switch expected anthropic but got custom; classifier requires protected human gate",
+      "next_actor": "Hermes/Codex",
+      "next_action": "repair_tests and repair_pr_body",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "repair_code",
+      "files": [
+        "neoengine_local/dev_lane_heartbeat.py",
+        "tests/neoengine_local/test_dev_lane_heartbeat.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 157,
+      "title": "fix(qwen-ops): harden CI admission preflight",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "9e31f9985737e23700ebf566ca70012d54e766ce",
+      "base_sha": "8688f04b5df4f8b5ffcb1c49b41ff7395e12cd49",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 2,
+      "additions": 244,
+      "deletions": 6,
+      "required_checks": [
+        {
+          "name": "guard",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291772530/job/83824870685"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291772541/job/83824870652"
+        },
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291772523/job/83824870641"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (guard=pass, policy=pass, Roadmap OS validation=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "scripts/qwen-ops-unified-pr-ci-controller.py",
+        "tests/qwen_ops/test_qwen_ops_controller_classifier.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 163,
+      "title": "feat(qwen-ops): add unlimited-WIP PR-flow state foundation",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "c0544891d7f381abd49cc01378d85f51e8ceddf9",
+      "base_sha": "8688f04b5df4f8b5ffcb1c49b41ff7395e12cd49",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 10,
+      "additions": 1571,
+      "deletions": 1,
+      "required_checks": [
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291771391/job/83824867582"
+        },
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291771369/job/83824867485"
+        },
+        {
+          "name": "guard",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291771376/job/83824867578"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (policy=pass, Roadmap OS validation=pass, guard=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "config/pr-flow-policy.json",
+        "docs/plans/reviews/2026-06-20-pr-flow-unlimited-wip-ce-review.json",
+        "docs/plans/reviews/2026-06-20-pr-flow-unlimited-wip-ce-review.md",
+        "docs/skills/neo-pr-pileup-drain.md",
+        "schemas/pr-flow-state.schema.json",
+        "schemas/pr-review-sla.schema.json",
+        "schemas/pr-stack.schema.json",
+        "scripts/qwen-ops-unified-pr-ci-controller.py",
+        "tests/qwen_ops/test_pr_flow_policy_schema.py",
+        "tests/qwen_ops/test_pr_flow_state.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 179,
+      "title": "fix(qwen-ops): finalize stale Codex pickup results",
+      "state": "DRAFT_IN_PROGRESS",
+      "current_head_sha": "c3f7fba60c91ba6a4fd4565970c542cd0e620837",
+      "base_sha": "68b79e915787073eb218c07eab851c3c28b1dfdb",
+      "mergeable": "MERGEABLE",
+      "draft": true,
+      "changed_files": 2,
+      "additions": 143,
+      "deletions": 51,
+      "required_checks": [
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/27928635477/job/82636027432"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/27928411370/job/82635380874"
+        },
+        {
+          "name": "guard",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/27928411376/job/82635381408"
+        }
+      ],
+      "required_check_status": "skipping:2;pass:1 (Roadmap OS validation=skipping, policy=pass, guard=skipping)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "draft gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "draft PR not reviewable",
+      "next_actor": "author/agent",
+      "next_action": "mark_draft or finish PR body/tests",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "mark_draft",
+      "files": [
+        "scripts/qwen-codex-pickup-result-scan",
+        "tests/qwen_ops/test_qwen_codex_pickup_doctor.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 181,
+      "title": "accept NeoWealth W5 G1 local proof evidence",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "46d077346753ba3720c85add87e8d192dc45a7a4",
+      "base_sha": "8688f04b5df4f8b5ffcb1c49b41ff7395e12cd49",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 14,
+      "additions": 651,
+      "deletions": 209,
+      "required_checks": [
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291769529/job/83824862225"
+        },
+        {
+          "name": "guard",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291769540/job/83824862216"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291769541/job/83824862136"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (Roadmap OS validation=pass, guard=pass, policy=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "blocker_classification_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "roadmap/events/accepted/2026-06-22-nw-w5-g1-local-proof-closed.json",
+        "roadmap/generated/from-events/claim-risk-report.generated.md",
+        "roadmap/generated/from-events/command-register.generated.json",
+        "roadmap/generated/from-events/command-register.generated.md",
+        "roadmap/generated/from-events/critical-path.generated.json",
+        "roadmap/generated/from-events/daily-command-brief.generated.md",
+        "roadmap/generated/from-events/dependency-dag.generated.json",
+        "roadmap/generated/from-events/dependency-frontier.generated.md",
+        "roadmap/generated/from-events/frontier.generated.json",
+        "roadmap/generated/from-events/health-scorecard.generated.md",
+        "roadmap/generated/from-events/hermes-convergence-packet-seeds.generated.json",
+        "roadmap/generated/from-events/reducer-parity-report.md",
+        "roadmap/tests/test_dependency_dag_views.py",
+        "roadmap/tools/generate_roadmap_views.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 182,
+      "title": "fix(qwen-ops): classify dispatch and raise CI log budget",
+      "state": "READY_FOR_HUMAN_REVIEW",
+      "current_head_sha": "e695092f83f10fbe5be798934772eff200e4ea20",
+      "base_sha": "8688f04b5df4f8b5ffcb1c49b41ff7395e12cd49",
+      "mergeable": "MERGEABLE",
+      "draft": false,
+      "changed_files": 7,
+      "additions": 188,
+      "deletions": 38,
+      "required_checks": [
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291768069/job/83824858140"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291768066/job/83824858079"
+        },
+        {
+          "name": "guard",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28291768056/job/83824858023"
+        }
+      ],
+      "required_check_status": "CURRENT_HEAD_REQUIRED_GREEN (Roadmap OS validation=pass, policy=pass, guard=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "review/protected gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "required checks green; no visible approval/reviewDecision in Phase0 data",
+      "next_actor": "protected human/reviewer",
+      "next_action": "request_human_review",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "request_human_review",
+      "files": [
+        "scripts/qwen-codex-pickup-result-scan",
+        "scripts/qwen-ops-local-pr-ci-controller",
+        "scripts/qwen-ops-unified-pr-ci-controller.py",
+        "tests/qwen_ops/test_qwen_codex_pickup_doctor.py",
+        "tests/qwen_ops/test_qwen_ops_controller_classifier.py",
+        "tests/qwen_ops/test_qwen_ops_controller_hourly_readout.py",
+        "tests/qwen_ops/test_qwen_ops_local_controller_memory_runtime.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 185,
+      "title": "docs(qwen-ops): codify Codex DAG CI repair lifecycle",
+      "state": "DRAFT_IN_PROGRESS",
+      "current_head_sha": "3b1679e0394569c7ab2de8ab2b8152c49199d843",
+      "base_sha": "9664c515c023f1fbc56287cb4b2dfe34fac91e99",
+      "mergeable": "MERGEABLE",
+      "draft": true,
+      "changed_files": 19,
+      "additions": 715,
+      "deletions": 0,
+      "required_checks": [
+        {
+          "name": "guard",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28000554140/job/82871858270"
+        },
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28000554144/job/82871854584"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28000554160/job/82871840612"
+        }
+      ],
+      "required_check_status": "skipping:2;pass:1 (guard=skipping, Roadmap OS validation=skipping, policy=pass)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "draft gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "draft PR not reviewable",
+      "next_actor": "author/agent",
+      "next_action": "mark_draft or finish PR body/tests",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "mark_draft",
+      "files": [
+        ".agents/skills/qwen-codex-dag-ci-repair/SKILL.md",
+        ".agents/skills/qwen-codex-dag-ci-repair/examples/merge-conflict-blocker.example.json",
+        ".agents/skills/qwen-codex-dag-ci-repair/examples/metadata-ci-repair.example.json",
+        ".agents/skills/qwen-codex-dag-ci-repair/prompts/classify-repair-outcome.prompt.md",
+        ".agents/skills/qwen-codex-dag-ci-repair/prompts/diagnose-dispatch-gap.prompt.md",
+        ".agents/skills/qwen-codex-dag-ci-repair/prompts/execute-live-ci-repair.prompt.md",
+        ".agents/skills/qwen-codex-dag-ci-repair/prompts/finalize-async-result.prompt.md",
+        ".agents/skills/qwen-codex-dag-ci-repair/schemas/aggregate-summary.schema.json",
+        ".agents/skills/qwen-codex-dag-ci-repair/schemas/blocker-receipt.schema.json",
+        ".agents/skills/qwen-codex-dag-ci-repair/schemas/dispatch-receipt.schema.json",
+        ".agents/skills/qwen-codex-dag-ci-repair/schemas/repair-packet.schema.json",
+        ".agents/skills/qwen-codex-dag-ci-repair/schemas/terminal-result.schema.json",
+        "docs/qwen-ops/qwen-codex-dag-ci-repair-retrospective.md",
+        "docs/qwen-ops/qwen-codex-dag-ci-repair-runbook.md",
+        "scripts/qwen-codex-live-ci-repair",
+        "scripts/qwen_codex_live_ci_repair.py",
+        "tests/qwen_ops/fixtures/qwen_codex_live_ci_repair/merge-conflict-blocker.example.json",
+        "tests/qwen_ops/fixtures/qwen_codex_live_ci_repair/metadata-ci-repair.example.json",
+        "tests/qwen_ops/test_qwen_codex_live_ci_repair.py"
+      ]
+    },
+    {
+      "repo": "neoengine-ai-org/ai-org",
+      "pr_number": 186,
+      "title": "fix(qwen-ops): gate Codex dispatch before sidecar pickup",
+      "state": "DRAFT_IN_PROGRESS",
+      "current_head_sha": "d4193047842d459c8a1c8b3dd5debd4f80a4d80c",
+      "base_sha": "9664c515c023f1fbc56287cb4b2dfe34fac91e99",
+      "mergeable": "MERGEABLE",
+      "draft": true,
+      "changed_files": 8,
+      "additions": 552,
+      "deletions": 19,
+      "required_checks": [
+        {
+          "name": "guard",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28173946130/job/83445144273"
+        },
+        {
+          "name": "policy",
+          "bucket": "pass",
+          "state": "SUCCESS",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28173946166/job/83445112760"
+        },
+        {
+          "name": "Roadmap OS validation",
+          "bucket": "skipping",
+          "state": "SKIPPED",
+          "link": "https://github.com/neoengine-ai-org/ai-org/actions/runs/28173946148/job/83445113381"
+        }
+      ],
+      "required_check_status": "skipping:2;pass:1 (guard=skipping, policy=pass, Roadmap OS validation=skipping)",
+      "advisory_checks": [],
+      "advisory_check_status": "pass:2",
+      "review_status": "NO_VISIBLE_APPROVAL_IN_PHASE0",
+      "protected_gate_status": "draft gate",
+      "local_validation_status": "NOT_RUN_PHASE0_READ_ONLY",
+      "exact_blocker": "draft PR not reviewable",
+      "next_actor": "author/agent",
+      "next_action": "mark_draft or finish PR body/tests",
+      "movement_class": "watchdog_visibility_delta",
+      "runtime_capability_advanced": false,
+      "non_claims_present": true,
+      "rollback_present": true,
+      "stale_claims_present": false,
+      "recommended_terminal_action": "mark_draft",
+      "files": [
+        "scripts/qwen-codex-pickup-result-scan",
+        "scripts/qwen-ops-local-pr-ci-controller",
+        "scripts/qwen-ops-unified-pr-ci-controller.py",
+        "tests/qwen_ops/test_qwen_ops_codex_dispatch_idempotency.py",
+        "tests/qwen_ops/test_qwen_ops_controller_active_repairs.py",
+        "tests/qwen_ops/test_qwen_ops_controller_classifier.py",
+        "tests/qwen_ops/test_qwen_ops_local_controller_memory_runtime.py",
+        "tests/qwen_ops/test_qwen_ops_local_controller_qwen35_lifecycle.py"
+      ]
+    }
+  ],
+  "qwen": {
+    "true_movement_count": 0,
+    "activity_count": 5,
+    "inflation_risks": [
+      "Open Qwen routing/dispatch PRs are classified as activity until merged or no-op evidence accepted."
+    ]
+  },
+  "human_actions_required": [
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#689",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#722",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (ui-quality-gate=pass, backend=pass, neoengine-governance-required=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#725",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (ui-quality-gate=pass, backend=pass, neoengine-governance-required=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#726",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#729",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#744",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#746",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (backend=pass, neoengine-governance-required=pass, ui-quality-gate=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#747",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (neoengine-governance-required=pass, backend=pass, ui-quality-gate=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/neoengine#748",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (neoengine-governance-required=pass, ui-quality-gate=pass, backend=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/hermes-agent#37",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (Classify PR risk, reviews, and CI lanes=pass, test (1)=pass, ruff enforcement (blocking)=pass, ruff + ty diff=pass, Scan PR for critical supply chain risks=pass, Windows footguns (blocking)=pass, e2e=pass, Check PyPI dependency upper bounds=pass, check-common-ancestor=pass, test (5)=pass, test (6)=pass, test (4)=pass, test (3)=pass, test (2)=pass, check-attribution=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/ai-org#157",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (guard=pass, policy=pass, Roadmap OS validation=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/ai-org#163",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (policy=pass, Roadmap OS validation=pass, guard=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/ai-org#181",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (Roadmap OS validation=pass, guard=pass, policy=pass)"
+    },
+    {
+      "repo_pr": "neoengine-ai-org/ai-org#182",
+      "exact_ask": "Review current head for protected/human decision after required checks are green.",
+      "evidence": "CURRENT_HEAD_REQUIRED_GREEN (Roadmap OS validation=pass, policy=pass, guard=pass)"
+    }
+  ],
+  "platform_ci_blockers": [],
+  "non_claims_preserved": true
+}
