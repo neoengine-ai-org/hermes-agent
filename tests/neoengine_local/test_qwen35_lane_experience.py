@@ -70,6 +70,8 @@ def test_preflight_refuses_dirty_worktree_before_real_launch(tmp_path: Path) -> 
     def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
         if command[:2] == ["git", "rev-parse"] and command[-1] == "--show-toplevel":
             return 0, str(worktree), ""
+        if command[:3] == ["git", "config", "--get"]:
+            return 0, "https://github.com/adingler711/neowealth.git", ""
         if command[:2] == ["git", "branch"]:
             return 0, "qwen35/networth-render-island-audit", ""
         if command[:2] == ["git", "rev-parse"] and command[-1] == "HEAD":
@@ -116,6 +118,8 @@ def test_preflight_records_successful_tool_execution_receipt(tmp_path: Path) -> 
     def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
         if command[:2] == ["git", "rev-parse"] and command[-1] == "--show-toplevel":
             return 0, str(worktree), ""
+        if command[:3] == ["git", "config", "--get"]:
+            return 0, "git@github.com:neoengine-ai-org/hermes-agent.git", ""
         if command[:2] == ["git", "branch"]:
             return 0, "main", ""
         if command[:2] == ["git", "rev-parse"] and command[-1] == "HEAD":
@@ -494,3 +498,105 @@ def test_preflight_requires_registry_by_default(tmp_path: Path) -> None:
     assert result["status"] == "FAILED_TOOLING_OR_CONTEXT"
     assert result["failure_mode"] == "INVOCATION_REGISTRY_REQUIRED"
     assert result["registry_enforced"] is True
+
+
+
+def test_preflight_registry_refuses_declared_repo_remote_mismatch(tmp_path: Path) -> None:
+    worktree = tmp_path / "repo"
+    worktree.mkdir()
+    receipt = tmp_path / "canary.json"
+    registry = Qwen35Registry(tmp_path / "registry.json")
+    registry.upsert(
+        repo="neoengine-ai-org/hermes-agent",
+        org="neoengine-ai-org",
+        model="qwen3.5:9b",
+        qwen_cli_version="0.19.1",
+        known_good_invocation=["--bare", "--sandbox", "--approval-mode=yolo"],
+        known_bad_invocations=[["--bare", "--sandbox", "-y"]],
+        canary_receipt_path=str(receipt),
+        notes="test registry entry",
+        verified_at="2026-06-26T00:00:00Z",
+    )
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "rev-parse"] and command[-1] == "--show-toplevel":
+            return 0, str(worktree), ""
+        if command[:3] == ["git", "config", "--get"]:
+            return 0, "https://github.com/adingler711/neowealth.git", ""
+        raise AssertionError(f"remote mismatch should refuse before further tool execution: {command}")
+
+    result = run_preflight_canary(
+        repo="neoengine-ai-org/hermes-agent",
+        org="neoengine-ai-org",
+        worktree=worktree,
+        model="qwen3.5:9b",
+        invocation=["--bare", "--sandbox", "--approval-mode=yolo"],
+        receipt_path=receipt,
+        registry_path=registry.path,
+        runner=runner,
+        now="2026-06-26T00:00:00Z",
+    )
+
+    assert result["status"] == "FAILED_TOOLING_OR_CONTEXT"
+    assert result["failure_mode"] == "REPO_REMOTE_MISMATCH"
+
+
+def test_post_run_non_claim_prefix_cannot_hide_overclaim(tmp_path: Path) -> None:
+    receipt = tmp_path / "completion.json"
+    receipt.write_text(json.dumps({"terminal_status": "NO_CHANGE_WITH_EVIDENCE", "note": "not deployed; live and accepted"}))
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "status"]:
+            return 0, "", ""
+        if command[:2] == ["git", "diff"]:
+            return 0, "", ""
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc123", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
+
+    assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
+    assert "completion text may exceed non-claim ceiling" in result["blockers"]
+
+
+def test_post_run_productive_diff_requires_claimed_files_match_observed_diff(tmp_path: Path) -> None:
+    receipt = tmp_path / "completion.json"
+    receipt.write_text(json.dumps({"terminal_status": "PRODUCTIVE_DIFF_WITH_EVIDENCE", "changed_files": ["wrong.py"]}))
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "status"]:
+            return 0, " M actual.py", ""
+        if command[:2] == ["git", "diff"] and "--name-only" in command:
+            return 0, "actual.py\n", ""
+        if command[:2] == ["git", "diff"]:
+            return 0, " actual.py | 1 +", ""
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc123", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
+
+    assert result["verdict"] == "CLAIMS_EXCEED_EVIDENCE"
+    assert "PRODUCTIVE_DIFF_WITH_EVIDENCE changed_files do not match independently observed diff files" in result["blockers"]
+
+
+def test_post_run_productive_diff_accepts_matching_claimed_files(tmp_path: Path) -> None:
+    receipt = tmp_path / "completion.json"
+    receipt.write_text(json.dumps({"terminal_status": "PRODUCTIVE_DIFF_WITH_EVIDENCE", "changed_files": ["actual.py"]}))
+
+    def runner(command: list[str], cwd: Path) -> tuple[int, str, str]:
+        if command[:2] == ["git", "status"]:
+            return 0, " M actual.py", ""
+        if command[:2] == ["git", "diff"] and "--name-only" in command:
+            return 0, "actual.py\n", ""
+        if command[:2] == ["git", "diff"]:
+            return 0, " actual.py | 1 +", ""
+        if command[:2] == ["git", "rev-parse"]:
+            return 0, "abc123", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    result = verify_post_run(repo="repo", worktree=tmp_path, completion_receipt=receipt, runner=runner)
+
+    assert result["verdict"] == "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
+    assert result["git_diff_files"] == ["actual.py"]

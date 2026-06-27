@@ -160,6 +160,20 @@ def _run_or_fail(runner: Runner, command: list[str], cwd: Path) -> tuple[int, st
         return 99, "", f"{type(exc).__name__}: {exc}"
 
 
+def _normalize_repo_url(value: str) -> str:
+    text = value.strip()
+    if text.startswith("git@github.com:"):
+        text = text.removeprefix("git@github.com:")
+    elif "github.com/" in text:
+        text = text.split("github.com/", 1)[1]
+    text = text.removesuffix(".git").strip("/")
+    return text
+
+
+def _remote_matches_repo(remote_url: str, repo: str) -> bool:
+    return _normalize_repo_url(remote_url) == repo.strip().strip("/")
+
+
 def run_preflight_canary(
     *,
     repo: str,
@@ -210,6 +224,12 @@ def run_preflight_canary(
     rc, repo_root, err = run(["git", "rev-parse", "--show-toplevel"])
     if rc != 0:
         return _finish_canary(receipt, base, "FAILED_TOOLING_OR_CONTEXT", "REPO_ROOT_DETECTION_FAILED", err)
+    rc, remote_url, err = run(["git", "config", "--get", "remote.origin.url"])
+    if rc != 0 or not remote_url.strip():
+        return _finish_canary(receipt, base, "FAILED_TOOLING_OR_CONTEXT", "REMOTE_REPO_DETECTION_FAILED", err or remote_url)
+    base["remote_origin_url"] = remote_url
+    if not _remote_matches_repo(remote_url, repo):
+        return _finish_canary(receipt, base, "FAILED_TOOLING_OR_CONTEXT", "REPO_REMOTE_MISMATCH", "declared repo does not match worktree remote.origin.url")
     rc, branch, err = run(["git", "branch", "--show-current"])
     if rc != 0:
         return _finish_canary(receipt, base, "FAILED_TOOLING_OR_CONTEXT", "BRANCH_DETECTION_FAILED", err)
@@ -361,7 +381,7 @@ def _completion_text_exceeds_non_claims(value: Any) -> bool:
         if not isinstance(item, str):
             return False
         text = item.strip().lower()
-        if not text or text in allowed_negative or text.startswith("not ") or text.startswith("no "):
+        if not text or text in allowed_negative:
             return False
         return any(term in text for term in positive_terms)
 
@@ -410,14 +430,18 @@ def verify_post_run(
 
     status_rc, git_status, status_err = run(["git", "status", "--porcelain"])
     diff_rc, git_diff, diff_err = run(["git", "diff", "--stat"])
+    diff_names_rc, git_diff_names, diff_names_err = run(["git", "diff", "--name-only"])
     head_rc, head_sha, head_err = run(["git", "rev-parse", "HEAD"])
-    payload.update({"git_status": git_status, "git_diff_stat": git_diff, "head_sha": head_sha})
+    observed_changed_files = [line.strip() for line in git_diff_names.splitlines() if line.strip()]
+    payload.update({"git_status": git_status, "git_diff_stat": git_diff, "git_diff_files": observed_changed_files, "head_sha": head_sha})
 
     blockers: list[str] = []
     if status_rc != 0:
         blockers.append(f"git status failed: {status_err or git_status}")
     if diff_rc != 0:
         blockers.append(f"git diff failed: {diff_err or git_diff}")
+    if diff_names_rc != 0:
+        blockers.append(f"git diff name inspection failed: {diff_names_err or git_diff_names}")
     if head_rc != 0 or not head_sha:
         blockers.append(f"git HEAD detection failed: {head_err or head_sha}")
     if blockers:
@@ -425,6 +449,7 @@ def verify_post_run(
         return payload
 
     claimed_commit = str(completion.get("commit_sha") or "").strip()
+    claimed_changed_files = [str(path).strip() for path in completion.get("changed_files", []) if str(path).strip()] if isinstance(completion.get("changed_files"), list) else []
     claimed_commit_verified = False
     if claimed_commit:
         exists_rc, _, exists_err = run(["git", "cat-file", "-e", f"{claimed_commit}^{{commit}}"])
@@ -470,7 +495,13 @@ def verify_post_run(
             verdict = "CLAIMS_EXCEED_EVIDENCE"
             blockers.append("NO_CHANGE_WITH_EVIDENCE does not match independently observed artifacts")
     elif terminal == "PRODUCTIVE_DIFF_WITH_EVIDENCE":
-        if git_diff or claimed_commit_verified:
+        if observed_changed_files:
+            if sorted(claimed_changed_files) == sorted(observed_changed_files):
+                verdict = "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
+            else:
+                verdict = "CLAIMS_EXCEED_EVIDENCE"
+                blockers.append("PRODUCTIVE_DIFF_WITH_EVIDENCE changed_files do not match independently observed diff files")
+        elif claimed_commit_verified:
             verdict = "VERIFIED_PRODUCTIVE_CANDIDATE_DIFF"
         else:
             verdict = "CLAIMS_EXCEED_EVIDENCE"
