@@ -171,7 +171,7 @@ def run_preflight_canary(
     runner: Runner = default_runner,
     now: str | None = None,
     registry_path: str | Path | None = None,
-    enforce_registry: bool = False,
+    enforce_registry: bool = True,
 ) -> dict[str, Any]:
     root = Path(worktree)
     receipt = Path(receipt_path)
@@ -524,8 +524,8 @@ def main(argv: list[str] | None = None) -> int:
     canary.add_argument("--model", required=True)
     canary.add_argument("--invocation", nargs="+", required=True)
     canary.add_argument("--receipt", required=True)
-    canary.add_argument("--registry")
-    canary.add_argument("--enforce-registry", action="store_true")
+    canary.add_argument("--registry", required=True)
+    canary.add_argument("--no-enforce-registry", action="store_true", help="diagnostic override; result states registry enforcement is disabled")
     verify = sub.add_parser("verify")
     verify.add_argument("--repo", required=True)
     verify.add_argument("--worktree", required=True)
@@ -540,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             invocation=args.invocation,
             receipt_path=args.receipt,
             registry_path=args.registry,
-            enforce_registry=args.enforce_registry,
+            enforce_registry=not args.no_enforce_registry,
         )
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0 if result["status"] == "PASS" else 2
