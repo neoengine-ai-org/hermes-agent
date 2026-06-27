@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-06-27T15:03:58.716459+00:00",
+  "generated_at": "2026-06-27T15:39:43.828958+00:00",
   "scores": {
-    "operational": 8.9,
-    "technical": 8.7,
-    "convergence_discipline": 8.8
+    "operational": 9.3,
+    "technical": 9.2,
+    "convergence_discipline": 9.3
   },
   "repos": {
     "neoengine-ai-org/neoengine": {
@@ -2366,5 +2366,89 @@
     }
   ],
   "platform_ci_blockers": [],
-  "non_claims_preserved": true
+  "non_claims_preserved": true,
+  "phase_1_closeout": {
+    "generated_at": "2026-06-27T15:39:43.828958+00:00",
+    "verdict": "ORG_CONVERGENCE_IMPROVED_BLOCKED_BY_HUMAN_GATE",
+    "board_publication": {
+      "repo": "neoengine-ai-org/hermes-agent",
+      "pr": 53,
+      "head_sha": "76ea8de39ce564b7faac82e1bb5d963f8a54831c",
+      "state": "OPEN",
+      "status": "published_via_pr_classifier_pending_after_body_repair"
+    },
+    "repairs": [
+      {
+        "repo": "neoengine-ai-org/neoengine",
+        "pr": 752,
+        "action": "PR body/classifier metadata repaired",
+        "head_sha": "8acc7d67b70a7f550f941f7385e020760ccafbeb",
+        "state": "READY_FOR_HUMAN_REVIEW",
+        "evidence": "classifier, governance, backend, ui-quality, opposite-frontier advisory green; review request comment posted"
+      },
+      {
+        "repo": "neoengine-ai-org/neowealth",
+        "pr": 651,
+        "action": "PR body/classifier metadata repaired",
+        "head_sha": "f9973beed5b9c170ddfa7e11970a4cc5ac24cce5",
+        "state": "MERGED_WITH_EVIDENCE",
+        "evidence": "classifier, NeoWealth CI, and policy green; PR state MERGED"
+      },
+      {
+        "repo": "neoengine-ai-org/neowealth",
+        "pr": 649,
+        "action": "PR body/classifier metadata repaired",
+        "head_sha": "efc016a08a78406a40b1ab9c28a91bef9b0a2c06",
+        "state": "READY_FOR_HUMAN_REVIEW",
+        "evidence": "classifier, NeoWealth CI, policy green; review request comment posted"
+      },
+      {
+        "repo": "neoengine-ai-org/hermes-agent",
+        "pr": 39,
+        "action": "test repair commit pushed",
+        "head_sha": "8bde7551a9d92c856b272a78ea2fb10878862344",
+        "state": "BLOCKED_BY_PROTECTED_GATE_AND_PENDING_CI",
+        "evidence": "focused ACP tests and ruff pass locally; GitHub checks in progress; classifier body ready but review gate remains"
+      }
+    ],
+    "review_requests": [
+      {
+        "repo": "neoengine-ai-org/ai-org",
+        "pr": 182,
+        "head_sha": "e695092f83f10fbe5be798934772eff200e4ea20"
+      },
+      {
+        "repo": "neoengine-ai-org/neoengine",
+        "pr": 747,
+        "head_sha": "6c8fe416ededfabf96a60ff8272e8369b964f3e1"
+      },
+      {
+        "repo": "neoengine-ai-org/hermes-agent",
+        "pr": 37,
+        "head_sha": "b370a916d377568dd0112908071bcb58e58e0703"
+      },
+      {
+        "repo": "neoengine-ai-org/neoengine",
+        "pr": 752,
+        "head_sha": "8acc7d67b70a7f550f941f7385e020760ccafbeb"
+      },
+      {
+        "repo": "neoengine-ai-org/neowealth",
+        "pr": 649,
+        "head_sha": "efc016a08a78406a40b1ab9c28a91bef9b0a2c06"
+      }
+    ],
+    "qwen": {
+      "true_movement_count": 0,
+      "activity_count": 5,
+      "repair_commits_landed": 0,
+      "no_op_repairs_verified": 0,
+      "review_requests": 2,
+      "inflation_risks_removed": [
+        "ai-org #182 review requested but not claimed live until merged",
+        "NeoEngine #747 review requested without counting Qwen as runtime capacity"
+      ]
+    },
+    "non_claims_preserved": true
+  }
 }

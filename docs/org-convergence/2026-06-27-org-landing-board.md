@@ -163,3 +163,15 @@
   - No force-push, no protected-branch direct push, no branch-protection bypass.
   - Do not close drafts/duplicates until evidence comments are prepared.
   - Do not merge anything without live current-head required green + visible gate satisfaction.
+
+
+## Phase 1 Repair Addendum — 2026-06-27T15:39:43.828958+00:00
+
+- Verdict: ORG_CONVERGENCE_IMPROVED_BLOCKED_BY_HUMAN_GATE.
+- Board publication: Hermes PR #53 opened at `76ea8de39ce564b7faac82e1bb5d963f8a54831c`; PR body/classifier metadata repaired; classifier rerun pending at addendum time.
+- NeoEngine #752: PR body/classifier metadata repaired; classifier, governance, backend, UI-quality, and advisory checks green; current-head review requested for `8acc7d67b70a7f550f941f7385e020760ccafbeb`.
+- NeoWealth #651: PR body/classifier metadata repaired; classifier, CI, and policy green; PR is now merged at `f9973beed5b9c170ddfa7e11970a4cc5ac24cce5`.
+- NeoWealth #649: PR body/classifier metadata repaired; classifier, CI, and policy green; current-head review requested for `efc016a08a78406a40b1ab9c28a91bef9b0a2c06`.
+- Hermes #39: focused test repair commit pushed at `8bde7551a9d92c856b272a78ea2fb10878862344`; focused ACP tests and ruff passed locally; GitHub required checks are still pending and protected/classifier review gate remains.
+- Human/protected review requests posted: ai-org #182, NeoEngine #747, Hermes #37, NeoEngine #752, NeoWealth #649.
+- Non-claims preserved: no production launch, customer-data readiness, OAuth/banking readiness, money movement, tax/accounting/ledger finality, branch-protection bypass, protected approval, Qwen movement inflation, or stale-head green claim.
