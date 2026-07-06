@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.release_memory.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "computed_at",
+    "orgs"
+  ],
+  "title": "org.release_memory.v1",
+  "type": "object"
+}

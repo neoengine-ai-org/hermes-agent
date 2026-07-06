@@ -1,0 +1,16 @@
+{
+  "schema": "org.policy.v1",
+  "org": "everarc",
+  "critical_path": [
+    {
+      "kind": "pull_request",
+      "number": 91,
+      "reason": "Everarc delivery evidence adoption seed",
+      "required_ladder": "product_capability_delivery.v1",
+      "required_claims": ["CURRENT_HEAD_SIDECAR_RECEIPT_BOUND"],
+      "eligible_lanes": ["EA-SONNET-01", "EA-SONNET-02", "EA-CODEX-01"]
+    }
+  ],
+  "required_checks": ["CI"],
+  "forbidden_claims_without_verified_ladder": ["live", "deployed", "accepted", "landed"]
+}

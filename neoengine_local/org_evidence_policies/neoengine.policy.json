@@ -1,0 +1,38 @@
+{
+  "schema": "org.policy.v1",
+  "org": "neoengine",
+  "critical_path": [
+    {
+      "kind": "pull_request",
+      "number": 726,
+      "reason": "Roadmap OS runtime delivery-state projection",
+      "required_ladder": "roadmap_os_delivery.v1",
+      "required_claims": ["CURRENT_HEAD_SIDECAR_RECEIPT_BOUND"],
+      "eligible_lanes": ["NE-SONNET-01", "NE-SONNET-02"]
+    },
+    {
+      "kind": "pull_request",
+      "number": 729,
+      "reason": "Actions cancellation diagnostic disposition",
+      "required_ladder": "diagnostic_disposition.v1",
+      "required_claims": []
+    }
+  ],
+  "contained": [
+    {
+      "kind": "pull_request_range",
+      "numbers": [735, 736, 737, 738, 739, 740],
+      "reason": "OCR shadow/prep until #726 resolves"
+    }
+  ],
+  "downstream": [
+    {
+      "kind": "pull_request",
+      "number": 722,
+      "requires": [726],
+      "required_artifact": "split_overlap_matrix"
+    }
+  ],
+  "required_checks": ["Mac App"],
+  "forbidden_claims_without_verified_ladder": ["live", "deployed", "accepted", "landed"]
+}

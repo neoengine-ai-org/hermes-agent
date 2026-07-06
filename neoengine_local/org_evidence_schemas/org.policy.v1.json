@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.policy.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "org",
+    "critical_path",
+    "required_checks"
+  ],
+  "title": "org.policy.v1",
+  "type": "object"
+}

@@ -1,0 +1,16 @@
+{
+  "schema": "org.policy.v1",
+  "org": "neowealth",
+  "critical_path": [
+    {
+      "kind": "pull_request",
+      "number": 625,
+      "reason": "NeoWealth live-data waves remain draft until proof ladder closes",
+      "required_ladder": "product_capability_delivery.v1",
+      "required_claims": ["CURRENT_HEAD_SIDECAR_RECEIPT_BOUND"],
+      "eligible_lanes": ["NW-SONNET-01", "NW-SONNET-02", "NW-CODEX-01"]
+    }
+  ],
+  "required_checks": ["CI"],
+  "forbidden_claims_without_verified_ladder": ["live", "deployed", "accepted", "landed"]
+}

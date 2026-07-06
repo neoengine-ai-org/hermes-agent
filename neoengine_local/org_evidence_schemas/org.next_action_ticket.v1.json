@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.next_action_ticket.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "ticket_id",
+    "org",
+    "subject",
+    "reason",
+    "required_artifact"
+  ],
+  "title": "org.next_action_ticket.v1",
+  "type": "object"
+}

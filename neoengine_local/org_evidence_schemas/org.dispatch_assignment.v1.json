@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "org.dispatch_assignment.v1"
+    }
+  },
+  "required": [
+    "schema",
+    "assignment_id",
+    "ticket_id",
+    "org",
+    "lane",
+    "status"
+  ],
+  "title": "org.dispatch_assignment.v1",
+  "type": "object"
+}
