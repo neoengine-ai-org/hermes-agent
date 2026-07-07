@@ -209,7 +209,8 @@ def is_test_like_path(file: str) -> bool:
     parts = {part.lower() for part in path.parts}
     name = path.name.lower()
     return (
-        bool(parts & {"test", "tests", "__tests__", "spec", "specs"})
+        bool(parts & {"test", "tests", "__tests__"})
+        or (bool(parts & {"spec", "specs"}) and (name.endswith("_spec.rb") or name.endswith("_test.rb")))
         or name.startswith("test_")
         or name.endswith(
             (
@@ -240,19 +241,24 @@ def is_documentation_file(file: str) -> bool:
 
 
 def is_launch_production_path(file: str) -> bool:
-    if is_documentation_file(file) or is_test_like_path(file):
+    if is_documentation_file(file):
         return False
 
-    path = Path(file)
+    path = Path(file.replace("\\", "/"))
     tokens = path_tokens(file)
-    parts = {part.lower() for part in path.parts}
+    parts_list = [part.lower() for part in path.parts]
+    parts = set(parts_list)
     suffix = path.suffix.lower()
     name = path.name.lower()
+    test_like = is_test_like_path(file)
+    if suffix in DOC_PROSE_SUFFIXES:
+        return False
+
     production_tokens = {"prod", "production"}
-    deploy_tokens = {"deploy", "deployment", "deployments", "release", "rollout"}
     deploy_name_tokens = {"deploy", "deployment", "deployments"}
     release_rollout_tokens = {"release", "rollout"}
     launch_posture_tokens = {
+        "activation",
         "approval",
         "approved",
         "boundary",
@@ -274,29 +280,6 @@ def is_launch_production_path(file: str) -> bool:
         "ready",
         "sequence",
         "values",
-    }
-    deployment_parts = {
-        ".github",
-        "charts",
-        "config",
-        "deploy",
-        "deployment",
-        "deployments",
-        "env",
-        "environment",
-        "environments",
-        "helm",
-        "infra",
-        "infrastructure",
-        "k8s",
-        "kubernetes",
-        "ops",
-        "prod",
-        "production",
-        "release",
-        "rollout",
-        "terraform",
-        "workflows",
     }
     deployment_script_parts = {
         ".github",
@@ -326,10 +309,59 @@ def is_launch_production_path(file: str) -> bool:
         ".yaml",
         ".yml",
     }
+    docker_artifact = (
+        name == "dockerfile"
+        or name in {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+        or (name.startswith(("dockerfile", "docker-compose", "compose.")) and tokens & production_tokens)
+    )
     deploy_artifact = (
         suffix in EXECUTABLE_SUFFIXES
         or suffix in deployment_config_suffixes
-        or name.startswith(("dockerfile", "docker-compose"))
+        or docker_artifact
+    )
+    root_path = len(parts_list) == 1
+    workflow_path = len(parts_list) >= 2 and parts_list[0] == ".github" and parts_list[1] == "workflows"
+    top_level_deployment_config = bool(parts_list) and parts_list[0] in {
+        "ansible",
+        "helm",
+        "helm-charts",
+        "infrastructure",
+        "infra",
+        "k8s",
+        "kubernetes",
+        "kube",
+        "manifests",
+        "pulumi",
+        "terraform",
+    }
+    top_level_helm_chart_config = (
+        bool(parts_list)
+        and parts_list[0] in {"charts", "helm", "helm-charts"}
+        and (
+            "templates" in parts
+            or name in {"chart.yaml", "chart.yml"}
+            or parts_list[0] in {"helm", "helm-charts"}
+            or (parts_list[0] == "charts" and len(parts_list) >= 3 and name in {"values.yaml", "values.yml"})
+            or (
+                parts_list[0] == "charts"
+                and len(parts_list) >= 3
+                and suffix in {".yaml", ".yml"}
+                and tokens & production_tokens
+            )
+        )
+    )
+    nested_helm_chart_config = bool(parts & {"helm", "helm-charts"}) and (not parts_list or parts_list[0] not in {"docs", "examples"})
+    deployment_config_context = (
+        top_level_deployment_config
+        or top_level_helm_chart_config
+        or nested_helm_chart_config
+        or bool(parts & {"ansible", "infra", "infrastructure", "k8s", "kubernetes", "kube", "manifests", "pulumi", "terraform"})
+    )
+    deployment_path_context = (
+        workflow_path
+        or root_path
+        or bool(parts & deployment_script_parts)
+        or top_level_deployment_config
     )
     presentation_parts = {"component", "components", "frontend", "ui", "ui-tui", "view", "views"}
     presentation_observer_tokens = {
@@ -344,31 +376,72 @@ def is_launch_production_path(file: str) -> bool:
         "panel",
         "status",
         "table",
-        "view",
-        "views",
         "widget",
     }
-    deploy_control_tokens = {"controller", "cutover", "manager", "pipeline", "router", "sequence"}
+    deploy_control_tokens = {"controller", "cutover", "helper", "helpers", "manager", "pipeline", "router", "sequence"}
+    production_operation_tokens = {"backfill", "cutover", "settings"}
+    fixture_tokens = {"example", "fixture", "fixtures", "mock", "sample", "samples"}
+
+    if test_like:
+        if docker_artifact and not tokens & production_tokens and not deployment_config_context:
+            return False
+        if suffix not in deployment_config_suffixes and not docker_artifact:
+            return False
+    if docker_artifact:
+        return True
 
     if (
         parts & presentation_parts
-        and tokens & deploy_name_tokens
+        and tokens & (deploy_name_tokens | release_rollout_tokens | production_tokens | {"launch"})
         and tokens & presentation_observer_tokens
-        and not tokens & (production_tokens | {"launch"} | deploy_control_tokens)
+        and not deployment_config_context
+        and not (suffix in deployment_config_suffixes and tokens & (production_tokens | deploy_name_tokens))
+        and not tokens & deploy_control_tokens
+        and not tokens & {"approval", "approved", "gate", "gating", "readiness", "ready"}
     ):
         return False
 
-    if tokens & deploy_name_tokens and deploy_artifact:
+    if suffix in deployment_config_suffixes and deployment_config_context:
         return True
-    if tokens & release_rollout_tokens and deploy_artifact and (parts & deployment_script_parts or tokens & production_tokens):
+    if (
+        suffix in deployment_config_suffixes
+        and tokens & (deploy_name_tokens | release_rollout_tokens)
+        and not tokens & fixture_tokens
+    ):
+        return True
+    if (
+        tokens & deploy_name_tokens
+        and deploy_artifact
+        and not tokens & fixture_tokens
+        and (deployment_path_context or tokens & (production_tokens | release_rollout_tokens | {"launch"} | deploy_control_tokens))
+    ):
+        return True
+    if tokens & release_rollout_tokens and deploy_artifact and not tokens & fixture_tokens and (deployment_path_context or tokens & production_tokens):
         return True
     if tokens & production_tokens and deploy_artifact:
-        return True
-    if tokens & production_tokens and (tokens & (deploy_tokens | {"launch"} | launch_posture_tokens) or parts & deployment_parts):
-        return True
+        if suffix in deployment_config_suffixes:
+            if root_path or deployment_config_context or deployment_path_context or parts & {"config", "env", "environment", "environments", "prod", "production"}:
+                return True
+        else:
+            if (
+                deployment_path_context
+                or deployment_config_context
+                or parts & {"prod", "production"}
+                or tokens & (deploy_name_tokens | release_rollout_tokens | {"launch"} | deploy_control_tokens | production_operation_tokens)
+            ):
+                return True
+    if tokens & production_tokens and (
+        tokens & (deploy_name_tokens | release_rollout_tokens | {"launch"} | launch_posture_tokens) or deployment_config_context
+    ):
+        if (
+            not deploy_artifact
+            or deployment_path_context
+            or deployment_config_context
+            or parts & {"prod", "production"}
+            or tokens & (deploy_name_tokens | release_rollout_tokens | {"launch"} | deploy_control_tokens | production_operation_tokens)
+        ):
+            return True
     if "launch" in tokens and tokens & (production_tokens | launch_posture_tokens):
-        return True
-    if parts & {"charts", "helm", "terraform"} and (suffix in deployment_config_suffixes or name.startswith(("dockerfile", "docker-compose"))):
         return True
     return False
 
@@ -479,6 +552,30 @@ def missing_runtime_payload_contract_fields(fields: dict[str, str] | None) -> li
     return sorted(field for field in RUNTIME_PAYLOAD_CONTRACT_FIELDS if not fields.get(field))
 
 
+def body_text_for_surface_inference(body: str) -> str:
+    """Return PR body text that can safely contribute semantic surfaces."""
+
+    lines: list[str] = []
+    for line in body.splitlines():
+        if re.match(r"^#+\s+(?:protected\s+)?non-claims\s*$", line, re.IGNORECASE):
+            continue
+        if re.match(r"^\s*-\s*protected_non_claims\s*:", line, re.IGNORECASE):
+            continue
+        negated_claim = re.match(r"^\s*-\s*this pr does not\b(.*)$", line, re.IGNORECASE)
+        if negated_claim:
+            affirmative_tail = re.search(
+                r"(?:\b(?:but|however|except)\b|[,;]\s*(?:and\s+)?|\band\s+)"
+                r"(.*\b(?:add|adds|adding|introduce|introduces|enable|enables|implement|implements|route|routes|routing|touch|touches|change|changes|update|updates|authorize|authorizes|claim|claims)\b.*)$",
+                negated_claim.group(1),
+                re.IGNORECASE,
+            )
+            if affirmative_tail:
+                lines.append(affirmative_tail.group(1))
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def infer_surfaces(files: list[str], body: str) -> set[str]:
     surfaces: set[str] = set()
     if not files:
@@ -491,8 +588,9 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
         p = Path(file)
         suffix = p.suffix.lower()
         parts = {part.lower() for part in p.parts}
+        file_test_like = is_test_like_path(file)
         docs_like = docs_like and (suffix in {".md", ".rst", ".txt"} or "docs" in parts or file == ".github/PULL_REQUEST_TEMPLATE.md")
-        tests_like = tests_like and ("tests" in parts or p.name.startswith("test_"))
+        tests_like = tests_like and file_test_like
         receipt_like = receipt_like and ("receipt" in p.name.lower() or "receipts" in parts)
 
         if file.startswith(".github/workflows/"):
@@ -504,9 +602,9 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
             surfaces.add("governance_review_policy")
         if file.startswith("gateway/") or "dispatch" in file or "conductor" in file:
             surfaces.add("conductor_dispatch")
-        if file.startswith(("agent/", "tools/", "hermes_cli/", "cron/", "tui_gateway/", "plugins/", "gateway/")):
+        if not file_test_like and file.startswith(("agent/", "tools/", "hermes_cli/", "cron/", "tui_gateway/", "plugins/", "gateway/")):
             surfaces.add("runtime_backend")
-        if file.startswith(("ui-tui/", "website/src/", "website/web/")) or suffix in {".tsx", ".jsx", ".css"}:
+        if not file_test_like and (file.startswith(("ui-tui/", "website/src/", "website/web/")) or suffix in {".tsx", ".jsx", ".css"}):
             surfaces.add("runtime_frontend")
         if "route" in file or "api" in parts:
             surfaces.add("api_route")
@@ -568,7 +666,9 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
             normalized = surface.strip().replace(" ", "_")
             if normalized in SURFACE_TO_CI:
                 surfaces.add(normalized)
-    body_lower = body.lower()
+    # Only prose-derived surfaces use filtered text. File paths and explicit
+    # Impacted surfaces declarations above remain authoritative.
+    body_lower = body_text_for_surface_inference(body).lower()
     for surface in SURFACE_TO_CI:
         if surface == "launch_production":
             continue
