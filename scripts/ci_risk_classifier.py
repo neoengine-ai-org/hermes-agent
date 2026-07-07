@@ -552,6 +552,30 @@ def missing_runtime_payload_contract_fields(fields: dict[str, str] | None) -> li
     return sorted(field for field in RUNTIME_PAYLOAD_CONTRACT_FIELDS if not fields.get(field))
 
 
+def body_text_for_surface_inference(body: str) -> str:
+    """Return PR body text that can safely contribute semantic surfaces."""
+
+    lines: list[str] = []
+    for line in body.splitlines():
+        if re.match(r"^#+\s+(?:protected\s+)?non-claims\s*$", line, re.IGNORECASE):
+            continue
+        if re.match(r"^\s*-\s*protected_non_claims\s*:", line, re.IGNORECASE):
+            continue
+        negated_claim = re.match(r"^\s*-\s*this pr does not\b(.*)$", line, re.IGNORECASE)
+        if negated_claim:
+            affirmative_tail = re.search(
+                r"(?:\b(?:but|however|except)\b|[,;]\s*(?:and\s+)?|\band\s+)"
+                r"(.*\b(?:add|adds|adding|introduce|introduces|enable|enables|implement|implements|route|routes|routing|touch|touches|change|changes|update|updates|authorize|authorizes|claim|claims)\b.*)$",
+                negated_claim.group(1),
+                re.IGNORECASE,
+            )
+            if affirmative_tail:
+                lines.append(affirmative_tail.group(1))
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
 def infer_surfaces(files: list[str], body: str) -> set[str]:
     surfaces: set[str] = set()
     if not files:
@@ -642,7 +666,9 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
             normalized = surface.strip().replace(" ", "_")
             if normalized in SURFACE_TO_CI:
                 surfaces.add(normalized)
-    body_lower = body.lower()
+    # Only prose-derived surfaces use filtered text. File paths and explicit
+    # Impacted surfaces declarations above remain authoritative.
+    body_lower = body_text_for_surface_inference(body).lower()
     for surface in SURFACE_TO_CI:
         if surface == "launch_production":
             continue

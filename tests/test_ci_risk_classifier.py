@@ -894,6 +894,169 @@ def test_classifier_self_change_routes_tier4_opposite_frontier() -> None:
     assert result.opposite_frontier_required is True
 
 
+def test_classifier_self_change_ignores_protected_non_claim_surface_text() -> None:
+    result = ci_risk_classifier.classify(
+        ["scripts/ci_risk_classifier.py", "tests/test_ci_risk_classifier.py"],
+        body(
+            **{
+                "Risk class": "R3",
+                "Complexity class": "C2",
+                "Impacted surfaces": "classifier_change, ci_workflow",
+                "RuntimePayloadContract present": "yes",
+                "governance_or_merge_authority_change": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "classifier_change",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, workflow_lint, pr_impact_classifier_tests, governance_required, review_policy_guard",
+            }
+        )
+        + runtime_payload_contract(
+            protected_non_claims="No production readiness, launch readiness, protected approval, money movement, live-bank readiness, or customer-data readiness."
+        )
+        + "\n## Non-claims\n\n- This PR does not claim money movement authority.\n",
+        additions=80,
+    )
+
+    assert "classifier_change" in result.impacted_surfaces
+    assert "money_movement" not in result.impacted_surfaces
+    assert result.customer_data_or_finance_impact is False
+    assert result.risk_class == "R3"
+
+
+def test_body_surface_inference_still_uses_ordinary_prose_after_non_claim_filter() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/ops/change-note.md"],
+        body(
+            **{
+                "Risk class": "R5",
+                "Complexity class": "C5",
+                "Impacted surfaces": "docs_only",
+                "RuntimePayloadContract present": "yes",
+                "protected_surface": "true",
+                "customer_data_or_finance_impact": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "risk=R5, protected_surface, customer_data_or_finance_impact",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "Opposite-provider adversarial required": "yes",
+                "Human/protected review required": "yes",
+                "Founder review required": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+            }
+        )
+        + runtime_payload_contract()
+        + "\n## Non-claims\n\n- This PR does not claim money movement authority.\n"
+        + "\n## Operator note\n\nThis change adds money movement routing in ordinary operator prose.\n",
+        additions=12,
+    )
+
+    assert "money_movement" in result.impacted_surfaces
+    assert result.customer_data_or_finance_impact is True
+    assert result.risk_class == "R5"
+
+
+def test_non_claims_prefix_heading_does_not_hide_real_surface_prose() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/ops/change-note.md"],
+        body(
+            **{
+                "Risk class": "R5",
+                "Complexity class": "C5",
+                "Impacted surfaces": "docs_only",
+                "RuntimePayloadContract present": "yes",
+                "protected_surface": "true",
+                "customer_data_or_finance_impact": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "risk=R5, protected_surface, customer_data_or_finance_impact",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "Opposite-provider adversarial required": "yes",
+                "Human/protected review required": "yes",
+                "Founder review required": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+            }
+        )
+        + runtime_payload_contract()
+        + "\n## Non-claims and surfaces touched\n\nThis change adds money movement routing.\n",
+        additions=12,
+    )
+
+    assert "money_movement" in result.impacted_surfaces
+    assert result.customer_data_or_finance_impact is True
+    assert result.risk_class == "R5"
+
+
+def test_trailing_non_claims_section_does_not_hide_following_real_surface_prose() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/ops/change-note.md"],
+        body(
+            **{
+                "Risk class": "R5",
+                "Complexity class": "C5",
+                "Impacted surfaces": "docs_only",
+                "RuntimePayloadContract present": "yes",
+                "protected_surface": "true",
+                "customer_data_or_finance_impact": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "risk=R5, protected_surface, customer_data_or_finance_impact",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "Opposite-provider adversarial required": "yes",
+                "Human/protected review required": "yes",
+                "Founder review required": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+            }
+        )
+        + runtime_payload_contract()
+        + "\n## Non-claims\n\n- This PR does not claim money movement authority.\n\nThis PR does add money movement routing.\n",
+        additions=12,
+    )
+
+    assert "money_movement" in result.impacted_surfaces
+    assert result.customer_data_or_finance_impact is True
+    assert result.risk_class == "R5"
+
+
+def test_mixed_non_claim_bullet_keeps_affirmative_risky_tail() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/ops/change-note.md"],
+        body(
+            **{
+                "Risk class": "R5",
+                "Complexity class": "C5",
+                "Impacted surfaces": "docs_only",
+                "RuntimePayloadContract present": "yes",
+                "protected_surface": "true",
+                "customer_data_or_finance_impact": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "risk=R5, protected_surface, customer_data_or_finance_impact",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "Opposite-provider adversarial required": "yes",
+                "Human/protected review required": "yes",
+                "Founder review required": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+            }
+        )
+        + runtime_payload_contract()
+        + "\n## Non-claims\n\n- This PR does not change auth, and adds money movement routing.\n",
+        additions=12,
+    )
+
+    assert "money_movement" in result.impacted_surfaces
+    assert result.customer_data_or_finance_impact is True
+    assert result.risk_class == "R5"
+
+
 def test_c4_systemic_complexity_routes_tier4_even_without_extra_protected_flags() -> None:
     result = ci_risk_classifier.classify(
         [f"docs/architecture/module_{index}.md" for index in range(25)],
