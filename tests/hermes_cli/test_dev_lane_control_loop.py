@@ -13,6 +13,21 @@ def _home(tmp_path, monkeypatch):
     return tmp_path
 
 
+def _continuity_packet(**overrides):
+    packet = {
+        "current_objective": "fix CI",
+        "current_repo_branch_pr": "repo/main#1",
+        "files_touched_or_planned": ["a.py"],
+        "active_blocker": None,
+        "last_verified_command_check": "pytest tests/x.py",
+        "next_safe_action": "rerun focused test",
+        "explicit_non_claims": ["not merged"],
+        "operator_approvals_relied_on": [],
+    }
+    packet.update(overrides)
+    return packet
+
+
 def test_new_session_resumes_from_heartbeat_and_continuity_state(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     with kb.connect() as conn:
@@ -28,21 +43,46 @@ def test_new_session_resumes_from_heartbeat_and_continuity_state(tmp_path, monke
         kb.write_lane_continuity_packet(
             conn,
             lane_id="dev-a",
-            packet={
-                "current_objective": "fix CI",
-                "current_repo_branch_pr": "repo/main#1",
-                "files_touched_or_planned": ["a.py"],
-                "active_blocker": None,
-                "last_verified_command_check": "pytest tests/x.py",
-                "next_safe_action": "rerun focused test",
-                "explicit_non_claims": ["not merged"],
-                "operator_approvals_relied_on": [],
-            },
+            packet=_continuity_packet(),
         )
         state = kb.discover_lane_session_state(conn, "dev-a", "session-new")
     assert state["heartbeat"]["claimed_work_item_id"] == "W1"
     assert state["continuity_packet"]["next_safe_action"] == "rerun focused test"
     assert state["ownership_valid"] is False
+
+
+def test_unchanged_continuity_packet_can_skip_routine_rewrite(tmp_path, monkeypatch):
+    _home(tmp_path, monkeypatch)
+    packet = _continuity_packet()
+    with kb.connect() as conn:
+        kb.write_lane_continuity_packet(
+            conn, lane_id="dev-a", packet=packet, now=100
+        )
+        kb.write_lane_continuity_packet(
+            conn,
+            lane_id="dev-a",
+            packet=packet,
+            now=200,
+            skip_if_unchanged=True,
+        )
+        unchanged = conn.execute(
+            "SELECT updated_at FROM lane_continuity_packets WHERE lane_id='dev-a'"
+        ).fetchone()
+
+        kb.write_lane_continuity_packet(
+            conn,
+            lane_id="dev-a",
+            packet=_continuity_packet(next_safe_action="claim next work item"),
+            now=300,
+            skip_if_unchanged=True,
+        )
+        changed = conn.execute(
+            "SELECT updated_at, packet_json FROM lane_continuity_packets WHERE lane_id='dev-a'"
+        ).fetchone()
+
+    assert unchanged["updated_at"] == 100
+    assert changed["updated_at"] == 300
+    assert "claim next work item" in changed["packet_json"]
 
 
 def test_duplicate_active_claims_are_rejected(tmp_path, monkeypatch):

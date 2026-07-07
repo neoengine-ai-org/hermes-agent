@@ -355,7 +355,18 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
 # Worker aliveness / crash detection
 # ---------------------------------------------------------------------------
 
-def test_pid_alive_helper():
+def test_pid_alive_helper(monkeypatch):
+    from gateway import status as gateway_status
+
+    real_pid_exists = gateway_status._pid_exists
+
+    def fake_pid_exists(pid):
+        if pid == 2 ** 30:
+            return False
+        return real_pid_exists(pid)
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", fake_pid_exists)
+
     # Our own pid is alive.
     assert kb._pid_alive(os.getpid())
     # PID 0 / None / negative.
@@ -377,6 +388,33 @@ def test_pid_alive_detects_darwin_zombie(monkeypatch):
     monkeypatch.setattr(kb.subprocess, "run", fake_run)
 
     assert kb._pid_alive(123) is False
+
+
+def test_pid_alive_treats_probe_runtime_error_as_alive(monkeypatch):
+    from gateway import status as gateway_status
+
+    def unknown_pid(_pid):
+        raise RuntimeError("indeterminate liveness probe")
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", unknown_pid)
+
+    assert kb._pid_alive(12345) is True
+
+
+def test_terminate_reclaimed_worker_runtime_error_does_not_claim_kill():
+    def guarded_kill(_pid, _sig):
+        raise RuntimeError("blocked by process guard")
+
+    info = kb._terminate_reclaimed_worker(
+        12345,
+        kb._claimer_id(),
+        signal_fn=guarded_kill,
+    )
+
+    assert info["host_local"] is True
+    assert info["termination_attempted"] is True
+    assert info["terminated"] is False
+    assert info["sigkill"] is False
 
 
 def test_detect_crashed_workers_reclaims(kanban_home):
@@ -4209,8 +4247,12 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         conn.close()
 
 
-def test_detect_crashed_workers_increments_counter(kanban_home):
+def test_detect_crashed_workers_increments_counter(kanban_home, monkeypatch):
     """A single crash increments the consecutive_failures counter."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
