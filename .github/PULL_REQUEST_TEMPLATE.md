@@ -66,6 +66,7 @@ escalation reason.
 - Opposite-provider adversarial required: yes/no
 - Human/protected review required: yes/no
 - Founder review required: yes/no
+<!-- Founder review is reserved for R5, launch_production, or another explicitly founder-gated protected posture. Marketing/support claims still require their lanes and reviews, but do not by themselves make Founder review required. -->
 - Required CI lanes:
 - Skipped CI lanes and rationale:
 - Token class: S/M/L/XL
@@ -170,4 +171,3 @@ escalation reason.
 ## Screenshots / Logs
 
 <!-- If applicable, add screenshots or log output showing the fix/feature in action. -->
-

@@ -192,6 +192,186 @@ RUNTIME_PAYLOAD_CONTRACT_FIELDS = {
     "protected_non_claims",
 }
 
+EXECUTABLE_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".sql", ".sh", ".bash", ".rb", ".go", ".rs"}
+DOC_PROSE_SUFFIXES = {".md", ".mdx", ".rst", ".txt"}
+DOC_PLANS_DATA_SUFFIXES = {".json", ".yaml", ".yml"}
+DOC_PLANNING_PREFIXES = ("docs/plans/",)
+
+
+def path_tokens(file: str) -> set[str]:
+    normalized = file.replace("\\", "/")
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", normalized)
+    return {token for token in re.split(r"[^a-z0-9]+", camel_split.lower()) if token}
+
+
+def is_test_like_path(file: str) -> bool:
+    path = Path(file)
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    return (
+        bool(parts & {"test", "tests", "__tests__", "spec", "specs"})
+        or name.startswith("test_")
+        or name.endswith(
+            (
+                ".test.py",
+                ".spec.py",
+                ".test.ts",
+                ".spec.ts",
+                ".test.tsx",
+                ".spec.tsx",
+                ".test.js",
+                ".spec.js",
+                ".test.jsx",
+                ".spec.jsx",
+            )
+        )
+    )
+
+
+def is_documentation_file(file: str) -> bool:
+    normalized = file.replace("\\", "/")
+    path = Path(normalized)
+    suffix = path.suffix.lower()
+    parts = {part.lower() for part in path.parts}
+    return suffix not in EXECUTABLE_SUFFIXES and (
+        (suffix in DOC_PROSE_SUFFIXES and "docs" in parts)
+        or (normalized.startswith(DOC_PLANNING_PREFIXES) and suffix in (DOC_PROSE_SUFFIXES | DOC_PLANS_DATA_SUFFIXES))
+    )
+
+
+def is_launch_production_path(file: str) -> bool:
+    if is_documentation_file(file) or is_test_like_path(file):
+        return False
+
+    path = Path(file)
+    tokens = path_tokens(file)
+    parts = {part.lower() for part in path.parts}
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    production_tokens = {"prod", "production"}
+    deploy_tokens = {"deploy", "deployment", "deployments", "release", "rollout"}
+    deploy_name_tokens = {"deploy", "deployment", "deployments"}
+    release_rollout_tokens = {"release", "rollout"}
+    launch_posture_tokens = {
+        "approval",
+        "approved",
+        "boundary",
+        "config",
+        "configuration",
+        "controller",
+        "dockerfile",
+        "env",
+        "environment",
+        "environments",
+        "gate",
+        "gating",
+        "grade",
+        "manager",
+        "pipeline",
+        "router",
+        "settings",
+        "readiness",
+        "ready",
+        "sequence",
+        "values",
+    }
+    deployment_parts = {
+        ".github",
+        "charts",
+        "config",
+        "deploy",
+        "deployment",
+        "deployments",
+        "env",
+        "environment",
+        "environments",
+        "helm",
+        "infra",
+        "infrastructure",
+        "k8s",
+        "kubernetes",
+        "ops",
+        "prod",
+        "production",
+        "release",
+        "rollout",
+        "terraform",
+        "workflows",
+    }
+    deployment_script_parts = {
+        ".github",
+        "bin",
+        "cron",
+        "deploy",
+        "deployment",
+        "deployments",
+        "infra",
+        "infrastructure",
+        "k8s",
+        "kubernetes",
+        "ops",
+        "release",
+        "rollout",
+        "scripts",
+        "tools",
+        "workflows",
+    }
+    deployment_config_suffixes = {
+        ".env",
+        ".hcl",
+        ".json",
+        ".tf",
+        ".tfvars",
+        ".toml",
+        ".yaml",
+        ".yml",
+    }
+    deploy_artifact = (
+        suffix in EXECUTABLE_SUFFIXES
+        or suffix in deployment_config_suffixes
+        or name.startswith(("dockerfile", "docker-compose"))
+    )
+    presentation_parts = {"component", "components", "frontend", "ui", "ui-tui", "view", "views"}
+    presentation_observer_tokens = {
+        "badge",
+        "banner",
+        "card",
+        "dashboard",
+        "display",
+        "list",
+        "modal",
+        "notes",
+        "panel",
+        "status",
+        "table",
+        "view",
+        "views",
+        "widget",
+    }
+    deploy_control_tokens = {"controller", "cutover", "manager", "pipeline", "router", "sequence"}
+
+    if (
+        parts & presentation_parts
+        and tokens & deploy_name_tokens
+        and tokens & presentation_observer_tokens
+        and not tokens & (production_tokens | {"launch"} | deploy_control_tokens)
+    ):
+        return False
+
+    if tokens & deploy_name_tokens and deploy_artifact:
+        return True
+    if tokens & release_rollout_tokens and deploy_artifact and (parts & deployment_script_parts or tokens & production_tokens):
+        return True
+    if tokens & production_tokens and deploy_artifact:
+        return True
+    if tokens & production_tokens and (tokens & (deploy_tokens | {"launch"} | launch_posture_tokens) or parts & deployment_parts):
+        return True
+    if "launch" in tokens and tokens & (production_tokens | launch_posture_tokens):
+        return True
+    if parts & {"charts", "helm", "terraform"} and (suffix in deployment_config_suffixes or name.startswith(("dockerfile", "docker-compose"))):
+        return True
+    return False
+
 
 def _max(values: Iterable[str], order: list[str]) -> str:
     return max(values, key=order.index)
@@ -310,7 +490,7 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
     for file in files:
         p = Path(file)
         suffix = p.suffix.lower()
-        parts = set(p.parts)
+        parts = {part.lower() for part in p.parts}
         docs_like = docs_like and (suffix in {".md", ".rst", ".txt"} or "docs" in parts or file == ".github/PULL_REQUEST_TEMPLATE.md")
         tests_like = tests_like and ("tests" in parts or p.name.startswith("test_"))
         receipt_like = receipt_like and ("receipt" in p.name.lower() or "receipts" in parts)
@@ -364,7 +544,7 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
             surfaces.add("tax_accounting")
         if "money_movement" in file.lower() or "payment" in file.lower():
             surfaces.add("money_movement")
-        if any(term in file.lower() for term in ("production", "deploy", "launch")):
+        if is_launch_production_path(file):
             surfaces.add("launch_production")
         if "support" in file.lower():
             surfaces.add("support_customer_ops")
@@ -382,8 +562,16 @@ def infer_surfaces(files: list[str], body: str) -> set[str]:
     if receipt_like:
         surfaces.add("receipt_only")
 
+    declared_surfaces = parse_declared_field(body, "Impacted surfaces")
+    if declared_surfaces:
+        for surface in re.split(r"[,/]", declared_surfaces):
+            normalized = surface.strip().replace(" ", "_")
+            if normalized in SURFACE_TO_CI:
+                surfaces.add(normalized)
     body_lower = body.lower()
     for surface in SURFACE_TO_CI:
+        if surface == "launch_production":
+            continue
         if surface.replace("_", " ") in body_lower or surface in body_lower:
             surfaces.add(surface)
     return surfaces or {"docs_only"}
@@ -445,7 +633,7 @@ def required_reviews(risk: str, complexity: str, surfaces: set[str]) -> set[str]
         reviews.add("opposite_provider_adversarial_required")
     if risk in {"R4", "R5"} or surfaces & PROTECTED_SURFACES:
         reviews.add("protected_human_review_required")
-    if risk == "R5" or surfaces & {"launch_production", "marketing_claims"}:
+    if risk == "R5" or "launch_production" in surfaces:
         reviews.add("founder_review_required")
     if surfaces & {"security_permissions", "auth_identity", "secrets_tokens", "live_connector", "webhook", "pii_customer_data"}:
         reviews.add("security_review_required")
