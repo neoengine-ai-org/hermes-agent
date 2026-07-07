@@ -397,9 +397,20 @@ def test_launch_named_docs_do_not_trigger_launch_production_or_founder_review() 
     assert result.required_reviews == ["no_secondary_review_required"]
 
 
+def test_production_substring_marketing_docs_do_not_trigger_founder_review() -> None:
+    result = ci_risk_classifier.classify(
+        ["marketing/production-launch.md"],
+        body(),
+        additions=12,
+    )
+
+    assert "launch_production" not in result.impacted_surfaces
+    assert result.founder_review_required is False
+
+
 def test_deploy_production_named_tests_do_not_trigger_launch_production() -> None:
     result = ci_risk_classifier.classify(
-        ["tests/deploy-production.test.ts"],
+        ["tests/deploy-production.test.ts", "src/deploy-production.spec.ts"],
         body(
             **{
                 "Risk class": "R1",
@@ -447,6 +458,61 @@ def test_launch_named_runtime_without_production_posture_stays_runtime_review_on
     assert result.merge_blocking_conditions == []
 
 
+def test_non_deployment_chart_and_domain_paths_do_not_trigger_founder_review() -> None:
+    quiet_paths = [
+        "sql/ddl/chart_of_accounts.sql",
+        "src/components/charts/config.json",
+        "src/deployment-schedule.ts",
+        "src/capitalDeployment.ts",
+        "src/capital-deployment.ts",
+        "src/prod-fixtures.json",
+        "src/prod-fixtures.ts",
+        "src/prodParser.sql",
+        "src/prodConfig.ts",
+        "src/productionReadinessBanner.tsx",
+        "charts/revenue.json",
+        "charts/monthly-spend.yaml",
+        "charts/values.json",
+        "repo/components/charts/values.yaml",
+        "src/dashboard/charts/values.json",
+        "ui/charts/templates/axis.yaml",
+        "Dockerfile.dev",
+        "docker-compose.override.yml",
+        "tests/Dockerfile",
+        "tests/docker-compose.yml",
+        "fixtures/deploy_sample.json",
+        "deploy/deploy_sample.json",
+        "spec/deploy_production_spec.rb",
+        "docs/helm/values.yaml",
+        "examples/helm/production.yaml",
+        "ops/config.yaml",
+        "scripts/ui/release-notes.tsx",
+        "ops/ui/release-dashboard.tsx",
+        "ui-tui/production-status.tsx",
+    ]
+
+    for path in quiet_paths:
+        result = ci_risk_classifier.classify(
+            [path],
+            body(
+                **{
+                    "Risk class": "R2",
+                    "Complexity class": "C1",
+                    "Impacted surfaces": "runtime_frontend",
+                    "RuntimePayloadContract present": "yes",
+                    "model_tier_required": "2",
+                    "escalation_reason": "standard_bounded_engineering",
+                    "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, ui_quality, targeted_frontend_tests",
+                }
+            )
+            + runtime_payload_contract(),
+            additions=30,
+        )
+
+        assert "launch_production" not in result.impacted_surfaces, path
+        assert result.founder_review_required is False, path
+
+
 def test_real_production_deploy_workflow_still_requires_founder_review() -> None:
     result = ci_risk_classifier.classify(
         [".github/workflows/deploy-production.yml"],
@@ -481,6 +547,10 @@ def test_real_production_deploy_workflow_still_requires_founder_review() -> None
     assert result.merge_blocking_conditions == []
 
 
+def test_production_workflow_path_detection_does_not_depend_on_declared_surface() -> None:
+    assert ci_risk_classifier.is_launch_production_path(".github/workflows/production.yml") is True
+
+
 def test_real_production_environment_paths_still_require_founder_review() -> None:
     production_paths = [
         "environments/production/values.yaml",
@@ -505,11 +575,41 @@ def test_real_production_environment_paths_still_require_founder_review() -> Non
         "agent/launch_sequence.py",
         "deploy/deploy.sh",
         "infra/rollout.sh",
+        "infra/main.tf",
+        "infra/Dockerfile",
+        "infra/tests/deploy_production.tf",
         "k8s/deployment.yaml",
+        "k8s/service.yaml",
+        "k8s/ingress.yaml",
+        "k8s/configmap.yaml",
+        "k8s/secret.yaml",
+        "k8s/views/deployment.yaml",
+        "manifests/deployment.yaml",
+        "kube/deployment.yaml",
+        "config/deploy.json",
+        "settings/rollout.yaml",
+        "services/views/release.yaml",
         "charts/app/values.yaml",
+        "charts/app/values-prod.yaml",
+        "charts/app/values.production.yaml",
+        "charts/app/prod-values.yaml",
+        "charts/app/production.yaml",
+        "charts/app/prod.yaml",
+        "charts/app/Chart.yaml",
+        "charts/app/templates/deployment.yaml",
+        "helm-charts/app/values.yaml",
+        "services/helm/production.yaml",
+        "services/helm/views/production.yaml",
+        "views/deploy-production.yaml",
         "terraform/main.tf",
+        "ansible/site.yml",
+        "pulumi/main.yaml",
         "prod.env",
+        "Dockerfile",
         "Dockerfile.production",
+        "Dockerfile.prod",
+        "docker-compose.yml",
+        "compose.yaml",
     ]
 
     for path in production_paths:
