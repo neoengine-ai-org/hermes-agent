@@ -334,6 +334,247 @@ def test_pull_request_template_contains_classifier_policy_and_non_claim_blocks()
     assert "does not bypass branch protection" in template
 
 
+def test_marketing_claims_do_not_force_founder_review() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/marketing/landing-claims.md"],
+        body(
+            **{
+                "Risk class": "R3",
+                "Complexity class": "C1",
+                "Impacted surfaces": "marketing_claims",
+                "model_tier_required": "3",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "false",
+                "escalation_reason": "bounded_complex_engineering",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, marketing_claims_check, regulated_claim_guard",
+            }
+        ),
+        additions=25,
+    )
+
+    assert "marketing_claims" in result.impacted_surfaces
+    assert result.risk_class == "R3"
+    assert result.founder_review_required is False
+    assert "founder_review_required" not in result.required_reviews
+
+
+def test_marketing_launch_prose_does_not_infer_launch_production() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/marketing/landing-claims.md"],
+        body(
+            **{
+                "Risk class": "R3",
+                "Complexity class": "C1",
+                "Impacted surfaces": "marketing_claims",
+                "model_tier_required": "3",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "false",
+                "escalation_reason": "bounded_complex_engineering",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, marketing_claims_check, regulated_claim_guard",
+            }
+        )
+        + "\nThis updates the launch production banner copy for marketing claims.\n",
+        additions=25,
+    )
+
+    assert "marketing_claims" in result.impacted_surfaces
+    assert "launch_production" not in result.impacted_surfaces
+    assert result.risk_class == "R3"
+    assert result.founder_review_required is False
+
+
+def test_launch_named_docs_do_not_trigger_launch_production_or_founder_review() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/launch/production-readiness-notes.md"],
+        body(),
+        additions=18,
+    )
+
+    assert set(result.impacted_surfaces) == {"docs_only"}
+    assert "launch_production" not in result.impacted_surfaces
+    assert result.risk_class == "R0"
+    assert result.founder_review_required is False
+    assert result.required_reviews == ["no_secondary_review_required"]
+
+
+def test_deploy_production_named_tests_do_not_trigger_launch_production() -> None:
+    result = ci_risk_classifier.classify(
+        ["tests/deploy-production.test.ts"],
+        body(
+            **{
+                "Risk class": "R1",
+                "Complexity class": "C0",
+                "Impacted surfaces": "test_only",
+                "model_tier_required": "1",
+                "escalation_reason": "cheap_semantic_review",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, targeted_tests",
+            }
+        ),
+        additions=22,
+    )
+
+    assert result.impacted_surfaces == ["test_only"]
+    assert result.risk_class == "R1"
+    assert "launch_production" not in result.impacted_surfaces
+    assert result.founder_review_required is False
+
+
+def test_launch_named_runtime_without_production_posture_stays_runtime_review_only() -> None:
+    result = ci_risk_classifier.classify(
+        ["ui-tui/app-launcher.tsx", "ui-tui/deployment-status.tsx", "ui-tui/release-notes.tsx"],
+        body(
+            **{
+                "Risk class": "R2",
+                "Complexity class": "C1",
+                "Impacted surfaces": "runtime_frontend",
+                "RuntimePayloadContract present": "yes",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "model_tier_required": "2",
+                "escalation_reason": "standard_bounded_engineering",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, ui_quality, targeted_frontend_tests",
+            }
+        )
+        + runtime_payload_contract(),
+        additions=40,
+    )
+
+    assert "runtime_frontend" in result.impacted_surfaces
+    assert "launch_production" not in result.impacted_surfaces
+    assert result.risk_class == "R2"
+    assert result.model_tier_required == 2
+    assert result.founder_review_required is False
+    assert result.merge_blocking_conditions == []
+
+
+def test_real_production_deploy_workflow_still_requires_founder_review() -> None:
+    result = ci_risk_classifier.classify(
+        [".github/workflows/deploy-production.yml"],
+        body(
+            **{
+                "Risk class": "R5",
+                "Complexity class": "C5",
+                "Impacted surfaces": "ci_workflow, launch_production",
+                "RuntimePayloadContract present": "yes",
+                "protected_surface": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "risk=R5, protected_surface",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "Opposite-provider adversarial required": "yes",
+                "Human/protected review required": "yes",
+                "Founder review required": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+            }
+        )
+        + runtime_payload_contract(),
+        additions=35,
+    )
+
+    assert "launch_production" in result.impacted_surfaces
+    assert result.risk_class == "R5"
+    assert result.model_tier_required == 4
+    assert result.founder_review_required is True
+    assert "founder_review_required" in result.required_reviews
+    assert result.merge_blocking_conditions == []
+
+
+def test_real_production_environment_paths_still_require_founder_review() -> None:
+    production_paths = [
+        "environments/production/values.yaml",
+        "production/main.tf",
+        "config/production.yaml",
+        "services/prod/server.py",
+        "app/production_settings.py",
+        "gateway/deploy_pipeline.py",
+        "lib/deployment_helpers.py",
+        "release/deploy.py",
+        "rollout/manager.ts",
+        "ui-tui/launchController.tsx",
+        "agent/productionRouter.py",
+        "src/services/deployManager.ts",
+        "scripts/deploy.py",
+        "deploy.py",
+        "tools/deploy_helper.py",
+        "bin/deploy_staging.py",
+        "cron/production_cutover.py",
+        "gateway/production_router.py",
+        "tasks/production_backfill.py",
+        "agent/launch_sequence.py",
+        "deploy/deploy.sh",
+        "infra/rollout.sh",
+        "k8s/deployment.yaml",
+        "charts/app/values.yaml",
+        "terraform/main.tf",
+        "prod.env",
+        "Dockerfile.production",
+    ]
+
+    for path in production_paths:
+        result = ci_risk_classifier.classify(
+            [path],
+            body(
+                **{
+                    "Risk class": "R5",
+                    "Complexity class": "C5",
+                    "Impacted surfaces": "launch_production",
+                    "RuntimePayloadContract present": "yes",
+                    "protected_surface": "true",
+                    "model_tier_required": "4",
+                    "cc_review_required": "true",
+                    "opposite_frontier_required": "true",
+                    "escalation_reason": "risk=R5, protected_surface",
+                    "Secondary review required": "yes",
+                    "Adversarial review required": "yes",
+                    "Opposite-provider adversarial required": "yes",
+                    "Human/protected review required": "yes",
+                    "Founder review required": "yes",
+                    "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+                }
+            )
+            + runtime_payload_contract(),
+            additions=12,
+        )
+
+        assert "launch_production" in result.impacted_surfaces, path
+        assert result.risk_class == "R5", path
+        assert result.founder_review_required is True, path
+
+
+def test_non_launch_body_prose_still_infers_protected_surfaces() -> None:
+    result = ci_risk_classifier.classify(
+        ["docs/ops/change-note.md"],
+        body(
+            **{
+                "Risk class": "R5",
+                "Complexity class": "C5",
+                "Impacted surfaces": "docs_only",
+                "RuntimePayloadContract present": "yes",
+                "protected_surface": "true",
+                "model_tier_required": "4",
+                "cc_review_required": "true",
+                "opposite_frontier_required": "true",
+                "escalation_reason": "risk=R5, protected_surface",
+                "Secondary review required": "yes",
+                "Adversarial review required": "yes",
+                "Opposite-provider adversarial required": "yes",
+                "Human/protected review required": "yes",
+                "Founder review required": "yes",
+                "Required CI lanes": "pr_body_contract, diff_check, docs_impact, typecheck, targeted_runtime_tests, backend_runtime, build, governance_required, security_required, protected_claim_gate, human_gate_required, privacy_data_gate, rollback_proof, audit_log_validation, production_readiness_gate, incident_response_check, support_readiness_check, marketing_claims_check, regulated_claim_guard, data_deletion_export_check, monitoring_observability_check, workflow_lint, pr_impact_classifier_tests, rollback_check",
+            }
+        )
+        + runtime_payload_contract()
+        + "\nThis change mentions money movement and secrets tokens in operator prose.\n",
+        additions=12,
+    )
+
+    assert "money_movement" in result.impacted_surfaces
+    assert "secrets_tokens" in result.impacted_surfaces
+    assert result.risk_class == "R5"
+
+
 
 def test_cc_review_tier3_uses_codex_without_opposite_frontier_for_complex_bounded_engineering() -> None:
     result = ci_risk_classifier.classify(
