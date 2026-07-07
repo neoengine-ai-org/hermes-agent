@@ -77,7 +77,7 @@ def run(cmd: list[str], cwd: Path | None = None, timeout: int = 20) -> tuple[int
 
 def load_json(path: Path) -> dict:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding='utf-8'))
     except Exception:
         return {}
 
@@ -213,7 +213,7 @@ def dirty_state() -> dict:
         'top_dirty_files': [e['path'] for e in entries[:12]],
     }
     DIRTY_RECEIPT.parent.mkdir(parents=True, exist_ok=True)
-    DIRTY_RECEIPT.write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n')
+    DIRTY_RECEIPT.write_text(json.dumps(receipt, indent=2, sort_keys=True) + '\n', encoding='utf-8')
     return receipt
 
 
@@ -269,7 +269,7 @@ def main() -> int:
     if not CONTROL.is_file():
         return fail_closed('Hermes could not read the required single source of truth because the file is missing.')
     try:
-        control_text = CONTROL.read_text()
+        control_text = CONTROL.read_text(encoding='utf-8')
     except Exception as e:
         return fail_closed(f'Hermes could not read the required single source of truth: {e}')
     if SECTION not in control_text:
@@ -349,7 +349,7 @@ def main() -> int:
         'rule': 'Runtime proof can prove the NeoWealth operating substrate is alive; it cannot prove product progress, PR readiness, merge readiness, blocker closure, CI repair, launch readiness, or production readiness.',
     }
     STATE.parent.mkdir(parents=True, exist_ok=True)
-    STATE.write_text(json.dumps(state_doc, indent=2, sort_keys=True) + '\n')
+    STATE.write_text(json.dumps(state_doc, indent=2, sort_keys=True) + '\n', encoding='utf-8')
 
     prev_blockers = previous_snapshot.get('blockers') or []
     new_blockers = 0
