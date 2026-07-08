@@ -1398,8 +1398,13 @@ def _cross_process_init_lock(path: Path):
     process. Runtime supervisors start as independent processes and can all hit
     ``connect()`` for the first time at once; schema initialization must not run
     concurrently across those processes.
+
+    ``hermes kanban swap`` also takes this lock exclusively across its inode
+    swap, so a new/respawned ``connect()`` blocks until the swap finishes and
+    then opens the fresh inode. For that to hold, the lock path is canonicalized
+    (``realpath``) so a symlinked and a resolved DB path map to the same lock.
     """
-    lock_path = path.with_name(f"{path.name}.init.lock")
+    lock_path = _kanban_lock_sidecar(path, "init.lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     if fcntl is None:
         # Windows lacks fcntl/flock; keep module importable and fall back to the
@@ -1412,6 +1417,171 @@ def _cross_process_init_lock(path: Path):
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+# ---------------------------------------------------------------------------
+# Cross-process write serialization + offline maintenance lock
+#
+# The kanban DB is written by many independent, long-lived processes (gateway,
+# per-lane supervisors, one-shot CLI invocations). SQLite already serializes
+# writers with ``BEGIN IMMEDIATE``, but a *file* lock on a dedicated
+# ``<db>.write.lock`` sidecar gives one guarantee SQLite's internal locks
+# cannot: an offline maintenance tool (``hermes kanban swap``) can take the SAME
+# lock EXCLUSIVELY and know that no cooperating writer is mid-transaction while
+# it replaces the live DB inode. Live inode swaps under active writers are the
+# confirmed root cause of the recurring page corruption, so this lock is the
+# primitive that makes an atomic swap safe.
+#
+# Reentrancy: ``_cross_process_write_lock`` is reentrant *within a thread* —
+# a nested ``write_txn`` does not re-take the flock (that would self-deadlock,
+# which is why an earlier non-reentrant version was reverted). Across threads
+# and processes it still serializes: a second thread/process blocks until the
+# holder releases. The inner nested ``write_txn`` therefore still reaches
+# ``BEGIN IMMEDIATE`` and fails fast exactly as before.
+
+
+def _kanban_lock_sidecar(db_path: Path, suffix: str) -> Path:
+    """Canonical ``<realpath(db)>.<suffix>`` lock sidecar path.
+
+    ``realpath`` so a symlinked and a resolved DB path map to the SAME lock
+    file — otherwise two processes opening the DB via different spellings would
+    take different locks and lose mutual exclusion (and ``swap`` exclusion).
+    """
+    real = Path(os.path.realpath(db_path))
+    return real.with_name(f"{real.name}.{suffix}")
+
+
+def _kanban_write_lock_path(db_path: Path) -> Path:
+    """Sidecar advisory-lock file guarding writes to ``db_path``."""
+    return _kanban_lock_sidecar(db_path, "write.lock")
+
+
+def _write_lock_enabled() -> bool:
+    """Whether ``write_txn`` takes the cross-process advisory write lock.
+
+    Controlled by ``HERMES_KANBAN_WRITE_LOCK``; default on. Set to ``0`` /
+    ``false`` / ``no`` / ``off`` to disable — SQLite's own ``BEGIN IMMEDIATE``
+    still serializes writers; only the cross-process maintenance guarantee that
+    ``hermes kanban swap`` relies on is weakened (it then trusts the lsof/PID
+    quiescence check alone).
+    """
+    raw = os.environ.get("HERMES_KANBAN_WRITE_LOCK", "").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+# Per-thread reentrancy depth, keyed by resolved lock-file path. Thread-local so
+# that *different* threads still serialize (each starts at depth 0 and blocks on
+# the flock) while a single thread's nested ``write_txn`` skips re-locking.
+_write_lock_local = threading.local()
+
+
+def _write_lock_depths() -> dict[str, int]:
+    depths = getattr(_write_lock_local, "depths", None)
+    if depths is None:
+        depths = {}
+        _write_lock_local.depths = depths
+    return depths
+
+
+def _conn_main_db_path(conn: sqlite3.Connection) -> Optional[str]:
+    """Filesystem path of a connection's ``main`` database, or ``None``."""
+    try:
+        for _seq, name, path in conn.execute("PRAGMA database_list"):
+            if name == "main" and path:
+                return str(path)
+    except sqlite3.Error:
+        return None
+    return None
+
+
+@contextlib.contextmanager
+def _cross_process_write_lock(conn: sqlite3.Connection):
+    """Serialize a write transaction across threads and processes.
+
+    Reentrant within a thread (see module note above). No-op when ``fcntl`` is
+    unavailable (Windows), when the write lock is disabled via
+    ``HERMES_KANBAN_WRITE_LOCK``, or for in-memory / unresolved databases.
+    """
+    if fcntl is None or not _write_lock_enabled():
+        yield
+        return
+    db_path = _conn_main_db_path(conn)
+    if not db_path or db_path == ":memory:":
+        yield
+        return
+    lock_path = _kanban_write_lock_path(Path(db_path))
+    key = str(lock_path)
+    depths = _write_lock_depths()
+    if depths.get(key, 0) > 0:
+        # Already held by this thread (nested write_txn) — do NOT re-flock or we
+        # would self-deadlock; the nested BEGIN IMMEDIATE still fails fast.
+        depths[key] += 1
+        try:
+            yield
+        finally:
+            depths[key] -= 1
+        return
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        depths[key] = 1
+        try:
+            yield
+        finally:
+            # Restore depth first, then release the OS lock, so a failure to
+            # unlock never leaves a phantom positive depth on this thread.
+            depths[key] = depths.get(key, 1) - 1
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+class KanbanMaintenanceLockTimeout(RuntimeError):
+    """Raised when the exclusive maintenance (init) lock cannot be acquired."""
+
+
+@contextlib.contextmanager
+def exclusive_maintenance_lock(db_path: Path, *, timeout: float = 10.0, poll: float = 0.2):
+    """Hold ``<db>.init.lock`` EXCLUSIVELY for an offline maintenance operation.
+
+    This is the SAME lock :func:`connect` takes around its whole open/init, so
+    while ``hermes kanban swap`` holds it no new or respawned process can attach
+    to the DB — closing the "connect() between the lsof check and the inode
+    swap" race. It deliberately locks the *init* lock, not ``write.lock``:
+    ``connect()`` acquires init-then-write (its migration runs ``write_txn``), so
+    a maintenance path that took write-then-init would deadlock. Locking only the
+    init lock keeps a single, consistent lock order.
+
+    Blocks up to ``timeout`` seconds (non-blocking ``flock`` retried every
+    ``poll`` s); raises :class:`KanbanMaintenanceLockTimeout` if it stays held —
+    i.e. a process is still attaching/migrating, so a swap must not proceed.
+
+    Yields ``None`` (a no-op) when ``fcntl`` is unavailable; the caller must then
+    fall back to the lsof/PID quiescence check alone.
+    """
+    if fcntl is None:
+        yield None
+        return
+    lock_path = _kanban_lock_sidecar(db_path, "init.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, timeout)
+    handle = lock_path.open("a+")
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise KanbanMaintenanceLockTimeout(
+                        f"could not acquire exclusive maintenance lock {lock_path} "
+                        f"within {timeout}s — a process is still attaching to the DB"
+                    )
+                time.sleep(poll)
+        try:
+            yield handle
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
 
 
 def connect(
@@ -1761,15 +1931,21 @@ def write_txn(conn: sqlite3.Connection):
     Use for any multi-statement write (creating a task + link, claiming a
     task + recording an event, etc.).  A claim CAS inside this context is
     atomic -- at most one concurrent writer can succeed.
+
+    Wrapped in :func:`_cross_process_write_lock` (reentrant per thread) so an
+    offline ``hermes kanban swap`` can take the same ``<db>.write.lock``
+    exclusively and know no cooperating writer is mid-transaction while it
+    replaces the DB inode.
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    else:
-        conn.execute("COMMIT")
+    with _cross_process_write_lock(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        else:
+            conn.execute("COMMIT")
 
 
 # ---------------------------------------------------------------------------
