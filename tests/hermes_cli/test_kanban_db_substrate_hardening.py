@@ -239,7 +239,9 @@ def test_periodic_reprobe_detects_corruption_after_first_connect(
         kb.connect(db_path=db_path)
 
     err = excinfo.value
-    assert "quick_check" in err.reason or "sqlite refused" in err.reason
+    # Periodic re-probe now runs the full integrity_check (not quick_check) so
+    # it catches index/table divergence ("orphan index") too.
+    assert "integrity_check" in err.reason or "sqlite refused" in err.reason
     # Cache evicted so subsequent connects re-run the full first-connect guard.
     assert key not in kb._INITIALIZED_PATHS
     # The existing backup path still ran.
@@ -325,8 +327,16 @@ def test_reprobe_lock_contention_skips_probe_and_defers(tmp_path, monkeypatch):
     assert key in kb._LAST_INTEGRITY_PROBE
 
 
-def test_reprobe_wal_without_shm_skips_without_deferring(tmp_path, monkeypatch):
-    """A no-SHM WAL shape must not create sidecars or reset the probe clock."""
+def test_reprobe_wal_without_shm_evicts_cache_for_full_reguard(tmp_path, monkeypatch):
+    """A no-SHM WAL shape can't be probed read-only without creating ``-shm``.
+
+    Rather than keep silently trusting the cached verdict forever (the hole an
+    adversarial review flagged), the periodic re-probe must (a) create no
+    sidecars, (b) stamp the probe clock so re-evaluation is at most once per
+    interval, and (c) evict the path from ``_INITIALIZED_PATHS`` so the next
+    ``connect()`` re-runs the full guard, whose read/write fallback verifies
+    integrity before migrations.
+    """
     monkeypatch.setenv("HERMES_KANBAN_INTEGRITY_RECHECK_SECONDS", "0.000001")
     db_path = _copied_wal_db_without_shm(tmp_path)
     key = str(db_path.resolve())
@@ -336,7 +346,9 @@ def test_reprobe_wal_without_shm_skips_without_deferring(tmp_path, monkeypatch):
     kb._guard_existing_db_is_healthy(db_path)
 
     assert not (tmp_path / "kanban.db-shm").exists()
-    assert key not in kb._LAST_INTEGRITY_PROBE
+    # Stamped (deferred one interval) and evicted so the next connect re-guards.
+    assert key in kb._LAST_INTEGRITY_PROBE
+    assert key not in kb._INITIALIZED_PATHS
 
 
 def test_reprobe_connection_is_read_only(tmp_path, monkeypatch):

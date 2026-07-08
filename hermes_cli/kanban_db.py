@@ -1361,7 +1361,7 @@ def _guard_existing_db_is_healthy(path: Path) -> bool:
 
 
 def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
-    """Re-probe a cached-healthy DB with ``PRAGMA quick_check`` periodically.
+    """Re-probe a cached-healthy DB with ``PRAGMA integrity_check`` periodically.
 
     Closes the "long-lived daemon never re-checks" hole: before this,
     a process that connected once before on-disk corruption happened kept
@@ -1376,11 +1376,18 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
       per-process jitter of up to 10% of the interval (pid-derived) so a
       dozen daemons started together don't all probe at the same interval
       boundary.
-    * Uses ``PRAGMA quick_check`` — cheaper than the first-connect full
-      ``integrity_check`` — over a short-timeout, **read-only**
-      (URI ``mode=ro``) probe connection. Read/write probe connections on
-      a WAL/hot-journal DB can checkpoint, run recovery, or take write
-      locks; a probe must never mutate a possibly-damaged file.
+    * Uses ``PRAGMA integrity_check`` (not ``quick_check``) over a
+      short-timeout, **read-only** (URI ``mode=ro``) probe connection.
+      ``quick_check`` skips the index<->table content-consistency pass and
+      would miss the "orphan index" corruption class this guard exists to
+      catch. Read/write probe connections on a WAL/hot-journal DB can
+      checkpoint, run recovery, or take write locks; a probe must never
+      mutate a possibly-damaged file.
+    * A WAL DB with no ``-shm`` cannot be probed read-only without creating
+      the sidecar, so that case evicts the trusted-cache entry (stamped once
+      per interval) and defers to the next ``connect()``'s full guard, whose
+      read/write fallback verifies integrity before migrations — rather than
+      trusting the cached verdict indefinitely.
     * The probe timestamp is recorded BEFORE probing (coalescing): while
       one thread's probe is in flight, concurrent connects see a fresh
       timestamp and skip instead of stacking probes behind
@@ -1402,6 +1409,16 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
     if last is not None and (now - last) < _reprobe_effective_interval(interval):
         return
     if _read_only_probe_would_create_shm(resolved):
+        # A read-only probe cannot open a WAL DB that has no -shm without
+        # creating one, so we cannot re-probe read-only here. Do NOT keep
+        # silently trusting the cached verdict forever (that was the original
+        # "long-lived daemon never re-checks" hole, just relocated): drop the
+        # trusted-cache entry so the next connect() re-runs the full guard,
+        # whose read/write fallback verifies integrity before migrations and
+        # recreates -shm (letting later probes go read-only again). Stamp now
+        # so this re-evaluation happens at most once per interval.
+        _LAST_INTEGRITY_PROBE[key] = now
+        _INITIALIZED_PATHS.discard(key)
         return
     # Coalesce: stamp before probing so concurrent connects skip while this
     # probe is in flight instead of queueing more probes. Every outcome
@@ -1415,7 +1432,13 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
             uri=True, timeout=2, isolation_level=None,
         )
         try:
-            reason = _integrity_check_reason(probe, pragma="quick_check")
+            # Full integrity_check, not quick_check: quick_check skips the
+            # index<->table content consistency pass, so it can miss exactly
+            # the "orphan index" / index-table divergence corruption class seen
+            # in the 2026-06-24 incident. The board is small and this runs at
+            # most once per recheck interval per path, so the extra cost is
+            # negligible next to missing a real corruption.
+            reason = _integrity_check_reason(probe)
         finally:
             probe.close()
     except sqlite3.OperationalError:
@@ -2011,33 +2034,34 @@ def write_lane_continuity_packet(
     ts = _now(now)
     packet_json = json.dumps(packet, sort_keys=True)
     packet_sha256 = hashlib.sha256(packet_json.encode("utf-8")).hexdigest()
-    if skip_if_unchanged:
-        existing = conn.execute(
-            "SELECT packet_json FROM lane_continuity_packets WHERE lane_id=?",
-            (lane_id,),
-        ).fetchone()
-        if existing is not None and existing["packet_json"] == packet_json:
-            _append_write_forensic_event(
-                conn,
-                action="write_lane_continuity_packet",
-                phase="skipped_unchanged",
-                lane_id=lane_id,
-                packet_sha256=packet_sha256,
+    # Decide skip-vs-write INSIDE the write transaction. The BEGIN IMMEDIATE in
+    # write_txn holds the write lock across the compare and the conditional
+    # write, so a concurrent writer cannot change the row between the read and
+    # the skip decision (the TOCTOU that an outside-the-transaction SELECT would
+    # leave open). An unchanged skip still enters/commits an empty transaction
+    # (cheap, no page writes), preserving the write-volume reduction.
+    wrote = True
+    with write_txn(conn):
+        if skip_if_unchanged:
+            existing = conn.execute(
+                "SELECT packet_json FROM lane_continuity_packets WHERE lane_id=?",
+                (lane_id,),
+            ).fetchone()
+            if existing is not None and existing["packet_json"] == packet_json:
+                wrote = False
+        if wrote:
+            conn.execute(
+                "INSERT INTO lane_continuity_packets(lane_id, packet_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(lane_id) DO UPDATE SET packet_json=excluded.packet_json, updated_at=excluded.updated_at",
+                (lane_id, packet_json, ts),
             )
-            return packet
     _append_write_forensic_event(
         conn,
         action="write_lane_continuity_packet",
-        phase="write",
+        phase="write" if wrote else "skipped_unchanged",
         lane_id=lane_id,
         packet_sha256=packet_sha256,
     )
-    with write_txn(conn):
-        conn.execute(
-            "INSERT INTO lane_continuity_packets(lane_id, packet_json, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(lane_id) DO UPDATE SET packet_json=excluded.packet_json, updated_at=excluded.updated_at",
-            (lane_id, packet_json, ts),
-        )
     return packet
 
 
@@ -5028,6 +5052,23 @@ def enforce_max_runtime(
                     killed = True
                 except (ProcessLookupError, OSError, RuntimeError):
                     pass
+                else:
+                    # Confirm the SIGKILL actually took effect before we let the
+                    # reclaim below run — a freshly-killed pid can linger a beat.
+                    for _ in range(10):
+                        if not _pid_alive(pid):
+                            break
+                        time.sleep(0.5)
+
+            # Only reclaim once the worker is confirmed gone. _pid_alive treats
+            # an indeterminate liveness probe (a RuntimeError from the process
+            # check) as ALIVE, and the kill() calls above swallow RuntimeError,
+            # so a signal we could not confirm landed leaves the process
+            # possibly-alive. Requeuing the task now would double-run it against
+            # a live worker; instead leave it 'running' for a later enforcement
+            # cycle once the process is provably dead.
+            if _pid_alive(pid):
+                continue
 
         with write_txn(conn):
             cur = conn.execute(
