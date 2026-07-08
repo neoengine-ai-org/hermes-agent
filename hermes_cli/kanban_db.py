@@ -1306,9 +1306,12 @@ def _guard_existing_db_is_healthy(path: Path) -> bool:
 
     No-op for missing files and zero-byte files (treated as fresh). Paths
     already proven healthy this process (cache hit) skip the full check but
-    are periodically re-probed with the cheaper ``PRAGMA quick_check`` via
+    are periodically re-probed with ``PRAGMA integrity_check`` via
     :func:`_maybe_periodic_integrity_reprobe` so long-lived daemons still
-    detect corruption that happens after their first connect.
+    detect corruption that happens after their first connect. A cached
+    WAL-without-``-shm`` path (which cannot be re-probed read-only) instead
+    drops its trusted-cache entry and returns ``False`` so the caller
+    read/write-verifies it on this connect.
 
     Path-trust note: ``path`` arrives via :func:`connect`, which itself
     resolves it from an explicit ``db_path`` argument, the
@@ -1332,7 +1335,18 @@ def _guard_existing_db_is_healthy(path: Path) -> bool:
     key = str(resolved)
     if key in _INITIALIZED_PATHS:
         # Already proven healthy this process — but long-lived daemons must
-        # not trust that verdict forever. Cheap periodic re-probe below.
+        # not trust that verdict forever.
+        if _read_only_probe_would_create_shm(resolved):
+            # WAL DB with no -shm: we cannot re-probe read-only without
+            # creating the sidecar. Rather than keep trusting the cache
+            # indefinitely, drop the entry and return False so the caller
+            # verifies the live read/write connection (integrity_check) on
+            # THIS connect, before any schema migration. A normal read/write
+            # connect recreates -shm, so later probes go read-only again and
+            # this self-heals after one connect.
+            _INITIALIZED_PATHS.discard(key)
+            return False
+        # Cheap periodic read-only re-probe below.
         _maybe_periodic_integrity_reprobe(resolved, key)
         return True
     reason: Optional[str] = None
@@ -1384,10 +1398,10 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
       checkpoint, run recovery, or take write locks; a probe must never
       mutate a possibly-damaged file.
     * A WAL DB with no ``-shm`` cannot be probed read-only without creating
-      the sidecar, so that case evicts the trusted-cache entry (stamped once
-      per interval) and defers to the next ``connect()``'s full guard, whose
-      read/write fallback verifies integrity before migrations — rather than
-      trusting the cached verdict indefinitely.
+      the sidecar. That case is handled upstream in
+      :func:`_guard_existing_db_is_healthy` (which drops the trusted-cache
+      entry and returns ``False`` so the caller read/write-verifies it on the
+      current connect), so it does not reach this periodic probe.
     * The probe timestamp is recorded BEFORE probing (coalescing): while
       one thread's probe is in flight, concurrent connects see a fresh
       timestamp and skip instead of stacking probes behind
@@ -1409,16 +1423,11 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
     if last is not None and (now - last) < _reprobe_effective_interval(interval):
         return
     if _read_only_probe_would_create_shm(resolved):
-        # A read-only probe cannot open a WAL DB that has no -shm without
-        # creating one, so we cannot re-probe read-only here. Do NOT keep
-        # silently trusting the cached verdict forever (that was the original
-        # "long-lived daemon never re-checks" hole, just relocated): drop the
-        # trusted-cache entry so the next connect() re-runs the full guard,
-        # whose read/write fallback verifies integrity before migrations and
-        # recreates -shm (letting later probes go read-only again). Stamp now
-        # so this re-evaluation happens at most once per interval.
-        _LAST_INTEGRITY_PROBE[key] = now
-        _INITIALIZED_PATHS.discard(key)
+        # Defensive: the cache-hit branch in _guard_existing_db_is_healthy
+        # already routes WAL-without-shm paths to a read/write re-verify before
+        # calling us, so this is normally unreachable. If it is reached, skip
+        # rather than create the sidecar (the read-only open below would also
+        # refuse and be handled as OperationalError).
         return
     # Coalesce: stamp before probing so concurrent connects skip while this
     # probe is in flight instead of queueing more probes. Every outcome

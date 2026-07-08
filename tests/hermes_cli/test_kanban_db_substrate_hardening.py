@@ -327,15 +327,14 @@ def test_reprobe_lock_contention_skips_probe_and_defers(tmp_path, monkeypatch):
     assert key in kb._LAST_INTEGRITY_PROBE
 
 
-def test_reprobe_wal_without_shm_evicts_cache_for_full_reguard(tmp_path, monkeypatch):
-    """A no-SHM WAL shape can't be probed read-only without creating ``-shm``.
+def test_wal_without_shm_cache_hit_forces_rw_reverify(tmp_path, monkeypatch):
+    """A cached WAL-without-``-shm`` path can't be re-probed read-only.
 
     Rather than keep silently trusting the cached verdict forever (the hole an
-    adversarial review flagged), the periodic re-probe must (a) create no
-    sidecars, (b) stamp the probe clock so re-evaluation is at most once per
-    interval, and (c) evict the path from ``_INITIALIZED_PATHS`` so the next
-    ``connect()`` re-runs the full guard, whose read/write fallback verifies
-    integrity before migrations.
+    adversarial review flagged), the guard must (a) create no sidecars,
+    (b) drop the path from ``_INITIALIZED_PATHS``, and (c) return ``False`` so
+    the caller read/write-verifies the live connection (integrity_check) on
+    THIS connect, before any schema migration — not merely on a later one.
     """
     monkeypatch.setenv("HERMES_KANBAN_INTEGRITY_RECHECK_SECONDS", "0.000001")
     db_path = _copied_wal_db_without_shm(tmp_path)
@@ -343,12 +342,11 @@ def test_reprobe_wal_without_shm_evicts_cache_for_full_reguard(tmp_path, monkeyp
     kb._INITIALIZED_PATHS.add(key)
     kb._LAST_INTEGRITY_PROBE.pop(key, None)
 
-    kb._guard_existing_db_is_healthy(db_path)
+    result = kb._guard_existing_db_is_healthy(db_path)
 
-    assert not (tmp_path / "kanban.db-shm").exists()
-    # Stamped (deferred one interval) and evicted so the next connect re-guards.
-    assert key in kb._LAST_INTEGRITY_PROBE
-    assert key not in kb._INITIALIZED_PATHS
+    assert result is False  # forces the caller's read/write integrity_check now
+    assert key not in kb._INITIALIZED_PATHS  # trusted-cache entry dropped
+    assert not (tmp_path / "kanban.db-shm").exists()  # no sidecar created
 
 
 def test_reprobe_connection_is_read_only(tmp_path, monkeypatch):
