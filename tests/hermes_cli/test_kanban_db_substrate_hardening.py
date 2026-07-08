@@ -385,6 +385,32 @@ def test_reprobe_connection_is_read_only(tmp_path, monkeypatch):
         ro.close()
 
 
+def test_periodic_reprobe_uses_full_integrity_check(tmp_path, monkeypatch):
+    """The periodic re-probe must run ``PRAGMA integrity_check``, not
+    ``quick_check`` — quick_check skips the index<->table consistency pass and
+    would miss the orphan-index corruption class the re-probe exists to catch.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_INTEGRITY_RECHECK_SECONDS", "0.000001")
+    db_path = _fresh_connected_db(tmp_path)
+    time.sleep(0.01)  # make the probe due
+
+    real_reason = kb._integrity_check_reason
+    pragmas: list[str] = []
+
+    def spy(conn, *, pragma="integrity_check"):
+        pragmas.append(pragma)
+        return real_reason(conn, pragma=pragma)
+
+    monkeypatch.setattr(kb, "_integrity_check_reason", spy)
+    conn = kb.connect(db_path=db_path)
+    conn.close()
+
+    # The cached-healthy second connect fires exactly the periodic re-probe,
+    # which must use the full integrity_check (never quick_check).
+    assert pragmas == ["integrity_check"], f"re-probe pragmas: {pragmas!r}"
+    assert "quick_check" not in pragmas
+
+
 def test_nested_write_txn_still_fails_fast(tmp_path):
     db_path = _fresh_connected_db(tmp_path)
 

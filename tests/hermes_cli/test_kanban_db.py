@@ -655,6 +655,42 @@ def test_enforce_max_runtime_does_not_reclaim_when_worker_still_alive(
         assert kb.get_task(conn, t).status == "running"
 
 
+def test_enforce_max_runtime_no_reclaim_when_sigkill_succeeds_but_pid_survives(
+    kanban_home, monkeypatch
+):
+    """Covers the post-SIGKILL confirmation poll branch: when the kill call
+    SUCCEEDS (raises nothing) but the process is still alive afterward, the task
+    must not be reclaimed. Distinct from the RuntimeError case: here signal_fn
+    does not raise, so the ``else`` confirmation poll runs before the guard.
+    """
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)  # survives the kill
+    monkeypatch.setattr(kb.time, "sleep", lambda _s: None)
+
+    with kb.connect() as conn:
+        host = kb._claimer_id().split(":", 1)[0]
+        t = kb.create_task(
+            conn, title="stuck", assignee="a", max_runtime_seconds=10,
+        )
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        run_id = kb.latest_run(conn, t).id
+        old_started = int(time.time()) - 20
+        conn.execute(
+            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 999999, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
+            (old_started, 999999, run_id),
+        )
+
+        # No-op signal_fn: SIGTERM + SIGKILL "succeed" (no exception), so the
+        # post-SIGKILL confirmation poll executes; _pid_alive stays True.
+        timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
+
+        assert timed_out == []
+        assert kb.get_task(conn, t).status == "running"
+
+
 def test_heartbeat_extends_claim(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="a")
