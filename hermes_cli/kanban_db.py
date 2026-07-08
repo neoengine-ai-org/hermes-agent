@@ -75,6 +75,7 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - fcntl is unavailable on Windows.
     fcntl = None  # type: ignore[assignment]
+import hashlib
 import json
 import math
 import os
@@ -88,7 +89,7 @@ import threading
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 from urllib.parse import quote as _url_quote
@@ -1043,6 +1044,8 @@ _SQLITE_HEADER = b"SQLite format 3\x00"
 _LAST_INTEGRITY_PROBE: dict[str, float] = {}
 
 _DEFAULT_INTEGRITY_RECHECK_SECONDS = 300.0
+_WRITE_FORENSICS_ENABLED_VALUES = {"1", "true", "yes", "on"}
+_DEFAULT_WRITE_FORENSICS_MAX_BYTES = 10 * 1024 * 1024
 
 
 def _integrity_recheck_seconds() -> float:
@@ -1076,6 +1079,41 @@ def _reprobe_effective_interval(interval: float) -> float:
     must be deterministic per process.
     """
     return interval * (1.0 + 0.1 * ((os.getpid() % 1024) / 1024.0))
+
+
+def _read_only_sqlite_uri(path: Path) -> str:
+    """Return a SQLite URI that opens an existing DB without mutating it."""
+    return f"file:{_url_quote(str(path))}?mode=ro"
+
+
+def _sqlite_sidecar_path(path: Path, suffix: str) -> Path:
+    return path.parent / f"{path.name}{suffix}"
+
+
+def _read_only_probe_would_create_shm(path: Path) -> bool:
+    """Return True when a read-only WAL probe would materialize ``-shm``."""
+    return (
+        _sqlite_sidecar_path(path, "-wal").exists()
+        and not _sqlite_sidecar_path(path, "-shm").exists()
+    )
+
+
+def _integrity_check_reason(
+    conn: sqlite3.Connection,
+    *,
+    pragma: str = "integrity_check",
+) -> Optional[str]:
+    row = conn.execute(f"PRAGMA {pragma}").fetchone()
+    if not row or (row[0] or "").lower() != "ok":
+        return f"{pragma} returned {row[0] if row else '<no row>'!r}"
+    return None
+
+
+def _raise_if_corrupt_reason(resolved: Path, reason: Optional[str]) -> None:
+    if reason is None:
+        return
+    backup = _backup_corrupt_db(resolved)
+    raise KanbanDbCorruptError(resolved, backup, reason)
 
 
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
@@ -1247,25 +1285,33 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
-def _guard_existing_db_is_healthy(path: Path) -> None:
+def _guard_existing_db_is_healthy(path: Path) -> bool:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
-    Opens the probe in read/write mode so SQLite can recover or
-    checkpoint a healthy WAL/hot-journal DB before we declare it
-    corrupt. If the file is malformed, copy it (and any WAL/SHM
-    sidecars) to a timestamped backup and raise
+    Opens the probe in read-only URI mode. A guard must never recover,
+    checkpoint, create sidecars, or take write locks on a file it is
+    evaluating for corruption. If the file is malformed, copy it (and
+    any WAL/SHM sidecars) to a timestamped backup and raise
     :class:`KanbanDbCorruptError` so callers cannot silently recreate
     the schema on top of a damaged DB.
 
-    Transient lock/busy errors (``sqlite3.OperationalError``) are NOT
-    treated as corruption; they propagate raw so the caller sees a
-    normal lock failure and no spurious ``.corrupt`` backup is made.
+    Returns ``True`` when the read-only guard verified the path, skipped a
+    fresh/empty file, or reused this process's trusted cache. Returns
+    ``False`` when the read-only open is refused (for example a WAL file
+    that needs read/write recovery); callers must then verify the live
+    read/write connection before running schema migrations.
+
+    Transient lock/busy/read-only-open errors (``sqlite3.OperationalError``)
+    are NOT treated as corruption; no spurious ``.corrupt`` backup is made.
 
     No-op for missing files and zero-byte files (treated as fresh). Paths
     already proven healthy this process (cache hit) skip the full check but
-    are periodically re-probed with the cheaper ``PRAGMA quick_check`` via
+    are periodically re-probed with ``PRAGMA integrity_check`` via
     :func:`_maybe_periodic_integrity_reprobe` so long-lived daemons still
-    detect corruption that happens after their first connect.
+    detect corruption that happens after their first connect. A cached
+    WAL-without-``-shm`` path (which cannot be re-probed read-only) instead
+    drops its trusted-cache entry and returns ``False`` so the caller
+    read/write-verifies it on this connect.
 
     Path-trust note: ``path`` arrives via :func:`connect`, which itself
     resolves it from an explicit ``db_path`` argument, the
@@ -1280,41 +1326,56 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     try:
         resolved = path.resolve()
     except OSError:
-        return
+        return True
     try:
         if not resolved.exists() or resolved.stat().st_size == 0:
-            return
+            return True
     except OSError:
-        return
+        return True
     key = str(resolved)
     if key in _INITIALIZED_PATHS:
         # Already proven healthy this process — but long-lived daemons must
-        # not trust that verdict forever. Cheap periodic re-probe below.
+        # not trust that verdict forever.
+        if _read_only_probe_would_create_shm(resolved):
+            # WAL DB with no -shm: we cannot re-probe read-only without
+            # creating the sidecar. Rather than keep trusting the cache
+            # indefinitely, drop the entry and return False so the caller
+            # verifies the live read/write connection (integrity_check) on
+            # THIS connect, before any schema migration. A normal read/write
+            # connect recreates -shm, so later probes go read-only again and
+            # this self-heals after one connect.
+            _INITIALIZED_PATHS.discard(key)
+            return False
+        # Cheap periodic read-only re-probe below.
         _maybe_periodic_integrity_reprobe(resolved, key)
-        return
+        return True
     reason: Optional[str] = None
+    if _read_only_probe_would_create_shm(resolved):
+        return False
     try:
-        probe = sqlite3.connect(str(resolved), timeout=5, isolation_level=None)
+        probe = sqlite3.connect(
+            _read_only_sqlite_uri(resolved),
+            uri=True, timeout=5, isolation_level=None,
+        )
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            reason = _integrity_check_reason(probe)
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
     except sqlite3.OperationalError:
-        # Lock contention, busy, transient IO — not corruption. Let it propagate.
-        raise
+        # Lock contention, busy, or read-only open refused because SQLite needs
+        # a read/write handle to recover WAL state. Not corruption by itself.
+        return False
     except sqlite3.DatabaseError as exc:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         _LAST_INTEGRITY_PROBE[key] = time.monotonic()
-        return
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+        return True
+    _raise_if_corrupt_reason(resolved, reason)
+    return True
 
 
 def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
-    """Re-probe a cached-healthy DB with ``PRAGMA quick_check`` periodically.
+    """Re-probe a cached-healthy DB with ``PRAGMA integrity_check`` periodically.
 
     Closes the "long-lived daemon never re-checks" hole: before this,
     a process that connected once before on-disk corruption happened kept
@@ -1329,11 +1390,18 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
       per-process jitter of up to 10% of the interval (pid-derived) so a
       dozen daemons started together don't all probe at the same interval
       boundary.
-    * Uses ``PRAGMA quick_check`` — cheaper than the first-connect full
-      ``integrity_check`` — over a short-timeout, **read-only**
-      (URI ``mode=ro``) probe connection. Read/write probe connections on
-      a WAL/hot-journal DB can checkpoint, run recovery, or take write
-      locks; a probe must never mutate a possibly-damaged file.
+    * Uses ``PRAGMA integrity_check`` (not ``quick_check``) over a
+      short-timeout, **read-only** (URI ``mode=ro``) probe connection.
+      ``quick_check`` skips the index<->table content-consistency pass and
+      would miss the "orphan index" corruption class this guard exists to
+      catch. Read/write probe connections on a WAL/hot-journal DB can
+      checkpoint, run recovery, or take write locks; a probe must never
+      mutate a possibly-damaged file.
+    * A WAL DB with no ``-shm`` cannot be probed read-only without creating
+      the sidecar. That case is handled upstream in
+      :func:`_guard_existing_db_is_healthy` (which drops the trusted-cache
+      entry and returns ``False`` so the caller read/write-verifies it on the
+      current connect), so it does not reach this periodic probe.
     * The probe timestamp is recorded BEFORE probing (coalescing): while
       one thread's probe is in flight, concurrent connects see a fresh
       timestamp and skip instead of stacking probes behind
@@ -1354,6 +1422,13 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
     last = _LAST_INTEGRITY_PROBE.get(key)
     if last is not None and (now - last) < _reprobe_effective_interval(interval):
         return
+    if _read_only_probe_would_create_shm(resolved):
+        # Defensive: the cache-hit branch in _guard_existing_db_is_healthy
+        # already routes WAL-without-shm paths to a read/write re-verify before
+        # calling us, so this is normally unreachable. If it is reached, skip
+        # rather than create the sidecar (the read-only open below would also
+        # refuse and be handled as OperationalError).
+        return
     # Coalesce: stamp before probing so concurrent connects skip while this
     # probe is in flight instead of queueing more probes. Every outcome
     # below either keeps this stamp (healthy / lock-skip) or pops it
@@ -1362,15 +1437,19 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
     reason: Optional[str] = None
     try:
         probe = sqlite3.connect(
-            f"file:{_url_quote(str(resolved))}?mode=ro",
+            _read_only_sqlite_uri(resolved),
             uri=True, timeout=2, isolation_level=None,
         )
         try:
-            row = probe.execute("PRAGMA quick_check").fetchone()
+            # Full integrity_check, not quick_check: quick_check skips the
+            # index<->table content consistency pass, so it can miss exactly
+            # the "orphan index" / index-table divergence corruption class seen
+            # in the 2026-06-24 incident. The board is small and this runs at
+            # most once per recheck interval per path, so the extra cost is
+            # negligible next to missing a real corruption.
+            reason = _integrity_check_reason(probe)
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"quick_check returned {row[0] if row else '<no row>'!r}"
     except sqlite3.OperationalError:
         # Lock contention / busy / read-only open refused (shm/lock) —
         # never corruption. Skip this probe rather than failing a hot
@@ -1386,8 +1465,7 @@ def _maybe_periodic_integrity_reprobe(resolved: Path, key: str) -> None:
     # instead of trusting the stale verdict.
     _INITIALIZED_PATHS.discard(key)
     _LAST_INTEGRITY_PROBE.pop(key, None)
-    backup = _backup_corrupt_db(resolved)
-    raise KanbanDbCorruptError(resolved, backup, reason)
+    _raise_if_corrupt_reason(resolved, reason)
 
 
 @contextlib.contextmanager
@@ -1619,11 +1697,19 @@ def connect(
         # Full integrity probe — catches corruption past the header (malformed
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
-        _guard_existing_db_is_healthy(path)
+        guard_verified = _guard_existing_db_is_healthy(path)
         resolved = str(path.resolve())
         conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
         try:
             conn.row_factory = sqlite3.Row
+            if not guard_verified:
+                try:
+                    reason = _integrity_check_reason(conn)
+                except sqlite3.OperationalError:
+                    raise
+                except sqlite3.DatabaseError as exc:
+                    reason = f"sqlite refused to open file: {exc}"
+                _raise_if_corrupt_reason(Path(resolved), reason)
             with _INIT_LOCK:
                 # WAL activation can take an exclusive lock while SQLite creates the
                 # sidecar files for a fresh database. Keep it in the same process-local
@@ -1938,14 +2024,17 @@ def write_txn(conn: sqlite3.Connection):
     replaces the DB inode.
     """
     with _cross_process_write_lock(conn):
+        _append_write_forensic_event(conn, action="write_txn", phase="begin")
         conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
         except Exception:
             conn.execute("ROLLBACK")
+            _append_write_forensic_event(conn, action="write_txn", phase="rollback")
             raise
         else:
             conn.execute("COMMIT")
+            _append_write_forensic_event(conn, action="write_txn", phase="commit")
 
 
 # ---------------------------------------------------------------------------
@@ -1964,6 +2053,84 @@ def _dict(row: sqlite3.Row | None) -> Optional[dict[str, Any]]:
 
 def _now(now: Optional[int] = None) -> int:
     return int(time.time() if now is None else now)
+
+
+def _write_forensics_enabled() -> bool:
+    raw = os.environ.get("HERMES_KANBAN_WRITE_FORENSICS", "").strip().lower()
+    return raw in _WRITE_FORENSICS_ENABLED_VALUES
+
+
+def _write_forensics_dir() -> Path:
+    override = os.environ.get("HERMES_KANBAN_WRITE_FORENSICS_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return kanban_home() / "state" / "kanban-write-forensics"
+
+
+def _write_forensics_max_bytes() -> int:
+    raw = os.environ.get("HERMES_KANBAN_WRITE_FORENSICS_MAX_BYTES", "").strip()
+    if not raw:
+        return _DEFAULT_WRITE_FORENSICS_MAX_BYTES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_WRITE_FORENSICS_MAX_BYTES
+
+
+def _db_path_for_conn(conn: sqlite3.Connection) -> Optional[str]:
+    try:
+        for _seq, name, path in conn.execute("PRAGMA database_list"):
+            if name == "main" and path:
+                return str(path)
+    except sqlite3.Error:
+        return None
+    return None
+
+
+def _safe_cwd() -> Optional[str]:
+    try:
+        return os.getcwd()
+    except OSError:
+        return None
+
+
+def _append_write_forensic_event(
+    conn: sqlite3.Connection,
+    *,
+    action: str,
+    phase: str,
+    lane_id: Optional[str] = None,
+    packet_sha256: Optional[str] = None,
+) -> None:
+    """Best-effort append-only DB write trace, enabled only by env."""
+    if not _write_forensics_enabled():
+        return
+    now = datetime.now(timezone.utc)
+    event = {
+        "ts": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "pid": os.getpid(),
+        "thread_id": threading.get_ident(),
+        "argv": list(sys.argv),
+        "cwd": _safe_cwd(),
+        "db_path": _db_path_for_conn(conn),
+        "action": action,
+        "phase": phase,
+    }
+    if lane_id is not None:
+        event["lane_id"] = lane_id
+    if packet_sha256 is not None:
+        event["packet_sha256"] = packet_sha256
+    try:
+        out_dir = _write_forensics_dir()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"kanban-writes-{now:%Y%m%d}.jsonl"
+        max_bytes = _write_forensics_max_bytes()
+        if max_bytes and out_path.exists() and out_path.stat().st_size >= max_bytes:
+            return
+        with out_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    except OSError:
+        return
 
 
 def _lane_row(conn: sqlite3.Connection, lane_id: str) -> Optional[dict[str, Any]]:
@@ -2033,7 +2200,14 @@ def record_lane_heartbeat(
     return _lane_row(conn, lane_id) or {}
 
 
-def write_lane_continuity_packet(conn: sqlite3.Connection, *, lane_id: str, packet: dict[str, Any], now: Optional[int] = None) -> dict[str, Any]:
+def write_lane_continuity_packet(
+    conn: sqlite3.Connection,
+    *,
+    lane_id: str,
+    packet: dict[str, Any],
+    now: Optional[int] = None,
+    skip_if_unchanged: bool = False,
+) -> dict[str, Any]:
     required = [
         "current_objective", "current_repo_branch_pr", "files_touched_or_planned",
         "active_blocker", "last_verified_command_check", "next_safe_action",
@@ -2043,12 +2217,36 @@ def write_lane_continuity_packet(conn: sqlite3.Connection, *, lane_id: str, pack
     if missing:
         raise ValueError(f"continuity packet missing required fields: {', '.join(missing)}")
     ts = _now(now)
+    packet_json = json.dumps(packet, sort_keys=True)
+    packet_sha256 = hashlib.sha256(packet_json.encode("utf-8")).hexdigest()
+    # Decide skip-vs-write INSIDE the write transaction. The BEGIN IMMEDIATE in
+    # write_txn holds the write lock across the compare and the conditional
+    # write, so a concurrent writer cannot change the row between the read and
+    # the skip decision (the TOCTOU that an outside-the-transaction SELECT would
+    # leave open). An unchanged skip still enters/commits an empty transaction
+    # (cheap, no page writes), preserving the write-volume reduction.
+    wrote = True
     with write_txn(conn):
-        conn.execute(
-            "INSERT INTO lane_continuity_packets(lane_id, packet_json, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(lane_id) DO UPDATE SET packet_json=excluded.packet_json, updated_at=excluded.updated_at",
-            (lane_id, json.dumps(packet, sort_keys=True), ts),
-        )
+        if skip_if_unchanged:
+            existing = conn.execute(
+                "SELECT packet_json FROM lane_continuity_packets WHERE lane_id=?",
+                (lane_id,),
+            ).fetchone()
+            if existing is not None and existing["packet_json"] == packet_json:
+                wrote = False
+        if wrote:
+            conn.execute(
+                "INSERT INTO lane_continuity_packets(lane_id, packet_json, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(lane_id) DO UPDATE SET packet_json=excluded.packet_json, updated_at=excluded.updated_at",
+                (lane_id, packet_json, ts),
+            )
+    _append_write_forensic_event(
+        conn,
+        action="write_lane_continuity_packet",
+        phase="write" if wrote else "skipped_unchanged",
+        lane_id=lane_id,
+        packet_sha256=packet_sha256,
+    )
     return packet
 
 
@@ -4820,7 +5018,11 @@ def _pid_alive(pid: Optional[int]) -> bool:
     if not pid or pid <= 0:
         return False
     from gateway.status import _pid_exists
-    if not _pid_exists(int(pid)):
+    try:
+        exists = _pid_exists(int(pid))
+    except RuntimeError:
+        return True
+    if not exists:
         return False
     # Still here → process exists. Check for zombie on platforms
     # where we have a cheap, deterministic process-state probe.
@@ -4891,7 +5093,7 @@ def _terminate_reclaimed_worker(
     info["termination_attempted"] = True
     try:
         kill(int(pid), signal.SIGTERM)
-    except (ProcessLookupError, OSError):
+    except (ProcessLookupError, OSError, RuntimeError):
         return info
 
     for _ in range(10):
@@ -4907,7 +5109,7 @@ def _terminate_reclaimed_worker(
             _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
             kill(int(pid), _sigkill)
             info["sigkill"] = True
-        except (ProcessLookupError, OSError):
+        except (ProcessLookupError, OSError, RuntimeError):
             return info
 
     info["terminated"] = not _pid_alive(pid)
@@ -5020,7 +5222,7 @@ def enforce_max_runtime(
         if kill is not None:
             try:
                 kill(pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError):
+            except (ProcessLookupError, OSError, RuntimeError):
                 pass
             # Short polling wait — no time.sleep on the write txn.
             for _ in range(10):
@@ -5033,8 +5235,25 @@ def enforce_max_runtime(
                     _sigkill = getattr(signal, "SIGKILL", signal.SIGTERM)
                     kill(pid, _sigkill)
                     killed = True
-                except (ProcessLookupError, OSError):
+                except (ProcessLookupError, OSError, RuntimeError):
                     pass
+                else:
+                    # Confirm the SIGKILL actually took effect before we let the
+                    # reclaim below run — a freshly-killed pid can linger a beat.
+                    for _ in range(10):
+                        if not _pid_alive(pid):
+                            break
+                        time.sleep(0.5)
+
+            # Only reclaim once the worker is confirmed gone. _pid_alive treats
+            # an indeterminate liveness probe (a RuntimeError from the process
+            # check) as ALIVE, and the kill() calls above swallow RuntimeError,
+            # so a signal we could not confirm landed leaves the process
+            # possibly-alive. Requeuing the task now would double-run it against
+            # a live worker; instead leave it 'running' for a later enforcement
+            # cycle once the process is provably dead.
+            if _pid_alive(pid):
+                continue
 
         with write_txn(conn):
             cur = conn.execute(
