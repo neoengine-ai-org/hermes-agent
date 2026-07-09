@@ -15,11 +15,17 @@ Exposes the full Kanban command surface documented in the design spec
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shlex
+import shutil
+import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -790,6 +796,102 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit one JSON object per task on stdout",
     )
 
+    # --- integrity (read-only substrate probe) ---
+    p_integrity = sub.add_parser(
+        "integrity",
+        help="Read-only integrity probe of the kanban DB "
+             "(PRAGMA quick_check + integrity_check; never mutates, "
+             "never creates backups)",
+        description=(
+            "Opens the resolved kanban DB with a short-timeout read-only "
+            "probe connection and reports PRAGMA quick_check + "
+            "integrity_check as JSON. Safe to run while gateways are live. "
+            "Exit codes: 0 ok, 3 corrupt, 4 unavailable (missing/locked)."
+        ),
+    )
+    p_integrity.add_argument(
+        "--db", default=None, metavar="PATH",
+        help="Explicit DB file to probe (default: the resolved board DB)",
+    )
+
+    # --- recover (offline .recover into a NEW file) ---
+    p_recover = sub.add_parser(
+        "recover",
+        help="Offline-recover a (corrupt) kanban DB into a NEW file via "
+             "the sqlite3 CLI '.recover' — never modifies the live DB",
+        description=(
+            "Copies the DB (+ -wal/-shm sidecars) to a private temp dir, "
+            "runs the sqlite3 CLI '.recover' on the copy, builds a fresh DB "
+            "at --output, and integrity-checks it. Prints per-table row "
+            "counts (old vs recovered) as JSON. Exit 0 only when the "
+            "recovered DB passes integrity_check."
+        ),
+    )
+    p_recover.add_argument(
+        "--output", required=True, metavar="PATH",
+        help="Path for the NEW recovered DB (must not already exist)",
+    )
+    p_recover.add_argument(
+        "--db", default=None, metavar="PATH",
+        help="Explicit DB file to recover from (default: the resolved board DB)",
+    )
+
+    # --- swap (lock-protected quiesce + atomic swap of a recovered DB) ---
+    p_swap = sub.add_parser(
+        "swap",
+        help="Safely swap a recovered kanban DB into the live path after "
+             "verifying writers are quiesced — the step `recover` deliberately "
+             "refuses to do, and doing it by hand caused the re-corruption",
+        description=(
+            "Replaces the live kanban DB with a recovered copy ONLY after "
+            "(1) taking the exclusive maintenance lock (the same lock connect() "
+            "takes, so no new process can attach), (2) verifying via lsof "
+            "that no other process holds the DB or its -wal/-shm open, and "
+            "(3) integrity-checking the incoming file. It deletes stale "
+            "-wal/-shm sidecars, keeps the old DB as a timestamped backup, "
+            "does an atomic os.replace, then re-verifies the live DB and "
+            "restores the backup on failure. This removes the need for the "
+            "ad-hoc live cp/mv surgery that repeatedly re-corrupted the board. "
+            "Exit: 0 ok, 3 corrupt, 4 unavailable, 2 usage, 5 writers-active."
+        ),
+    )
+    swap_src = p_swap.add_mutually_exclusive_group()
+    swap_src.add_argument(
+        "--from", dest="from_path", default=None, metavar="PATH",
+        help="Recovered DB to swap in (e.g. the --output of `hermes kanban "
+             "recover`)",
+    )
+    swap_src.add_argument(
+        "--recover", action="store_true",
+        help="Run `.recover` inline under the same lock and swap the result in "
+             "(instead of supplying a pre-recovered --from file)",
+    )
+    p_swap.add_argument(
+        "--db", default=None, metavar="PATH",
+        help="Explicit live DB file to swap (default: the resolved board DB)",
+    )
+    p_swap.add_argument(
+        "--backup-dir", dest="backup_dir", default=None, metavar="DIR",
+        help="Directory for the pre-swap backup (default: alongside the DB)",
+    )
+    p_swap.add_argument(
+        "--lock-timeout", dest="lock_timeout", type=float, default=10.0,
+        metavar="SECONDS",
+        help="Seconds to wait for the exclusive maintenance lock before aborting "
+             "(default: 10)",
+    )
+    p_swap.add_argument(
+        "--force", action="store_true",
+        help="Swap even if the lsof quiescence check reports attached holders "
+             "(DANGEROUS). Does NOT bypass the maintenance lock — if that lock "
+             "cannot be acquired the swap still aborts. Still integrity-checks "
+             "the incoming DB and keeps a backup.",
+    )
+    p_swap.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="Report quiescence and planned actions without swapping",
+    )
+
     # --- gc ---
     p_gc = sub.add_parser(
         "gc", help="Garbage-collect archived-task workspaces, old events, and old logs",
@@ -870,6 +972,22 @@ def kanban_command(args: argparse.Namespace) -> int:
             return 1
         os.environ["HERMES_KANBAN_BOARD"] = normed
         restore_board_env = True
+
+    # Substrate diagnostics/maintenance dispatch BEFORE the auto-init below:
+    # they must never create schema on the target file, never take the
+    # corrupt-guard backup path, and never raise KanbanDbCorruptError — the
+    # whole point is to inspect or repair a possibly-damaged DB without letting
+    # the normal connect() path touch it.
+    if action in ("integrity", "recover", "swap"):
+        handler = {
+            "integrity": _cmd_integrity,
+            "recover": _cmd_recover,
+            "swap": _cmd_swap,
+        }[action]
+        try:
+            return int(handler(args) or 0)
+        finally:
+            _restore_board_env()
 
     # Auto-initialize the DB before dispatching any subcommand. init_db
     # is idempotent, so running it every invocation is cheap (one
@@ -2605,6 +2723,627 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Substrate diagnostics (hermes kanban integrity / recover)
+#
+# Both handlers are dispatched BEFORE kanban_command's kb.init_db() auto-init
+# and deliberately bypass kb.connect(): they must never create schema, never
+# take the corrupt-guard backup path, and never mutate the live DB.
+# ---------------------------------------------------------------------------
+
+# Exit codes for `hermes kanban integrity` (and reused by `recover`).
+_INTEGRITY_EXIT_OK = 0
+_INTEGRITY_EXIT_CORRUPT = 3
+_INTEGRITY_EXIT_UNAVAILABLE = 4
+
+
+def _diag_db_path(args: argparse.Namespace) -> Path:
+    """Resolve the DB file a diagnostics subcommand should look at.
+
+    ``--db`` wins; otherwise the normal board resolution
+    (``HERMES_KANBAN_DB`` env → board → default) via kb.kanban_db_path().
+    """
+    db_arg = getattr(args, "db", None)
+    if db_arg:
+        return Path(db_arg).expanduser()
+    return kb.kanban_db_path()
+
+
+def _readonly_probe_connection(db_path: Path) -> sqlite3.Connection:
+    """Open ``db_path`` read-only (URI mode=ro) with a short timeout.
+
+    ``mode=ro`` guarantees the probe can never write pages, journals, or
+    WAL frames into a possibly-damaged file.
+    """
+    from urllib.parse import quote
+    uri = f"file:{quote(str(db_path))}?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=2, isolation_level=None)
+
+
+def _pragma_check_rows(conn: sqlite3.Connection, pragma: str) -> str:
+    """Run an integrity pragma and join its result rows into one string."""
+    rows = conn.execute(f"PRAGMA {pragma}").fetchall()
+    return "; ".join(str(r[0]) for r in rows) if rows else "<no rows>"
+
+
+def _cmd_integrity(args: argparse.Namespace) -> int:
+    """Read-only integrity probe. Exit 0 ok / 3 corrupt / 4 unavailable."""
+    db_path = _diag_db_path(args)
+    result: dict[str, Any] = {
+        "db_path": str(db_path),
+        "quick_check": None,
+        "integrity_check": None,
+        "verdict": "unavailable",
+    }
+
+    def _emit(verdict: str, code: int, error: Optional[str] = None) -> int:
+        result["verdict"] = verdict
+        if error:
+            result["error"] = error
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return code
+
+    if not db_path.is_file():
+        return _emit(
+            "unavailable", _INTEGRITY_EXIT_UNAVAILABLE,
+            f"no such database file: {db_path}",
+        )
+    try:
+        conn = _readonly_probe_connection(db_path)
+        try:
+            result["quick_check"] = _pragma_check_rows(conn, "quick_check")
+            result["integrity_check"] = _pragma_check_rows(conn, "integrity_check")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        # Locked / busy / cannot-open — NOT proof of corruption.
+        return _emit("unavailable", _INTEGRITY_EXIT_UNAVAILABLE, str(exc))
+    except sqlite3.DatabaseError as exc:
+        # malformed image / not a database — corruption.
+        return _emit("corrupt", _INTEGRITY_EXIT_CORRUPT, str(exc))
+    ok = result["quick_check"] == "ok" and result["integrity_check"] == "ok"
+    return _emit(
+        "ok" if ok else "corrupt",
+        _INTEGRITY_EXIT_OK if ok else _INTEGRITY_EXIT_CORRUPT,
+    )
+
+
+_RECOVER_SWAP_REMINDER = """\
+============================================================================
+NOTE: the live DB was NOT modified. The recovered copy is a NEW file.
+To swap it in you MUST first:
+  1. Quiesce ALL writers (stop every gateway/dispatcher/daemon using this
+     board — `hermes gateway stop` on each profile).
+  2. Delete the stale sidecars next to the live DB (<db>-wal and <db>-shm);
+     leaving them in place will corrupt the swapped-in file immediately.
+  3. Move the old DB aside, move the recovered file into place, restart.
+============================================================================"""
+
+
+def _recover_db_to(db_path: Path, out_path: Path) -> tuple[int, dict[str, Any]]:
+    """Offline `.recover` of ``db_path`` into a fresh ``out_path``.
+
+    Never opens ``db_path`` for write: copies it (+ -wal/-shm) to a private temp
+    dir, runs the sqlite3 CLI ``.recover`` on the copy, rebuilds a fresh DB at
+    ``out_path``, and integrity-checks it. Returns ``(exit_code, result)`` where
+    ``exit_code`` is 0 only when the recovered DB passes ``integrity_check``
+    (3 = recovered-but-corrupt, 1 = tooling failure). ``result`` is the JSON
+    payload; on a tooling failure it carries an ``"error"`` key.
+
+    Caller must have already validated that ``out_path`` does not exist and its
+    parent directory does.
+    """
+    result: dict[str, Any] = {
+        "db_path": str(db_path),
+        "output": str(out_path),
+        "sqlite3_binary": None,
+        "tables": {},
+        "integrity_check": None,
+        "verdict": "corrupt",
+    }
+    sqlite3_bin = shutil.which("sqlite3")
+    if not sqlite3_bin:
+        result["verdict"] = "unavailable"
+        result["error"] = (
+            "the `sqlite3` CLI binary is required for `.recover` but was not "
+            "found on PATH. Install sqlite3 (>= 3.29 for .recover support)."
+        )
+        return 1, result
+    result["sqlite3_binary"] = sqlite3_bin
+
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-recover-") as td:
+        tmp_dir = Path(td)
+        # Copy db + sidecars so .recover sees the same WAL state the live
+        # file has, without ever opening the live file for write.
+        work_copy = tmp_dir / db_path.name
+        shutil.copy2(db_path, work_copy)
+        for suffix in ("-wal", "-shm"):
+            sidecar = db_path.parent / (db_path.name + suffix)
+            if sidecar.exists():
+                shutil.copy2(sidecar, tmp_dir / sidecar.name)
+
+        try:
+            proc = subprocess.run(
+                [sqlite3_bin, str(work_copy), ".recover"],
+                capture_output=True, text=True, timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            result["error"] = "sqlite3 .recover timed out after 600s"
+            return 1, result
+        stderr_lower = (proc.stderr or "").lower()
+        if "unknown command" in stderr_lower:
+            result["error"] = (
+                f"this sqlite3 binary ({sqlite3_bin}) does not support "
+                "`.recover` — upgrade to sqlite3 >= 3.29."
+            )
+            return 1, result
+        if proc.returncode != 0 and not proc.stdout.strip():
+            result["error"] = (
+                f"sqlite3 .recover failed (rc={proc.returncode}): "
+                f"{proc.stderr.strip()}"
+            )
+            return 1, result
+        recovered_sql = proc.stdout
+
+        # Build the new DB by piping the recovered SQL through the CLI —
+        # .recover output can include dot-commands the sqlite3 module
+        # cannot execute.
+        build = subprocess.run(
+            [sqlite3_bin, str(out_path)],
+            input=recovered_sql, capture_output=True, text=True, timeout=600,
+        )
+        if build.returncode != 0 or not out_path.exists():
+            result["error"] = (
+                f"rebuilding {out_path} from recovered SQL failed "
+                f"(rc={build.returncode}): {build.stderr.strip()}"
+            )
+            return 1, result
+
+        # Integrity-verify the NEW file (ours; read-write is fine).
+        try:
+            new_conn = sqlite3.connect(str(out_path), timeout=5)
+            try:
+                result["integrity_check"] = _pragma_check_rows(
+                    new_conn, "integrity_check")
+                table_names = [
+                    r[0] for r in new_conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+                    ).fetchall()
+                ]
+                new_counts = {
+                    name: _count_rows_best_effort(new_conn, name)
+                    for name in table_names
+                }
+            finally:
+                new_conn.close()
+        except sqlite3.DatabaseError as exc:
+            result["integrity_check"] = f"error: {exc}"
+            table_names, new_counts = [], {}
+
+        # Old counts run against the temp COPY (never the live file) and
+        # tolerate per-table failures — corrupt tables may not be countable.
+        old_counts: dict[str, Optional[int]] = {}
+        try:
+            old_conn = sqlite3.connect(str(work_copy), timeout=5)
+            try:
+                for name in table_names:
+                    old_counts[name] = _count_rows_best_effort(old_conn, name)
+            finally:
+                old_conn.close()
+        except sqlite3.Error:
+            old_counts = {name: None for name in table_names}
+
+        result["tables"] = {
+            name: {"old": old_counts.get(name), "new": new_counts.get(name)}
+            for name in table_names
+        }
+
+    ok = result["integrity_check"] == "ok"
+    result["verdict"] = "ok" if ok else "corrupt"
+    return (_INTEGRITY_EXIT_OK if ok else _INTEGRITY_EXIT_CORRUPT), result
+
+
+def _cmd_recover(args: argparse.Namespace) -> int:
+    """Offline `.recover` into a NEW file. Never touches the live DB."""
+    out_path = Path(args.output).expanduser()
+    # is_symlink() (lstat semantics) as well as exists(): a BROKEN symlink
+    # reports exists() == False, but the sqlite3 CLI would follow it and
+    # write through to the link target.
+    if out_path.exists() or out_path.is_symlink():
+        print(
+            f"kanban recover: refusing to overwrite existing output file "
+            f"{out_path} — pick a fresh path",
+            file=sys.stderr,
+        )
+        return 2
+    if not out_path.parent.is_dir():
+        print(
+            f"kanban recover: output directory {out_path.parent} does not "
+            f"exist (or is not a directory) — create it first",
+            file=sys.stderr,
+        )
+        return 2
+    db_path = _diag_db_path(args)
+    if not db_path.is_file():
+        print(f"kanban recover: no such database file: {db_path}", file=sys.stderr)
+        return _INTEGRITY_EXIT_UNAVAILABLE
+
+    code, result = _recover_db_to(db_path, out_path)
+    if code == 1:
+        print(f"kanban recover: {result.get('error', 'recovery failed')}",
+              file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    print(_RECOVER_SWAP_REMINDER, file=sys.stderr)
+    return code
+
+
+# ---------------------------------------------------------------------------
+# Substrate repair (hermes kanban swap)
+#
+# The safe counterpart to `recover`: `recover` deliberately never swaps and
+# prints a manual quiesce/swap reminder. Doing that swap by hand — replacing the
+# live DB inode while writers hold open fds — is the confirmed root cause of the
+# repeated page corruption. `swap` enforces the quiesce-first discipline the
+# reminder describes so no incident ever again requires ad-hoc live surgery.
+# ---------------------------------------------------------------------------
+
+_SWAP_EXIT_WRITERS_ACTIVE = 5
+
+_SWAP_DONE_REMINDER = """\
+============================================================================
+Swap complete. The recovered DB is now live and integrity-verified; the old DB
+was kept as a timestamped `.pre-swap.*.bak` backup and the stale -wal/-shm
+sidecars were removed. Restart the writers you quiesced (gateways/supervisors)
+so they open the fresh inode.
+============================================================================"""
+
+
+def _fsync_path(path: Path) -> None:
+    """Best-effort fsync of a file and its parent directory."""
+    for target, flags in ((path, os.O_RDONLY), (path.parent, os.O_RDONLY)):
+        try:
+            fd = os.open(str(target), flags)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+
+def _atomic_restore(src: Path, dst: Path) -> bool:
+    """Atomically restore ``src`` over ``dst`` (temp copy + ``os.replace``).
+
+    Never leaves ``dst`` half-written: writes a sibling temp then atomically
+    renames it into place. Returns ``True`` on success, ``False`` (and cleans up
+    the temp) on any I/O failure, so the caller can report the failure honestly
+    instead of falsely claiming a restore.
+    """
+    tmp = dst.with_name(f"{dst.name}.restore.{os.getpid()}.tmp")
+    try:
+        shutil.copy2(src, tmp)
+        _fsync_path(tmp)
+        os.replace(tmp, dst)
+        _fsync_path(dst)
+        return True
+    except OSError:
+        with contextlib.suppress(OSError):
+            if tmp.exists():
+                tmp.unlink()
+        return False
+
+
+def _probe_integrity(path: Path) -> tuple[str, str]:
+    """Read-only quick_check + integrity_check of ``path``.
+
+    Returns ``(verdict, detail)`` where verdict is ``ok`` / ``corrupt`` /
+    ``unavailable``. Never opens ``path`` for write.
+    """
+    try:
+        conn = _readonly_probe_connection(path)
+        try:
+            qc = _pragma_check_rows(conn, "quick_check")
+            ic = _pragma_check_rows(conn, "integrity_check")
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as exc:
+        return "unavailable", str(exc)
+    except sqlite3.DatabaseError as exc:
+        return "corrupt", str(exc)
+    ok = qc == "ok" and ic == "ok"
+    return ("ok" if ok else "corrupt"), f"quick_check={qc}; integrity_check={ic}"
+
+
+def _lsof_db_holders(paths: list[Path]) -> tuple[Optional[list[dict]], Optional[str]]:
+    """Processes OTHER than us holding any of ``paths`` open.
+
+    Returns ``(holders, error)``. ``holders`` is a list of
+    ``{"pid", "command"}`` for every other process with one of the files open,
+    or ``[]`` if none. ``error`` is set (and ``holders`` is ``None``) when the
+    check could not be performed — the caller must treat "cannot verify" as
+    unsafe unless ``--force``.
+    """
+    lsof = shutil.which("lsof")
+    if not lsof:
+        return None, "lsof not found on PATH — cannot verify writer quiescence"
+    existing = [str(p) for p in paths if p.exists()]
+    if not existing:
+        return [], None
+    try:
+        # ``-w`` suppresses benign warnings so a non-empty stderr means a real
+        # failure (permission/procfs), which we can then fail closed on.
+        proc = subprocess.run(
+            [lsof, "-w", "-F", "pc", "--", *existing],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return None, f"lsof failed to run: {exc}"
+    # A process only appears in the output because it has one of `existing`
+    # open, so every emitted pid (other than ours) is a real holder.
+    me = os.getpid()
+    holders: dict[int, dict] = {}
+    cur_pid: Optional[int] = None
+    for line in proc.stdout.splitlines():
+        if not line:
+            continue
+        tag, val = line[0], line[1:]
+        if tag == "p":
+            try:
+                cur_pid = int(val)
+            except ValueError:
+                cur_pid = None
+            if cur_pid is not None and cur_pid != me:
+                holders.setdefault(cur_pid, {"pid": cur_pid, "command": None})
+        elif tag == "c" and cur_pid is not None and cur_pid != me:
+            holders.setdefault(cur_pid, {"pid": cur_pid, "command": None})
+            holders[cur_pid]["command"] = val
+    # lsof exits 1 both for "no open files" (normal) AND on error. Distinguish:
+    # holders parsed → trust them; otherwise a nonzero exit that also produced
+    # diagnostic stderr is a real failure → fail closed (do NOT report quiesced).
+    stderr = (proc.stderr or "").strip()
+    if not holders:
+        if proc.returncode not in (0, 1):
+            return None, f"lsof exited {proc.returncode}: {stderr or 'unknown error'}"
+        if proc.returncode == 1 and stderr:
+            return None, f"lsof error (rc=1): {stderr}"
+    return list(holders.values()), None
+
+
+def _cmd_swap(args: argparse.Namespace) -> int:
+    """Lock-protected quiesce + atomic swap of a recovered DB into the live path."""
+    db_path = _diag_db_path(args)
+    from_arg = getattr(args, "from_path", None)
+    do_recover = bool(getattr(args, "recover", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    force = bool(getattr(args, "force", False))
+
+    if not dry_run and not from_arg and not do_recover:
+        print("kanban swap: choose one of --from <recovered.db> or --recover "
+              "(or --dry-run to only check quiescence)", file=sys.stderr)
+        return 2
+    if not db_path.is_file():
+        print(f"kanban swap: no such live database file: {db_path}", file=sys.stderr)
+        return _INTEGRITY_EXIT_UNAVAILABLE
+
+    from_path = Path(from_arg).expanduser() if from_arg else None
+    if from_path is not None:
+        if not from_path.is_file():
+            print(f"kanban swap: --from file does not exist: {from_path}",
+                  file=sys.stderr)
+            return _INTEGRITY_EXIT_UNAVAILABLE
+        if from_path.resolve() == db_path.resolve():
+            print("kanban swap: --from must differ from the live DB",
+                  file=sys.stderr)
+            return 2
+
+    sidecar_suffixes = ("-wal", "-shm")
+    sidecars = [db_path.with_name(db_path.name + s) for s in sidecar_suffixes]
+    result: dict[str, Any] = {
+        "db_path": str(db_path),
+        "from": str(from_path) if from_path else None,
+        "mode": "recover" if do_recover else ("from" if from_path else "dry-run"),
+        "dry_run": dry_run,
+        "force": force,
+        "maintenance_lock": None,
+        "quiescence": None,
+        "backup": None,
+        "verdict": "aborted",
+    }
+
+    def _emit(code: int) -> int:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return code
+
+    def _check_quiescence() -> Optional[int]:
+        """lsof gate; sets result['quiescence']. Returns an exit code to abort
+        with, or None to proceed (holders/errors tolerated only under --force)."""
+        holders, qerr = _lsof_db_holders([db_path, *sidecars])
+        if qerr is not None:
+            result["quiescence"] = {"verified": False, "error": qerr}
+            if not force:
+                print(f"kanban swap: {qerr}; refusing to swap without verified "
+                      "quiescence (re-run with --force to override)", file=sys.stderr)
+                return _SWAP_EXIT_WRITERS_ACTIVE
+        else:
+            result["quiescence"] = {"verified": True, "holders": holders}
+            if holders and not force:
+                hs = ", ".join(f"{h['command']}({h['pid']})" for h in holders)
+                print(f"kanban swap: {len(holders)} process(es) still hold the DB "
+                      f"open [{hs}]; stop them first (`hermes gateway stop` per "
+                      "profile) or re-run with --force", file=sys.stderr)
+                return _SWAP_EXIT_WRITERS_ACTIVE
+        return None
+
+    def _integrity_exit(verdict: str) -> int:
+        return _INTEGRITY_EXIT_CORRUPT if verdict == "corrupt" else _INTEGRITY_EXIT_UNAVAILABLE
+
+    stack = contextlib.ExitStack()
+    try:
+        # Hold the exclusive maintenance (init) lock across the ENTIRE swap,
+        # including the post-swap verify/restore: connect() takes this same lock
+        # around its whole open, so no new/respawned process can attach to the
+        # old — or the not-yet-verified new — inode for the duration. Locking
+        # ONLY the init lock (never write.lock) keeps one init→write order
+        # fleet-wide: connect()'s migration runs write_txn under the init lock, so
+        # a maintenance path that took write-then-init would deadlock.
+        try:
+            entered = stack.enter_context(kb.exclusive_maintenance_lock(
+                db_path, timeout=float(getattr(args, "lock_timeout", 10.0))))
+        except kb.KanbanMaintenanceLockTimeout as exc:
+            # The maintenance lock IS the connect-gate. --force must NOT bypass it:
+            # proceeding unlocked would reopen the "a process attaches mid-swap"
+            # race this design closes. --force only overrides the lsof holder
+            # check below (an existing attached-but-idle connection).
+            result["maintenance_lock"] = "timeout"
+            result["verdict"] = "writers-active"
+            print(f"kanban swap: {exc}; stop the writers first "
+                  "(`hermes gateway stop` per profile) and retry — --force does "
+                  "not bypass the maintenance lock", file=sys.stderr)
+            return _emit(_SWAP_EXIT_WRITERS_ACTIVE)
+        if entered is None:
+            # fcntl unavailable (e.g. Windows): the connect-gate lock cannot be
+            # held at all, so nothing stops a process attaching mid-swap. Fail
+            # closed unless --force (which explicitly accepts unverifiable
+            # quiescence). Never silently mutate the DB with no lock.
+            result["maintenance_lock"] = "unavailable(no-fcntl)"
+            if not force:
+                result["verdict"] = "maintenance-lock-unavailable"
+                print("kanban swap: the maintenance lock is unavailable on this "
+                      "platform (no fcntl) — cannot guarantee no process attaches "
+                      "during the swap; re-run with --force to override at your "
+                      "own risk.", file=sys.stderr)
+                return _emit(_SWAP_EXIT_WRITERS_ACTIVE)
+        else:
+            result["maintenance_lock"] = "held"
+
+        # Quiescence gate (fast-fail + the whole answer for --dry-run). lsof
+        # catches EXISTING attached connections that the init lock cannot.
+        if (code := _check_quiescence()) is not None:
+            result["verdict"] = "writers-active"
+            return _emit(code)
+        if dry_run:
+            result["verdict"] = "dry-run-ok"
+            return _emit(_INTEGRITY_EXIT_OK)
+
+        with tempfile.TemporaryDirectory(prefix="hermes-kanban-swap-") as td:
+            # Produce a clean, integrity-verified incoming file.
+            if do_recover:
+                staged_recover = Path(td) / f"{db_path.name}.recovered"
+                code, rec = _recover_db_to(db_path, staged_recover)
+                result["recover"] = rec
+                if code != 0:
+                    result["verdict"] = "recover-failed"
+                    print("kanban swap: inline recovery did not produce a clean "
+                          "DB; not swapping", file=sys.stderr)
+                    return _emit(code if code in (1, _INTEGRITY_EXIT_CORRUPT)
+                                 else _INTEGRITY_EXIT_CORRUPT)
+                incoming: Path = staged_recover
+            else:
+                assert from_path is not None  # guaranteed by usage validation
+                incoming = from_path
+                verdict, detail = _probe_integrity(incoming)
+                result["incoming_integrity"] = detail
+                if verdict != "ok":
+                    result["verdict"] = "incoming-" + verdict
+                    print(f"kanban swap: --from file failed integrity_check "
+                          f"({detail}); refusing to swap in a bad DB", file=sys.stderr)
+                    return _emit(_integrity_exit(verdict))
+
+            stamp = datetime.now().strftime("%Y%m%dT%H%M%S_%f")
+            backup_dir = Path(getattr(args, "backup_dir", None) or db_path.parent).expanduser()
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            # Microsecond stamp + pid → collision-proof; and we never overwrite.
+            backup_path = backup_dir / f"{db_path.name}.pre-swap.{stamp}.p{os.getpid()}.bak"
+            # Staged incoming lives in the live DB's dir (same fs → atomic replace).
+            staged = db_path.with_name(f"{db_path.name}.incoming.{stamp}")
+            moved: list[tuple[Path, Path]] = []
+            try:
+                shutil.copy2(incoming, staged)
+                _fsync_path(staged)
+                if backup_path.exists() or backup_path.is_symlink():
+                    result["verdict"] = "backup-collision"
+                    print(f"kanban swap: backup path already exists ({backup_path})",
+                          file=sys.stderr)
+                    return _emit(1)
+
+                # CRASH-SAFE COMMIT (init lock held throughout):
+                #  1. copy the old DB aside (db_path stays live — never renamed
+                #     away, so the path is never absent on disk);
+                shutil.copy2(db_path, backup_path)
+                _fsync_path(backup_path)
+                result["backup"] = str(backup_path)
+                #  2. move the OLD -wal/-shm aside (a new DB sharing stale
+                #     sidecars corrupts on the next open);
+                for suffix in sidecar_suffixes:
+                    sc = db_path.with_name(db_path.name + suffix)
+                    if sc.exists():
+                        dest = backup_path.with_name(backup_path.name + suffix)
+                        os.replace(sc, dest)
+                        moved.append((sc, dest))
+                #  3. atomically OVERWRITE db_path with the clean incoming inode.
+                try:
+                    os.replace(staged, db_path)
+                    _fsync_path(db_path)
+                except OSError as exc:
+                    for sc, dest in moved:  # db_path still the intact old inode
+                        with contextlib.suppress(OSError):
+                            os.replace(dest, sc)
+                    with contextlib.suppress(OSError):
+                        backup_path.unlink()
+                    result["verdict"] = "swap-failed"
+                    print(f"kanban swap: replace failed ({exc}); live DB left "
+                          "intact (old inode)", file=sys.stderr)
+                    return _emit(1)
+                result["moved_sidecars"] = [str(d) for _, d in moved]
+
+                # Post-swap verify — STILL under the init lock, so nothing opens
+                # the new inode until it is confirmed clean (or restored).
+                verdict, detail = _probe_integrity(db_path)
+                result["post_swap_integrity"] = detail
+                if verdict != "ok":
+                    # Restore ATOMICALLY (temp copy + os.replace) so a failure
+                    # mid-restore can never leave a half-written live DB, and
+                    # report honestly if the restore itself fails.
+                    restored = _atomic_restore(backup_path, db_path)
+                    for sc, dest in moved:
+                        with contextlib.suppress(OSError):
+                            os.replace(dest, sc)
+                    if restored:
+                        result["verdict"] = "post-swap-" + verdict + "-restored"
+                        print(f"kanban swap: post-swap integrity failed ({detail}); "
+                              "restored the original DB from backup", file=sys.stderr)
+                    else:
+                        result["verdict"] = "post-swap-" + verdict + "-RESTORE-FAILED"
+                        print(f"kanban swap: post-swap integrity failed ({detail}) AND "
+                              f"restore failed — the intact pre-swap backup is at "
+                              f"{backup_path}; restore it manually before restarting "
+                              "writers", file=sys.stderr)
+                    return _emit(_integrity_exit(verdict))
+
+                result["verdict"] = "ok"
+                print(_SWAP_DONE_REMINDER, file=sys.stderr)
+                return _emit(_INTEGRITY_EXIT_OK)
+            finally:
+                # Never leave a partial/leftover `.incoming.*` beside the DB.
+                with contextlib.suppress(OSError):
+                    if staged.exists():
+                        staged.unlink()
+    finally:
+        stack.close()
+
+
+def _count_rows_best_effort(conn: sqlite3.Connection, table: str) -> Optional[int]:
+    """COUNT(*) a table, returning None instead of raising on damaged pages."""
+    quoted = table.replace('"', '""')
+    try:
+        row = conn.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()
+        return int(row[0]) if row else None
+    except sqlite3.Error:
+        return None
 
 
 # ---------------------------------------------------------------------------
