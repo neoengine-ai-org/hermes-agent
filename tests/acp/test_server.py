@@ -943,6 +943,7 @@ class TestSessionConfiguration:
     @pytest.mark.asyncio
     async def test_set_session_model_accepts_provider_prefixed_choice(self, tmp_path, monkeypatch):
         runtime_calls = []
+        agent_providers = []
 
         def fake_resolve_runtime_provider(requested=None, **kwargs):
             runtime_calls.append(requested)
@@ -957,6 +958,7 @@ class TestSessionConfiguration:
             }
 
         def fake_agent(**kwargs):
+            agent_providers.append(kwargs.get("provider"))
             return SimpleNamespace(
                 model=kwargs.get("model"),
                 provider=kwargs.get("provider"),
@@ -999,6 +1001,7 @@ class TestSessionConfiguration:
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert "anthropic" in runtime_calls
+        assert agent_providers[-1] == "anthropic"
 
 
 # ---------------------------------------------------------------------------
@@ -1528,6 +1531,7 @@ class TestSlashCommands:
     def test_model_switch_uses_requested_provider(self, tmp_path, monkeypatch):
         """`/model provider:model` should rebuild the ACP agent on that provider."""
         runtime_calls = []
+        agent_providers = []
 
         def fake_resolve_runtime_provider(requested=None, **kwargs):
             runtime_calls.append(requested)
@@ -1542,6 +1546,7 @@ class TestSlashCommands:
             }
 
         def fake_agent(**kwargs):
+            agent_providers.append(kwargs.get("provider"))
             return SimpleNamespace(
                 model=kwargs.get("model"),
                 provider=kwargs.get("provider"),
@@ -1582,6 +1587,7 @@ class TestSlashCommands:
         assert state.agent.provider == "anthropic"
         assert state.agent.base_url == "https://anthropic.example/v1"
         assert "anthropic" in runtime_calls
+        assert agent_providers[-1] == "anthropic"
 
 
 # ---------------------------------------------------------------------------
