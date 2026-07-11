@@ -549,19 +549,25 @@ def _run_git(workdir: Path, args: List[str]) -> Tuple[int, bytes, bytes]:
         return -1, b"", f"<unavailable: {exc}>".encode()
 
 
-def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
+def _git_snapshot(
+    workdir: Path,
+) -> Tuple[List[Tuple[str, bytes]], bool, bool]:
     """Capture status/diff/HEAD/unpushed/stash state of a workdir clone
     before removal.
 
-    Returns ``(members, is_dirty)`` — dirty means the working tree holds
-    ANY content a fresh clone could not reproduce: uncommitted tracked
-    changes, untracked or ignored files, stash entries, or commits that
-    exist on no remote (committed-but-unpushed work). Dirty workdirs must
-    be archived as full working-tree content, not just receipts.
+    Returns ``(members, is_dirty, stash_present)`` — dirty means the
+    working tree holds ANY content a fresh clone could not reproduce:
+    uncommitted tracked changes, untracked or ignored files, stash
+    entries, or commits that exist on no remote (committed-but-unpushed
+    work, including detached HEAD). Dirty workdirs must be archived as
+    full working-tree content; when a stash exists the archive must also
+    include ``.git`` itself, because ``stash -u`` untracked/binary content
+    is representable in no patch output.
     """
     members: List[Tuple[str, bytes]] = []
     base = f"lane-workdir-snapshots/{workdir.name}"
     dirty = False
+    stash_present = False
     for name, git_args, dirty_when in (
         # --ignored: ignored artifacts (build outputs, local results) count
         # as dirty too — a diff cannot reproduce them either
@@ -594,14 +600,23 @@ def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
                 )
             elif dirty_when == "any-output":
                 dirty = dirty or bool(stdout.strip())
+        if name == "stash.txt":
+            stash_present = returncode != 0 or bool(stdout.strip())
         members.append((f"{base}/{name}", payload))
-    return members, dirty
+    return members, dirty, stash_present
 
 
-def _workdir_content_files(workdir: Path, max_file_bytes: int = 64 * 1024 * 1024) -> Tuple[List[Path], List[str]]:
-    """All regular files in a workdir excluding .git, for full-content
-    archiving of dirty workdirs. Oversized files are reported, not silently
-    dropped."""
+def _workdir_content_files(
+    workdir: Path,
+    max_file_bytes: int = 64 * 1024 * 1024,
+    include_git: bool = False,
+) -> Tuple[List[Path], List[str]]:
+    """All regular files in a workdir for full-content archiving of dirty
+    workdirs. ``.git`` is excluded by default (the working tree + diffs
+    reproduce it) but INCLUDED when the caller detects state that lives
+    only inside .git — e.g. stash entries, whose ``-u`` untracked/binary
+    content no patch output can carry. Oversized files are reported, not
+    silently dropped."""
     files: List[Path] = []
     skipped: List[str] = []
     for path in sorted(workdir.rglob("*")):
@@ -610,7 +625,7 @@ def _workdir_content_files(workdir: Path, max_file_bytes: int = 64 * 1024 * 1024
                 continue
         except OSError:
             continue
-        if ".git" in path.relative_to(workdir).parts:
+        if not include_git and ".git" in path.relative_to(workdir).parts:
             continue
         if _file_size(path) > max_file_bytes:
             skipped.append(str(path.relative_to(workdir)))
@@ -680,11 +695,14 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
             report.candidate_bytes += dir_bytes
             if not cfg.execute:
                 continue
-            snapshot, dirty = _git_snapshot(workdir)
+            snapshot, dirty, stash_present = _git_snapshot(workdir)
             if dirty:
                 # diffs do not carry untracked/ignored contents — archive
-                # the full working tree (minus .git) before removal
-                to_archive, oversized = _workdir_content_files(workdir)
+                # the full working tree before removal; stash entries live
+                # only in .git, so a stash pulls .git into the archive too
+                to_archive, oversized = _workdir_content_files(
+                    workdir, include_git=stash_present
+                )
                 for rel in oversized:
                     report.notes.append(
                         f"{lane_id}: oversized file kept out of archive: {rel}"
@@ -884,6 +902,32 @@ def _session_referencing_tables(
     return refs
 
 
+def _cascade_offenders(
+    conn: sqlite3.Connection, tables: set, parents: set
+) -> Optional[List[str]]:
+    """Tables whose ON DELETE CASCADE reference onto a ``parents`` table
+    would fire TRANSITIVELY when we delete sessions/messages rows —
+    depth-2+ descendants we do not export. Non-empty means deletion must
+    abort (extend the exporter first). None means discovery itself failed
+    (cannot prove safety => also abort)."""
+    offenders: List[str] = []
+    for table in sorted(tables):
+        if table in {"sessions", "messages"} or table.startswith("sqlite_"):
+            continue
+        ident = '"' + table.replace('"', '""') + '"'
+        try:
+            rows = conn.execute(
+                f"PRAGMA foreign_key_list({ident})"
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+        for row in rows:
+            # row: (id, seq, table, from, to, on_update, on_delete, match)
+            if row[2] in parents and str(row[6]).upper() == "CASCADE":
+                offenders.append(f"{table}->{row[2]}")
+    return offenders
+
+
 def _eligible_session_ids(
     conn: sqlite3.Connection, cutoff: float
 ) -> List[str]:
@@ -994,6 +1038,24 @@ def _retain_one_db(
         if ref_tables is None:
             report.errors.append(
                 f"{slug}: FK reference discovery failed — rows NOT deleted"
+            )
+            return
+        # a grandchild table cascading off a direct reference (or off
+        # messages) would be deleted UNEXPORTED — fail closed until the
+        # exporter is extended for that schema
+        offenders = _cascade_offenders(
+            conn, tables, {t for t, _ in ref_tables} | {"messages"}
+        )
+        if offenders is None:
+            report.errors.append(
+                f"{slug}: cascade-safety discovery failed — rows NOT deleted"
+            )
+            return
+        if offenders:
+            report.errors.append(
+                f"{slug}: transitive ON DELETE CASCADE would delete "
+                f"unexported rows ({', '.join(offenders)}) — rows NOT "
+                "deleted; extend the exporter for these tables"
             )
             return
         ref_rows: List[Dict[str, Any]] = []

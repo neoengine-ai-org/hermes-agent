@@ -356,6 +356,79 @@ def test_pushed_clean_clone_collected_first_pass(tmp_path, monkeypatch):
     assert not any("revived" in n for n in report.notes)
 
 
+def test_stash_untracked_content_recoverable_from_archive(
+    tmp_path, monkeypatch
+):
+    """git stash -u content lives only in .git — a stash must pull .git
+    into the content archive so the stash is actually recoverable."""
+    import subprocess as sp
+
+    root = tmp_path / "hermes"
+    wd = _make_workdir(root, "lane-stash", OLD)
+    git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
+    sp.run(["git", "init", "-q", str(wd)], check=True)
+    (wd / "base.txt").write_text("base")
+    sp.run([*git, "add", "-A"], check=True)
+    sp.run([*git, "commit", "-qm", "base"], check=True)
+    (wd / "untracked-stashed.bin").write_bytes(b"\x00binary only in stash")
+    sp.run([*git, "stash", "-u", "-q"], check=True)
+    for p in [wd, *wd.rglob("*")]:
+        os.utime(p, (OLD, OLD))
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: False,
+    )
+    cfg = _cfg(root, execute=True)
+    lane_lane_workdirs(cfg, root)
+    assert not wd.exists()
+    archive = next(cfg.archive_dir.glob("lane-workdir-lane-stash-*.tar.gz"))
+    extract = tmp_path / "restore"
+    with tarfile.open(archive) as tar:
+        assert any(
+            "/.git/" in n or n.endswith("/.git") for n in tar.getnames()
+        )
+        tar.extractall(extract, filter="data")
+    # arcnames are root-relative; the snapshot dir shares the lane name,
+    # so address the restored workdir explicitly
+    restored = (
+        extract / "state" / "nw-agent-dispatch" / "lane-workdirs"
+        / "lane-stash"
+    )
+    listing = sp.run(
+        ["git", "-C", str(restored), "stash", "list"],
+        capture_output=True,
+        text=True,
+    )
+    assert listing.stdout.strip()  # the stash entry survived the archive
+
+
+def test_state_db_transitive_cascade_blocks_deletion(tmp_path):
+    root = tmp_path / "hermes"
+    db = _make_db(root)
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE topic_bindings (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE TABLE binding_meta (
+            id INTEGER PRIMARY KEY,
+            binding_id INTEGER
+                REFERENCES topic_bindings(id) ON DELETE CASCADE,
+            note TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    report = lane_state_db(_cfg(root, execute=True), root)
+    assert any("transitive" in e for e in report.errors)
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 5
+    conn.close()
+
+
 def test_state_db_ref_discovery_failure_blocks_deletion(
     tmp_path, monkeypatch
 ):
