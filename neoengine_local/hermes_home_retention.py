@@ -214,19 +214,31 @@ def _slug_for(root: Path, target: Path) -> str:
 
 
 def _unique_archive_base(cfg: RetentionConfig, slug: str) -> str:
-    """Collision-safe archive basename within the archive dir (protects
-    against slug collisions and same-second concurrent runs)."""
+    """Collision-safe archive basename within the archive dir. The receipt
+    path is atomically reserved with O_EXCL, so two runs (or two slugs
+    colliding in the same second) can never claim the same base."""
     base = f"{slug}-{cfg.runstamp}"
     candidate = base
     counter = 2
-    while (
-        (cfg.archive_dir / f"{candidate}.tar.gz").exists()
-        or (cfg.archive_dir / f"{candidate}.jsonl.gz").exists()
-        or (cfg.archive_dir / f"{candidate}.receipt.json").exists()
-    ):
+    while True:
+        receipt = cfg.archive_dir / f"{candidate}.receipt.json"
+        collision = (
+            (cfg.archive_dir / f"{candidate}.tar.gz").exists()
+            or (cfg.archive_dir / f"{candidate}.jsonl.gz").exists()
+        )
+        if not collision:
+            try:
+                fd = os.open(
+                    str(receipt), os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                )
+                os.close(fd)
+                return candidate
+            except FileExistsError:
+                pass
+            except OSError:
+                return candidate  # cannot reserve; fall back to name check
         candidate = f"{base}-{counter}"
         counter += 1
-    return candidate
 
 
 def _fsync_dir(directory: Path) -> None:
@@ -332,9 +344,17 @@ def _write_archive(
     return archive_path, verified
 
 
-def _safe_unlink(cfg: RetentionConfig, report: LaneReport, path: Path) -> bool:
-    """Unlink with a last-instant re-check: if the path was replaced with a
-    symlink or fresh content since the scan, leave it alone."""
+def _safe_unlink(
+    cfg: RetentionConfig,
+    report: LaneReport,
+    path: Path,
+    expected: Optional[os.stat_result] = None,
+) -> bool:
+    """Unlink with a last-instant re-check: the path must still resolve
+    inside the retention root (an ancestor swapped to a symlink since the
+    scan drops containment), must not have been replaced with a symlink or
+    fresh content, and — when the scan-time stat is provided — must be
+    byte-identical in (size, mtime) to what was scanned/archived."""
     try:
         stat = path.lstat()
     except OSError:
@@ -342,8 +362,17 @@ def _safe_unlink(cfg: RetentionConfig, report: LaneReport, path: Path) -> bool:
     if not os.path.isfile(path) or path.is_symlink():
         report.notes.append(f"skipped {path.name}: replaced since scan")
         return False
+    if not _is_within(cfg.root, path):
+        report.notes.append(f"skipped {path.name}: left root since scan")
+        return False
     if stat.st_mtime >= cfg.age_cutoff:
         report.notes.append(f"skipped {path.name}: fresh content since scan")
+        return False
+    if expected is not None and (
+        stat.st_size != expected.st_size
+        or stat.st_mtime_ns != expected.st_mtime_ns
+    ):
+        report.notes.append(f"skipped {path.name}: changed since scan")
         return False
     size = stat.st_size
     try:
@@ -366,14 +395,20 @@ def _prune_files(
     """Account candidates; on execute archive (unless cache class) then
     unlink ONLY the files verified inside the archive."""
     by_class: Dict[str, List[Path]] = {}
+    scan_stats: Dict[Path, os.stat_result] = {}
     for path in candidates:
         klass = archive_class if archive_class else _classify(path)
         by_class.setdefault(klass, []).append(path)
+        try:
+            scan_stats[path] = path.lstat()
+        except OSError:
+            continue
         report.candidate_files += 1
-        report.candidate_bytes += _file_size(path)
+        report.candidate_bytes += scan_stats[path].st_size
     if not cfg.execute:
         return
     for klass, files in sorted(by_class.items()):
+        files = [p for p in files if p in scan_stats]
         if klass == CLASS_CACHE:
             deletable = files  # re-derivable, no archive required
         else:
@@ -389,7 +424,7 @@ def _prune_files(
                     "verified in archive"
                 )
         for path in deletable:
-            _safe_unlink(cfg, report, path)
+            _safe_unlink(cfg, report, path, expected=scan_stats.get(path))
 
 
 # ---------------------------------------------------------------------------
@@ -490,7 +525,10 @@ def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
     base = f"lane-workdir-snapshots/{workdir.name}"
     dirty = False
     for name, git_args in (
-        ("status.txt", ["status", "--porcelain=v1", "--branch"]),
+        # --ignored: ignored artifacts (build outputs, local results) count
+        # as dirty too — a diff cannot reproduce them either
+        ("status.txt",
+         ["status", "--porcelain=v1", "--branch", "--ignored=matching"]),
         ("diff.patch", ["diff"]),
         ("diff-cached.patch", ["diff", "--cached"]),
         ("head.txt", ["rev-parse", "HEAD"]),
@@ -577,11 +615,23 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
             if sweep:
                 report.notes.append(f"{lane_id}: live process references lane")
                 continue
-            dir_bytes = sum(
-                _file_size(p)
-                for p in workdir.rglob("*")
-                if not p.is_symlink() and p.is_file()
-            )
+            dir_bytes = 0
+            newest_mtime = _file_mtime(workdir)
+            for p in workdir.rglob("*"):
+                try:
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                dir_bytes += _file_size(p)
+                newest_mtime = max(newest_mtime, _file_mtime(p))
+            if newest_mtime > grace_cutoff:
+                # a nested write does not bump the top-level dir mtime —
+                # any file written inside the grace window means live
+                report.notes.append(
+                    f"{lane_id}: nested content inside grace window"
+                )
+                continue
             report.candidate_files += 1
             report.candidate_bytes += dir_bytes
             if not cfg.execute:
@@ -623,8 +673,17 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
                 )
                 continue
             # last-instant re-check: lane may have revived since eligibility
-            if _file_mtime(workdir) > grace_cutoff or (
-                registry.exists() and _registry_says_alive(registry, lane_id)
+            # (registry, top-level mtime, AND a fresh process sweep — a lane
+            # can start between the first sweep and here)
+            resweep = _process_sweep_mentions([lane_id, str(workdir)])
+            if (
+                _file_mtime(workdir) > grace_cutoff
+                or (
+                    registry.exists()
+                    and _registry_says_alive(registry, lane_id)
+                )
+                or resweep is None
+                or resweep
             ):
                 report.notes.append(f"{lane_id}: revived before removal — kept")
                 continue
@@ -734,6 +793,29 @@ def _export_rows_gzip_jsonl(
     return path
 
 
+def _session_referencing_tables(
+    conn: sqlite3.Connection, tables: set
+) -> List[Tuple[str, str]]:
+    """(table, fk_column) pairs for every table with a foreign key onto
+    sessions, discovered from the live schema so drift is tolerated.
+    ``messages`` is excluded — it has its own export."""
+    refs: List[Tuple[str, str]] = []
+    for table in sorted(tables):
+        if table in {"sessions", "messages"} or table.startswith("sqlite_"):
+            continue
+        try:
+            rows = conn.execute(
+                f"PRAGMA foreign_key_list({json.dumps(table)})"
+            ).fetchall()
+        except sqlite3.Error:
+            continue
+        for row in rows:
+            # row: (id, seq, table, from, to, on_update, on_delete, match)
+            if row[2] == "sessions":
+                refs.append((table, row[3]))
+    return refs
+
+
 def _eligible_session_ids(
     conn: sqlite3.Connection, cutoff: float
 ) -> List[str]:
@@ -829,6 +911,42 @@ def _retain_one_db(
             cfg, f"{slug}-sessions-summary", CLASS_RECEIPT, session_rows
         )
 
+        # foreign_keys=ON makes ON DELETE CASCADE references (e.g. telegram
+        # topic bindings) follow the session delete — export them first,
+        # discovered generically from the live schema
+        ref_rows: List[Dict[str, Any]] = []
+        for table, column in _session_referencing_tables(conn, tables):
+            for start in range(0, len(session_ids), DB_DELETE_BATCH):
+                batch = session_ids[start : start + DB_DELETE_BATCH]
+                placeholders = ",".join("?" for _ in batch)
+                try:
+                    cursor = conn.execute(
+                        f'SELECT * FROM "{table}" '
+                        f'WHERE "{column}" IN ({placeholders})',
+                        batch,
+                    )
+                except sqlite3.Error:
+                    continue
+                columns = [d[0] for d in cursor.description]
+                ref_rows.extend(
+                    {"_table": table, **dict(zip(columns, row))}
+                    for row in cursor.fetchall()
+                )
+        refs_export = _export_rows_gzip_jsonl(
+            cfg, f"{slug}-session-refs", CLASS_RECEIPT, ref_rows
+        )
+        if ref_rows and refs_export is None:
+            report.errors.append(
+                f"{slug}: session-refs export failed — rows NOT deleted"
+            )
+            return
+
+        # any message inserted after this point has a larger rowid, even if
+        # its timestamp is old (replays) — used by delete revalidation
+        snapshot_max_id = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM messages"
+        ).fetchone()[0]
+
         message_rows: List[Dict[str, Any]] = []
         for start in range(0, len(session_ids), DB_DELETE_BATCH):
             batch = session_ids[start : start + DB_DELETE_BATCH]
@@ -857,27 +975,54 @@ def _retain_one_db(
         del message_rows
 
         deleted_messages = 0
+        deleted_sessions = 0
         revived_sessions = 0
         for start in range(0, len(session_ids), DB_DELETE_BATCH):
             batch = session_ids[start : start + DB_DELETE_BATCH]
             placeholders = ",".join("?" for _ in batch)
             with conn:
                 # revalidate inside the delete transaction: a session that
-                # gained a message inside the window since selection/export
-                # is live again and must not be deleted
+                # gained ANY message since the export snapshot (fresh
+                # timestamp OR replayed old timestamp = rowid past the
+                # snapshot), or whose lifecycle no longer satisfies
+                # eligibility (reopened), is live again — keep it
                 revived = {
                     r[0]
                     for r in conn.execute(
                         f"""
                         SELECT DISTINCT session_id FROM messages
                         WHERE session_id IN ({placeholders})
-                          AND timestamp >= ?
+                          AND (timestamp >= ? OR id > ?)
                         """,
-                        [*batch, cutoff],
+                        [*batch, cutoff, snapshot_max_id],
                     ).fetchall()
                 }
-                keep = [i for i in batch if i not in revived]
-                revived_sessions += len(revived)
+                still_eligible = {
+                    r[0]
+                    for r in conn.execute(
+                        f"""
+                        SELECT id FROM sessions
+                        WHERE id IN ({placeholders})
+                          AND (
+                            (
+                              (ended_at IS NOT NULL OR end_reason IS NOT NULL)
+                              AND COALESCE(ended_at, started_at) < ?
+                            )
+                            OR (
+                              ended_at IS NULL AND end_reason IS NULL
+                              AND started_at < ?
+                            )
+                          )
+                        """,
+                        [*batch, cutoff, cutoff],
+                    ).fetchall()
+                }
+                keep = [
+                    i
+                    for i in batch
+                    if i not in revived and i in still_eligible
+                ]
+                revived_sessions += len(batch) - len(keep)
                 if not keep:
                     continue
                 keep_ph = ",".join("?" for _ in keep)
@@ -893,9 +1038,10 @@ def _retain_one_db(
                     """,
                     keep,
                 )
-                conn.execute(
+                cur = conn.execute(
                     f"DELETE FROM sessions WHERE id IN ({keep_ph})", keep
                 )
+                deleted_sessions += cur.rowcount
         if revived_sessions:
             report.notes.append(
                 f"{slug}: {revived_sessions} session(s) revived since "
@@ -907,10 +1053,8 @@ def _retain_one_db(
                     "DELETE FROM compression_locks WHERE expires_at < ?",
                     (time.time(),),
                 )
-        report.acted_files += deleted_messages + (
-            len(session_ids) - revived_sessions
-        )
-        report.acted_bytes += int(msg_bytes)
+        report.acted_files += deleted_messages + deleted_sessions
+        report.acted_bytes += int(msg_bytes)  # pre-delete estimate
 
         try:
             ckpt = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
@@ -1273,7 +1417,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         warn_bytes=args.warn_bytes,
         db_warn_bytes=args.db_warn_bytes,
     )
-    reports = run_retention(cfg)
+    # single-instance guard for mutating runs: two concurrent sweeps over
+    # the same root would race each other's archives and re-checks
+    # (--check stays lock-free: it mutates nothing, not even a lock file)
+    lock_handle = None
+    if cfg.execute:
+        try:
+            import fcntl  # POSIX-only; retention timers are POSIX-side
+
+            lock_dir = root / "state" / "hermes-home-retention"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            lock_handle = open(lock_dir / ".lock", "w", encoding="utf-8")
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:
+            pass
+        except OSError:
+            print(
+                f"{TOOL_NAME}: another retention run holds the lock — exiting"
+            )
+            return 0
+
+    try:
+        reports = run_retention(cfg)
+    finally:
+        if lock_handle is not None:
+            lock_handle.close()
     print(format_report(cfg, reports))
     if args.check:
         return 1 if any(r.over_threshold for r in reports) else 0

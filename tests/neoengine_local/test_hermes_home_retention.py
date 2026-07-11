@@ -232,7 +232,10 @@ def test_dirty_workdir_full_content_archived(tmp_path, monkeypatch):
     sp.run(["git", "init", "-q", str(wd)], check=True)
     untracked = wd / "untracked-result.txt"
     untracked.write_text("the only copy of generated work")
-    os.utime(wd, (OLD, OLD))
+    # age everything (incl. .git internals) past the grace window — the
+    # nested newest-mtime liveness check must see a fully-dead lane
+    for p in [wd, *wd.rglob("*")]:
+        os.utime(p, (OLD, OLD))
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._process_sweep_mentions",
         lambda needles: False,
@@ -468,6 +471,42 @@ def test_profile_state_db_respects_kill_switch(tmp_path, monkeypatch):
     conn = sqlite3.connect(db)
     assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 5
     conn.close()
+
+
+def test_state_db_cascade_refs_exported_before_delete(tmp_path):
+    root = tmp_path / "hermes"
+    db = _make_db(root)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE topic_bindings (
+            id INTEGER PRIMARY KEY,
+            session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,
+            topic TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO topic_bindings (session_id, topic)"
+        " VALUES ('old-ended', 'burn-report')"
+    )
+    conn.commit()
+    conn.close()
+    cfg = _cfg(root, execute=True)
+    lane_state_db(cfg, root)
+    conn = sqlite3.connect(db)
+    # cascade removed the binding with the session...
+    assert conn.execute(
+        "SELECT COUNT(*) FROM topic_bindings"
+    ).fetchone()[0] == 0
+    conn.close()
+    # ...but its row was exported receipt-class first
+    refs = next(cfg.archive_dir.glob("*session-refs-*.jsonl.gz"))
+    lines = [
+        json.loads(l) for l in gzip.open(refs, "rt").read().splitlines()
+    ]
+    assert lines[0]["_table"] == "topic_bindings"
+    assert lines[0]["topic"] == "burn-report"
 
 
 def test_state_db_missing_tables_is_note_not_error(tmp_path):

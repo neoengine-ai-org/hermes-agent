@@ -1076,28 +1076,44 @@ def _output_keep_last() -> int:
         return 0
     raw = os.environ.get("HERMES_CRON_OUTPUT_KEEP", "").strip()
     if not raw:
-        return 200
+        return 500
     try:
         return max(0, int(raw))
     except ValueError:
-        return 200
+        return 500
+
+
+def _output_rotation_min_age_seconds() -> float:
+    """Age floor for write-time rotation. Outputs younger than this are
+    never rotation-deleted, so the archive-first retention sweep (which
+    handles anything older) gets to them before rotation does. Write-time
+    rotation is only the safety valve for runaway jobs."""
+    raw = os.environ.get("HERMES_CRON_OUTPUT_MIN_AGE_DAYS", "").strip()
+    try:
+        days = float(raw) if raw else 30.0
+    except ValueError:
+        days = 30.0
+    return max(0.0, days) * 86400.0
 
 
 def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
-    """Drop the oldest run outputs beyond ``keep``. Best-effort: rotation
-    must never break output writing, and must never delete outside
-    OUTPUT_DIR (job ids come from jobs.json, which can be hand-edited —
-    a traversal id like ``../..`` must not turn rotation into
-    arbitrary-directory deletion)."""
+    """Drop the oldest run outputs beyond ``keep`` that are also past the
+    age floor. Best-effort: rotation must never break output writing, and
+    must never delete outside OUTPUT_DIR (job ids come from jobs.json,
+    which can be hand-edited — a traversal id like ``../..`` must not turn
+    rotation into arbitrary-directory deletion)."""
     if keep <= 0:
         return
     try:
+        if OUTPUT_DIR.is_symlink():
+            return
         resolved = job_output_dir.resolve()
         output_root = OUTPUT_DIR.resolve()
-        if resolved != output_root and output_root not in resolved.parents:
+        if resolved == output_root or output_root not in resolved.parents:
             return
-        if resolved == output_root:
-            return
+        import time as _time
+
+        age_cutoff = _time.time() - _output_rotation_min_age_seconds()
         outputs = sorted(
             (
                 p
@@ -1108,6 +1124,8 @@ def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
         )
         for stale in outputs[: max(0, len(outputs) - keep)]:
             try:
+                if stale.stat().st_mtime >= age_cutoff:
+                    continue
                 stale.unlink()
             except OSError:
                 pass

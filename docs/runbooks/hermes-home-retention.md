@@ -46,10 +46,14 @@ keep-min 25 newest per directory) except where a lane has a stricter contract
 (lane-workdirs use the ratified 24h lane-worktree standing authority, gated on
 lane liveness; state.db uses 30d row retention).
 
-Additionally, `cron/jobs.py:save_job_output` now rotates at write time:
-each job keeps its newest `HERMES_CRON_OUTPUT_KEEP` (default 200) run
-outputs, so `cron/output` growth is bounded at the source and the sweep only
-handles pre-existing history and profiles.
+Additionally, `cron/jobs.py:save_job_output` rotates at write time as a
+**safety valve for runaway jobs only**: outputs beyond the newest
+`HERMES_CRON_OUTPUT_KEEP` (default 500) AND older than
+`HERMES_CRON_OUTPUT_MIN_AGE_DAYS` (default 30) are dropped without archive.
+Because the archive-first sweep handles everything older than 14 days
+weekly, rotation only ever fires on outputs the sweep failed to visit for
+over a month. Rotation refuses traversal job ids and symlinked output
+roots, honors the retention kill switches, and sorts by mtime.
 
 ### Why not the existing `maybe_auto_prune_and_vacuum`?
 
@@ -108,6 +112,13 @@ without cleanup is therefore still collected — fail-safe, not fail-open.
   FTS shadow tables follow via the existing delete triggers; children of
   pruned parents get `parent_session_id` nulled (mirrors `prune_sessions`);
   expired `compression_locks` rows are cleared when the table exists.
+- Rows in any table with a foreign key onto `sessions` (discovered from the
+  live schema, e.g. telegram topic bindings) are exported receipt-class
+  before the FK cascade deletes them. Each delete batch revalidates inside
+  its transaction: any new message since the export snapshot (fresh
+  timestamp OR rowid past the snapshot) or a reopened lifecycle keeps the
+  session. `--execute` runs take an exclusive flock so two sweeps can never
+  race the same root.
 - After deletion: `PRAGMA wal_checkpoint(TRUNCATE)`, then `VACUUM` only when
   estimated reclaimable bytes exceed `--vacuum-threshold-bytes` (default
   256 MiB). VACUUM needs up to 2x DB size free on disk; the job checks free

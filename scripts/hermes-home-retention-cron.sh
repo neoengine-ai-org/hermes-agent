@@ -41,8 +41,9 @@ write_handoff() {
     mkdir -p "$HANDOFF_DIR" || return 0
     # bound the payload: a huge report must not blow the execve env limit
     # and silently lose the only alert (keep head + tail of the report)
-    local bounded
-    if [ "${#report}" -gt 80000 ]; then
+    local bounded report_bytes
+    report_bytes=$(printf '%s' "$report" | wc -c | tr -d ' ')
+    if [ "$report_bytes" -gt 80000 ]; then
         bounded="$(printf '%s\n' "$report" | head -c 60000)
 [... report truncated for handoff; full output in the launchd log ...]
 $(printf '%s\n' "$report" | tail -c 20000)"
