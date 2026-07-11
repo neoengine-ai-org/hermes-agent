@@ -170,9 +170,10 @@ without cleanup is therefore still collected — fail-safe, not fail-open.
   SQLITE_BUSY; checkpoint-busy surfaced as a note); an FK row attached to
   an already-dead session between export and delete would cascade
   unexported (bindings attach to active sessions, which revalidation
-  keeps); transitive cascades (grandchild tables of a session-referencing
-  table) are deleted but not exported — no such table exists in the
-  current schema.
+  keeps). Transitive cascades are NOT a residual risk: `_cascade_offenders`
+  aborts deletion fail-closed if any table cascades off a
+  session-referencing table or off `messages` — extend the exporter
+  before such a schema can be pruned.
 - The kill switches also stop write-time cron rotation
   (`HERMES_HOME_RETENTION_DISABLED` / `..._CRON_OUTPUT_DISABLED`), so one
   env var halts all retention deletion in an incident. Rotation refuses
