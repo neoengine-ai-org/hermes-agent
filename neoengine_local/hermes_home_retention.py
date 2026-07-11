@@ -571,11 +571,16 @@ def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
         ("diff.patch", ["diff"], None),
         ("diff-cached.patch", ["diff", "--cached"], None),
         ("head.txt", ["rev-parse", "HEAD"], None),
-        # commits on no remote: a deleted clone is their ONLY copy
+        # commits on no remote: a deleted clone is their ONLY copy.
+        # HEAD is included explicitly so detached-HEAD commits count too.
         ("unpushed.txt",
-         ["log", "--branches", "--not", "--remotes", "--format=%H %s"],
+         ["log", "HEAD", "--branches", "--not", "--remotes",
+          "--format=%H %s"],
          "any-output"),
         ("stash.txt", ["stash", "list"], "any-output"),
+        # stash diffs live only in .git (excluded from content archives) —
+        # capture every entry's patch in the snapshot itself
+        ("stash.patch", ["stash", "list", "-p"], None),
     ):
         returncode, stdout, stderr = _run_git(workdir, git_args)
         payload = stdout if returncode == 0 else b"<git error> " + stderr

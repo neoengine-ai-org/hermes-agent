@@ -293,6 +293,69 @@ def test_unpushed_commit_counts_as_dirty_and_content_archived(
     assert any(n.endswith("unpushed.txt") for n in names)
 
 
+def test_detached_head_commit_counts_as_dirty_and_content_archived(
+    tmp_path, monkeypatch
+):
+    import subprocess as sp
+
+    root = tmp_path / "hermes"
+    wd = _make_workdir(root, "lane-detached", OLD)
+    git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
+    sp.run(["git", "init", "-q", str(wd)], check=True)
+    (wd / "base.txt").write_text("base")
+    sp.run([*git, "add", "-A"], check=True)
+    sp.run([*git, "commit", "-qm", "base"], check=True)
+    sp.run([*git, "checkout", "-q", "--detach"], check=True)
+    (wd / "detached-work.py").write_text("committed on detached HEAD")
+    sp.run([*git, "add", "-A"], check=True)
+    sp.run([*git, "commit", "-qm", "detached work"], check=True)
+    for p in [wd, *wd.rglob("*")]:
+        os.utime(p, (OLD, OLD))
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: False,
+    )
+    cfg = _cfg(root, execute=True)
+    lane_lane_workdirs(cfg, root)
+    assert not wd.exists()
+    archive = next(
+        cfg.archive_dir.glob("lane-workdir-lane-detached-*.tar.gz")
+    )
+    with tarfile.open(archive) as tar:
+        member = next(
+            n for n in tar.getnames() if n.endswith("detached-work.py")
+        )
+        payload = tar.extractfile(member).read().decode()
+    assert payload == "committed on detached HEAD"
+
+
+def test_pushed_clean_clone_collected_first_pass(tmp_path, monkeypatch):
+    """The tool's own git snapshot must not freshen .git/index and trip
+    the revival re-check (secondary-review F2 reproduction)."""
+    import subprocess as sp
+
+    root = tmp_path / "hermes"
+    remote = tmp_path / "remote.git"
+    sp.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    wd = _make_workdir(root, "lane-pushed", OLD)
+    git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
+    sp.run(["git", "init", "-q", str(wd)], check=True)
+    sp.run([*git, "remote", "add", "origin", str(remote)], check=True)
+    (wd / "done.txt").write_text("pushed work")
+    sp.run([*git, "add", "-A"], check=True)
+    sp.run([*git, "commit", "-qm", "done"], check=True)
+    sp.run([*git, "push", "-q", "-u", "origin", "HEAD"], check=True)
+    for p in [wd, *wd.rglob("*")]:
+        os.utime(p, (OLD, OLD))
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: False,
+    )
+    report = lane_lane_workdirs(_cfg(root, execute=True), root)
+    assert not wd.exists()  # collected on the FIRST pass
+    assert not any("revived" in n for n in report.notes)
+
+
 def test_state_db_ref_discovery_failure_blocks_deletion(
     tmp_path, monkeypatch
 ):

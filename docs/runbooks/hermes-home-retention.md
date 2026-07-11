@@ -207,6 +207,6 @@ without cleanup is therefore still collected — fail-safe, not fail-open.
 2. Weekly (timer or manual): `--execute` in archive mode. Exit code 2
    means a lane hit errors — the wrapper writes an `execute_failed`
    handoff; read the run receipt.
-4. First-run expectation on 2026-07 data: lane-workdirs −2.1 GiB, dispatch
+3. First-run expectation on 2026-07 data: lane-workdirs −2.1 GiB, dispatch
    logs −2.2 GiB, cron/output −1.0 GiB and ~190k inodes, state.db −2.5 to
    −3 GiB after VACUUM.
