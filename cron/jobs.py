@@ -1058,16 +1058,50 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
+def _output_keep_last() -> int:
+    """Per-job cap on retained run outputs. 0 disables rotation."""
+    raw = os.environ.get("HERMES_CRON_OUTPUT_KEEP", "").strip()
+    if not raw:
+        return 200
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 200
+
+
+def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
+    """Drop the oldest run outputs beyond ``keep``. Best-effort: rotation
+    must never break output writing."""
+    if keep <= 0:
+        return
+    try:
+        outputs = sorted(
+            (
+                p
+                for p in job_output_dir.iterdir()
+                if p.suffix == ".md" and p.is_file() and not p.is_symlink()
+            ),
+            key=lambda p: p.name,
+        )
+        for stale in outputs[: max(0, len(outputs) - keep)]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def save_job_output(job_id: str, output: str):
     """Save job output to file."""
     ensure_dirs()
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
+
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1082,7 +1116,8 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
+
+    _rotate_job_output(job_output_dir, _output_keep_last())
     return output_file
 
 
