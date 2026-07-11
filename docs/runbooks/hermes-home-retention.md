@@ -129,6 +129,30 @@ without cleanup is therefore still collected — fail-safe, not fail-open.
   disables.
 - Symlinks never followed or collected; targets resolving outside root are
   dropped; receipt-class files are archived before any deletion path.
+- Archive integrity gates deletion: archives are written tmp→fsync→rename
+  with a readback verification, and ONLY files proven present in the
+  verified archive are unlinked. Slug/collision-safe naming (dots kept,
+  `-N` suffix on collision). A failed or partial archive means the sources
+  are kept, with a report note.
+- Deletion re-checks at the last instant: a file replaced with fresh
+  content or a symlink since the scan is skipped; a lane workdir whose
+  mtime or registry state changed since eligibility is kept ("revived").
+- Fail-safe liveness: an unreadable registry, or an unavailable `ps`
+  sweep, means "assume alive". Dirty lane workdirs (uncommitted OR
+  untracked work) are archived as full working-tree content (minus
+  `.git`), because diffs cannot reproduce untracked files.
+- state.db deletions revalidate inside the delete transaction: a session
+  that gained an in-window message after selection is kept. Exports must
+  succeed durably (fsync + rename) before any row is deleted.
+  `PRAGMA foreign_keys=ON` so ON DELETE CASCADE references (telegram
+  bindings) follow. Residual accepted risk: VACUUM briefly holds an
+  exclusive lock against the live gateway; it fails soft on SQLITE_BUSY
+  and the checkpoint-busy result is surfaced as a report note.
+- The kill switches also stop write-time cron rotation
+  (`HERMES_HOME_RETENTION_DISABLED` / `..._CRON_OUTPUT_DISABLED`), so one
+  env var halts all retention deletion in an incident. Rotation refuses
+  job dirs that resolve outside `cron/output` (hand-edited traversal job
+  ids) and sorts by mtime, not filename.
 - Every execute run writes a run receipt to
   `~/.hermes/state/hermes-home-retention/runs/<runstamp>.json` summarizing
   per-lane plan/actions/bytes — the job's own actions are themselves

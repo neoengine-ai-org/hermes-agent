@@ -209,7 +209,45 @@ def _slug_for(root: Path, target: Path) -> str:
         rel = target.resolve().relative_to(root.resolve())
     except ValueError:
         rel = Path(target.name)
-    return str(rel).replace(os.sep, "-").replace(".", "")
+    # keep dots: stripping them collides "a.b/logs" with "ab/logs"
+    return str(rel).replace(os.sep, "-").lstrip(".")
+
+
+def _unique_archive_base(cfg: RetentionConfig, slug: str) -> str:
+    """Collision-safe archive basename within the archive dir (protects
+    against slug collisions and same-second concurrent runs)."""
+    base = f"{slug}-{cfg.runstamp}"
+    candidate = base
+    counter = 2
+    while (
+        (cfg.archive_dir / f"{candidate}.tar.gz").exists()
+        or (cfg.archive_dir / f"{candidate}.jsonl.gz").exists()
+        or (cfg.archive_dir / f"{candidate}.receipt.json").exists()
+    ):
+        candidate = f"{base}-{counter}"
+        counter += 1
+    return candidate
+
+
+def _fsync_dir(directory: Path) -> None:
+    try:
+        fd = os.open(str(directory), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_receipt(cfg: RetentionConfig, receipt_path: Path, receipt: Dict[str, Any]) -> None:
+    tmp = receipt_path.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(receipt, indent=2, sort_keys=True))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, receipt_path)
+    _fsync_dir(receipt_path.parent)
 
 
 def _write_archive(
@@ -218,37 +256,67 @@ def _write_archive(
     klass: str,
     files: List[Path],
     extra_members: Optional[List[Tuple[str, bytes]]] = None,
-) -> Optional[Path]:
-    """Create ``<slug>-<runstamp>.tar.gz`` + sibling receipt. Returns the
-    archive path, or None when there is nothing to archive."""
+) -> Tuple[Optional[Path], List[Path]]:
+    """Create ``<slug>-<runstamp>.tar.gz`` + sibling receipt, durably
+    (tmp-write, fsync, rename, dir fsync, readback verify).
+
+    Returns ``(archive_path, verified_files)`` where ``verified_files`` are
+    the files proven present in the readback — the ONLY files a caller may
+    delete. Returns ``(None, [])`` when there is nothing to archive or the
+    archive could not be verified.
+    """
     if not files and not extra_members:
-        return None
+        return None, []
     cfg.archive_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = cfg.archive_dir / f"{slug}-{cfg.runstamp}.tar.gz"
-    receipt_path = cfg.archive_dir / f"{slug}-{cfg.runstamp}.receipt.json"
-    mtimes = [_file_mtime(p) for p in files] or [time.time()]
-    byte_count = sum(_file_size(p) for p in files)
+    base = _unique_archive_base(cfg, slug)
+    archive_path = cfg.archive_dir / f"{base}.tar.gz"
+    receipt_path = cfg.archive_dir / f"{base}.receipt.json"
     root_resolved = cfg.root.resolve()
-    with tarfile.open(archive_path, "w:gz") as tar:
-        for path in files:
-            try:
-                arcname = str(path.resolve().relative_to(root_resolved))
-            except ValueError:
-                arcname = path.name
-            try:
-                tar.add(path, arcname=arcname, recursive=False)
-            except OSError:
-                continue
-        for member_name, payload in extra_members or []:
-            info = tarfile.TarInfo(name=member_name)
-            info.size = len(payload)
-            info.mtime = int(time.time())
-            tar.addfile(info, io.BytesIO(payload))
+    added: List[Tuple[str, Path]] = []
+    tmp_archive = cfg.archive_dir / f"{base}.tar.gz.tmp"
+    try:
+        with open(tmp_archive, "wb") as fh:
+            with tarfile.open(fileobj=fh, mode="w:gz") as tar:
+                for path in files:
+                    try:
+                        arcname = str(
+                            path.resolve().relative_to(root_resolved)
+                        )
+                    except ValueError:
+                        arcname = path.name
+                    try:
+                        tar.add(path, arcname=arcname, recursive=False)
+                        added.append((arcname, path))
+                    except OSError:
+                        continue
+                for member_name, payload in extra_members or []:
+                    info = tarfile.TarInfo(name=member_name)
+                    info.size = len(payload)
+                    info.mtime = int(time.time())
+                    tar.addfile(info, io.BytesIO(payload))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_archive, archive_path)
+        _fsync_dir(cfg.archive_dir)
+    except OSError:
+        try:
+            tmp_archive.unlink()
+        except OSError:
+            pass
+        return None, []
+    # readback: only files verifiably inside the archive may be deleted
+    try:
+        with tarfile.open(archive_path) as tar:
+            present = set(tar.getnames())
+    except (OSError, tarfile.TarError):
+        return None, []
+    verified = [path for arcname, path in added if arcname in present]
+    mtimes = [_file_mtime(p) for p in verified] or [time.time()]
     receipt = {
         "created_utc": _utcnow_iso(),
         "target": slug,
-        "file_count": len(files),
-        "byte_count": byte_count,
+        "file_count": len(verified),
+        "byte_count": sum(_file_size(p) for p in verified),
         "oldest_mtime": min(mtimes),
         "newest_mtime": max(mtimes),
         "mode": "archive",
@@ -257,10 +325,35 @@ def _write_archive(
         "tool": TOOL_NAME,
         "tool_version": TOOL_VERSION,
     }
-    tmp = receipt_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True))
-    os.replace(tmp, receipt_path)
-    return archive_path
+    try:
+        _write_receipt(cfg, receipt_path, receipt)
+    except OSError:
+        return None, []
+    return archive_path, verified
+
+
+def _safe_unlink(cfg: RetentionConfig, report: LaneReport, path: Path) -> bool:
+    """Unlink with a last-instant re-check: if the path was replaced with a
+    symlink or fresh content since the scan, leave it alone."""
+    try:
+        stat = path.lstat()
+    except OSError:
+        return False
+    if not os.path.isfile(path) or path.is_symlink():
+        report.notes.append(f"skipped {path.name}: replaced since scan")
+        return False
+    if stat.st_mtime >= cfg.age_cutoff:
+        report.notes.append(f"skipped {path.name}: fresh content since scan")
+        return False
+    size = stat.st_size
+    try:
+        path.unlink()
+    except OSError as exc:
+        report.errors.append(f"unlink {path}: {exc}")
+        return False
+    report.acted_files += 1
+    report.acted_bytes += size
+    return True
 
 
 def _prune_files(
@@ -270,8 +363,8 @@ def _prune_files(
     candidates: List[Path],
     archive_class: Optional[str],
 ) -> None:
-    """Account candidates; on execute archive (unless class is None/cache)
-    then unlink."""
+    """Account candidates; on execute archive (unless cache class) then
+    unlink ONLY the files verified inside the archive."""
     by_class: Dict[str, List[Path]] = {}
     for path in candidates:
         klass = archive_class if archive_class else _classify(path)
@@ -281,19 +374,22 @@ def _prune_files(
     if not cfg.execute:
         return
     for klass, files in sorted(by_class.items()):
-        if klass != CLASS_CACHE:
-            archive = _write_archive(cfg, f"{slug}-{klass}", klass, files)
+        if klass == CLASS_CACHE:
+            deletable = files  # re-derivable, no archive required
+        else:
+            archive, deletable = _write_archive(
+                cfg, f"{slug}-{klass}", klass, files
+            )
             if archive is not None:
                 report.archives.append(archive.name)
-        for path in files:
-            size = _file_size(path)
-            try:
-                path.unlink()
-            except OSError as exc:
-                report.errors.append(f"unlink {path}: {exc}")
-                continue
-            report.acted_files += 1
-            report.acted_bytes += size
+            unverified = len(files) - len(deletable)
+            if unverified:
+                report.notes.append(
+                    f"{slug}-{klass}: {unverified} file(s) kept — not "
+                    "verified in archive"
+                )
+        for path in deletable:
+            _safe_unlink(cfg, report, path)
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +428,7 @@ def _registry_says_alive(registry_path: Path, lane_id: str) -> bool:
     try:
         raw = registry_path.read_text(encoding="utf-8")
     except OSError:
-        return False
+        return True  # registry exists but is unreadable => assume alive
     if lane_id not in raw:
         return False
     try:
@@ -360,9 +456,13 @@ def _registry_says_alive(registry_path: Path, lane_id: str) -> bool:
     return any(alive_flags)
 
 
-def _process_sweep_mentions(needles: List[str]) -> bool:
+def _process_sweep_mentions(needles: List[str]) -> Optional[bool]:
     """Best-effort scan of live process command lines + env (own processes)
-    for any needle, mirroring the HERMES_LANE_MARKER descendant sweep."""
+    for any needle, mirroring the HERMES_LANE_MARKER descendant sweep.
+
+    Returns True/False on a successful sweep, None when the sweep itself is
+    unavailable — callers must treat None as potentially-live (fail-safe).
+    """
     for args in (["ps", "-axwwE", "-o", "pid=,command="],
                  ["ps", "-axww", "-o", "pid=,command="]):
         try:
@@ -375,13 +475,20 @@ def _process_sweep_mentions(needles: List[str]) -> bool:
             continue
         haystack = proc.stdout
         return any(needle in haystack for needle in needles)
-    return False  # sweep unavailable; grace + registry remain the gate
+    return None  # sweep unavailable => caller must fail safe
 
 
-def _git_snapshot(workdir: Path) -> List[Tuple[str, bytes]]:
-    """Capture status/diff/HEAD of a workdir clone before removal."""
+def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
+    """Capture status/diff/HEAD of a workdir clone before removal.
+
+    Returns ``(members, is_dirty)`` — dirty means uncommitted tracked
+    changes OR untracked files, in which case the caller must archive the
+    full working tree, not just receipts (diffs do not carry untracked or
+    ignored file contents).
+    """
     members: List[Tuple[str, bytes]] = []
     base = f"lane-workdir-snapshots/{workdir.name}"
+    dirty = False
     for name, git_args in (
         ("status.txt", ["status", "--porcelain=v1", "--branch"]),
         ("diff.patch", ["diff"]),
@@ -397,10 +504,42 @@ def _git_snapshot(workdir: Path) -> List[Tuple[str, bytes]]:
             payload = proc.stdout if proc.returncode == 0 else (
                 b"<git error> " + proc.stderr
             )
+            if name == "status.txt" and proc.returncode == 0:
+                dirty = any(
+                    line and not line.startswith("##")
+                    for line in proc.stdout.decode(
+                        "utf-8", "replace"
+                    ).splitlines()
+                )
+            elif name == "status.txt":
+                dirty = True  # cannot prove clean => treat as dirty
         except (OSError, subprocess.TimeoutExpired) as exc:
             payload = f"<unavailable: {exc}>".encode()
+            if name == "status.txt":
+                dirty = True
         members.append((f"{base}/{name}", payload))
-    return members
+    return members, dirty
+
+
+def _workdir_content_files(workdir: Path, max_file_bytes: int = 64 * 1024 * 1024) -> Tuple[List[Path], List[str]]:
+    """All regular files in a workdir excluding .git, for full-content
+    archiving of dirty workdirs. Oversized files are reported, not silently
+    dropped."""
+    files: List[Path] = []
+    skipped: List[str] = []
+    for path in sorted(workdir.rglob("*")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+        except OSError:
+            continue
+        if ".git" in path.relative_to(workdir).parts:
+            continue
+        if _file_size(path) > max_file_bytes:
+            skipped.append(str(path.relative_to(workdir)))
+            continue
+        files.append(path)
+    return files, skipped
 
 
 def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
@@ -429,7 +568,13 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
             if registry.exists() and _registry_says_alive(registry, lane_id):
                 report.notes.append(f"{lane_id}: registry says alive")
                 continue
-            if _process_sweep_mentions([lane_id, str(workdir)]):
+            sweep = _process_sweep_mentions([lane_id, str(workdir)])
+            if sweep is None:
+                report.notes.append(
+                    f"{lane_id}: process sweep unavailable — kept (fail-safe)"
+                )
+                continue
+            if sweep:
                 report.notes.append(f"{lane_id}: live process references lane")
                 continue
             dir_bytes = sum(
@@ -441,21 +586,48 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
             report.candidate_bytes += dir_bytes
             if not cfg.execute:
                 continue
-            receipts = [
-                p
-                for p in _iter_regular_files(workdir)
-                if p.suffix.lower() in {".json", ".md"}
-            ]
-            extra = _git_snapshot(workdir)
-            archive = _write_archive(
+            snapshot, dirty = _git_snapshot(workdir)
+            if dirty:
+                # diffs do not carry untracked/ignored contents — archive
+                # the full working tree (minus .git) before removal
+                to_archive, oversized = _workdir_content_files(workdir)
+                for rel in oversized:
+                    report.notes.append(
+                        f"{lane_id}: oversized file kept out of archive: {rel}"
+                    )
+            else:
+                to_archive = [
+                    p
+                    for p in _iter_regular_files(workdir)
+                    if p.suffix.lower() in {".json", ".md"}
+                ]
+                oversized = []
+            archive, verified = _write_archive(
                 cfg,
                 f"lane-workdir-{lane_id}",
                 CLASS_RECEIPT,
-                receipts,
-                extra_members=extra,
+                to_archive,
+                extra_members=snapshot,
             )
-            if archive is not None:
-                report.archives.append(archive.name)
+            if archive is None:
+                report.notes.append(
+                    f"{lane_id}: kept — archive could not be written/verified"
+                )
+                continue
+            report.archives.append(archive.name)
+            if len(verified) < len(to_archive) or oversized:
+                report.notes.append(
+                    f"{lane_id}: kept — archive incomplete "
+                    f"({len(verified)}/{len(to_archive)} verified, "
+                    f"{len(oversized)} oversized)"
+                )
+                continue
+            # last-instant re-check: lane may have revived since eligibility
+            if _file_mtime(workdir) > grace_cutoff or (
+                registry.exists() and _registry_says_alive(registry, lane_id)
+            ):
+                report.notes.append(f"{lane_id}: revived before removal — kept")
+                continue
             try:
                 shutil.rmtree(workdir)
             except OSError as exc:
@@ -522,30 +694,43 @@ def _db_tables(conn: sqlite3.Connection) -> set:
 def _export_rows_gzip_jsonl(
     cfg: RetentionConfig, slug: str, klass: str, rows: List[Dict[str, Any]]
 ) -> Optional[Path]:
+    """Durable gzipped-JSONL export (tmp-write, fsync, rename, dir fsync).
+    Returns None on failure — callers must NOT delete the source rows then."""
     if not rows:
         return None
     cfg.archive_dir.mkdir(parents=True, exist_ok=True)
-    path = cfg.archive_dir / f"{slug}-{cfg.runstamp}.jsonl.gz"
-    with gzip.open(path, "wt", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, default=str) + "\n")
-    receipt_path = cfg.archive_dir / f"{slug}-{cfg.runstamp}.receipt.json"
-    receipt = {
-        "created_utc": _utcnow_iso(),
-        "target": slug,
-        "file_count": len(rows),
-        "byte_count": path.stat().st_size,
-        "oldest_mtime": None,
-        "newest_mtime": None,
-        "mode": "archive",
-        "archive": path.name,
-        "class": klass,
-        "tool": TOOL_NAME,
-        "tool_version": TOOL_VERSION,
-    }
-    tmp = receipt_path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True))
-    os.replace(tmp, receipt_path)
+    base = _unique_archive_base(cfg, slug)
+    path = cfg.archive_dir / f"{base}.jsonl.gz"
+    tmp = cfg.archive_dir / f"{base}.jsonl.gz.tmp"
+    try:
+        with open(tmp, "wb") as raw:
+            with gzip.open(raw, "wt", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, default=str) + "\n")
+            raw.flush()
+            os.fsync(raw.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(cfg.archive_dir)
+        receipt = {
+            "created_utc": _utcnow_iso(),
+            "target": slug,
+            "file_count": len(rows),
+            "byte_count": path.stat().st_size,
+            "oldest_mtime": None,
+            "newest_mtime": None,
+            "mode": "archive",
+            "archive": path.name,
+            "class": klass,
+            "tool": TOOL_NAME,
+            "tool_version": TOOL_VERSION,
+        }
+        _write_receipt(cfg, cfg.archive_dir / f"{base}.receipt.json", receipt)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        return None
     return path
 
 
@@ -593,6 +778,10 @@ def _retain_one_db(
         return
     try:
         conn.execute("PRAGMA busy_timeout=10000")
+        if cfg.execute:
+            # the runtime schema declares ON DELETE CASCADE references to
+            # sessions (e.g. telegram bindings) — honor them
+            conn.execute("PRAGMA foreign_keys=ON")
         tables = _db_tables(conn)
         if not {"sessions", "messages"} <= tables:
             report.notes.append(f"{slug}: no sessions/messages tables")
@@ -636,11 +825,10 @@ def _retain_one_db(
             )
         for row in session_rows:
             row.pop("system_prompt", None)  # bulk prompt text, not accounting
-        _export_rows_gzip_jsonl(
+        summary = _export_rows_gzip_jsonl(
             cfg, f"{slug}-sessions-summary", CLASS_RECEIPT, session_rows
         )
 
-        exported = 0
         message_rows: List[Dict[str, Any]] = []
         for start in range(0, len(session_ids), DB_DELETE_BATCH):
             batch = session_ids[start : start + DB_DELETE_BATCH]
@@ -653,45 +841,84 @@ def _retain_one_db(
             message_rows.extend(
                 dict(zip(columns, row)) for row in cursor.fetchall()
             )
-            exported += len(message_rows)
+        had_messages = bool(message_rows)
         archive = _export_rows_gzip_jsonl(
             cfg, f"{slug}-messages", CLASS_BULK, message_rows
         )
         if archive is not None:
             report.archives.append(archive.name)
+        if (had_messages and archive is None) or (
+            session_rows and summary is None
+        ):
+            report.errors.append(
+                f"{slug}: export failed — rows NOT deleted"
+            )
+            return
         del message_rows
 
         deleted_messages = 0
+        revived_sessions = 0
         for start in range(0, len(session_ids), DB_DELETE_BATCH):
             batch = session_ids[start : start + DB_DELETE_BATCH]
             placeholders = ",".join("?" for _ in batch)
             with conn:
+                # revalidate inside the delete transaction: a session that
+                # gained a message inside the window since selection/export
+                # is live again and must not be deleted
+                revived = {
+                    r[0]
+                    for r in conn.execute(
+                        f"""
+                        SELECT DISTINCT session_id FROM messages
+                        WHERE session_id IN ({placeholders})
+                          AND timestamp >= ?
+                        """,
+                        [*batch, cutoff],
+                    ).fetchall()
+                }
+                keep = [i for i in batch if i not in revived]
+                revived_sessions += len(revived)
+                if not keep:
+                    continue
+                keep_ph = ",".join("?" for _ in keep)
                 cur = conn.execute(
-                    f"DELETE FROM messages WHERE session_id IN ({placeholders})",
-                    batch,
+                    f"DELETE FROM messages WHERE session_id IN ({keep_ph})",
+                    keep,
                 )
                 deleted_messages += cur.rowcount
                 conn.execute(
                     f"""
                     UPDATE sessions SET parent_session_id = NULL
-                    WHERE parent_session_id IN ({placeholders})
+                    WHERE parent_session_id IN ({keep_ph})
                     """,
-                    batch,
+                    keep,
                 )
                 conn.execute(
-                    f"DELETE FROM sessions WHERE id IN ({placeholders})", batch
+                    f"DELETE FROM sessions WHERE id IN ({keep_ph})", keep
                 )
+        if revived_sessions:
+            report.notes.append(
+                f"{slug}: {revived_sessions} session(s) revived since "
+                "selection — kept"
+            )
         if "compression_locks" in tables:
             with conn:
                 conn.execute(
                     "DELETE FROM compression_locks WHERE expires_at < ?",
                     (time.time(),),
                 )
-        report.acted_files += deleted_messages + len(session_ids)
+        report.acted_files += deleted_messages + (
+            len(session_ids) - revived_sessions
+        )
         report.acted_bytes += int(msg_bytes)
 
         try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            ckpt = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if ckpt and ckpt[0] == 1:
+                report.notes.append(
+                    f"{slug}: wal_checkpoint busy (writer active) — "
+                    "WAL truncation deferred"
+                )
         except sqlite3.Error as exc:
             report.notes.append(f"{slug}: wal_checkpoint skipped: {exc}")
         freelist = conn.execute("PRAGMA freelist_count").fetchone()[0]
@@ -809,34 +1036,51 @@ def lane_profiles(cfg: RetentionConfig) -> List[LaneReport]:
         return [LaneReport(lane="profiles", enabled=False)]
     reports: List[LaneReport] = []
     profiles_dir = cfg.root / "profiles"
-    if not profiles_dir.is_dir():
+    if profiles_dir.is_symlink() or not profiles_dir.is_dir():
+        return reports
+    if not _is_within(cfg.root, profiles_dir):
         return reports
     for profile in sorted(profiles_dir.iterdir()):
         if profile.is_symlink() or not profile.is_dir():
+            continue
+        if not _is_within(cfg.root, profile):
             continue
         sub = lane_cron_output(
             cfg, profile, lane_name=f"cron-output[{profile.name}]"
         )
         reports.append(sub)
+        # per-lane kill switches gate profile recursion too
         db_report = LaneReport(lane=f"state-db[{profile.name}]")
-        try:
-            _retain_one_db(cfg, db_report, profile / "state.db")
-        except Exception as exc:
-            db_report.errors.append(f"{profile / 'state.db'}: {exc}")
+        if _lane_disabled("STATE_DB"):
+            db_report.enabled = False
+        else:
+            try:
+                _retain_one_db(cfg, db_report, profile / "state.db")
+            except Exception as exc:
+                db_report.errors.append(f"{profile / 'state.db'}: {exc}")
         reports.append(db_report)
         logs_report = LaneReport(lane=f"logs[{profile.name}]")
-        logs_dir = profile / "logs"
-        if logs_dir.is_dir() and not logs_dir.is_symlink():
-            files = list(_iter_regular_files(logs_dir))
-            candidates = _split_keep_min(files, cfg.keep_min, cfg.age_cutoff)
-            if candidates:
-                _prune_files(
-                    cfg,
-                    logs_report,
-                    _slug_for(cfg.root, logs_dir),
-                    candidates,
-                    CLASS_BULK,
+        if _lane_disabled("DISPATCH_LOGS"):
+            logs_report.enabled = False
+        else:
+            logs_dir = profile / "logs"
+            if (
+                logs_dir.is_dir()
+                and not logs_dir.is_symlink()
+                and _is_within(cfg.root, logs_dir)
+            ):
+                files = list(_iter_regular_files(logs_dir))
+                candidates = _split_keep_min(
+                    files, cfg.keep_min, cfg.age_cutoff
                 )
+                if candidates:
+                    _prune_files(
+                        cfg,
+                        logs_report,
+                        _slug_for(cfg.root, logs_dir),
+                        candidates,
+                        CLASS_BULK,
+                    )
         reports.append(logs_report)
     return reports
 

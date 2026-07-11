@@ -13,6 +13,10 @@ from neoengine_local.hermes_home_retention import (
     CLASS_BULK,
     CLASS_RECEIPT,
     RetentionConfig,
+    _registry_says_alive,
+    _slug_for,
+    _unique_archive_base,
+    _write_archive,
     lane_archive_gc,
     lane_cron_output,
     lane_dispatch_logs,
@@ -196,6 +200,71 @@ def test_lane_workdir_live_process_survives(tmp_path, monkeypatch):
     assert wd.exists()
 
 
+def test_lane_workdir_sweep_unavailable_is_fail_safe(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    wd = _make_workdir(root, "lane-nosweep", OLD)
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: None,
+    )
+    report = lane_lane_workdirs(_cfg(root, execute=True), root)
+    assert wd.exists()
+    assert any("fail-safe" in n for n in report.notes)
+
+
+def test_registry_unreadable_means_alive(tmp_path, monkeypatch):
+    registry = tmp_path / "agent-work-registry.json"
+    registry.write_text("{}")
+
+    def boom(self, *args, **kwargs):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(type(registry), "read_text", boom)
+    assert _registry_says_alive(registry, "any-lane") is True
+
+
+def test_dirty_workdir_full_content_archived(tmp_path, monkeypatch):
+    import subprocess as sp
+
+    root = tmp_path / "hermes"
+    wd = _make_workdir(root, "lane-dirty", OLD)
+    # make it a real git repo with an UNTRACKED file (diff won't carry it)
+    sp.run(["git", "init", "-q", str(wd)], check=True)
+    untracked = wd / "untracked-result.txt"
+    untracked.write_text("the only copy of generated work")
+    os.utime(wd, (OLD, OLD))
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: False,
+    )
+    cfg = _cfg(root, execute=True)
+    report = lane_lane_workdirs(cfg, root)
+    assert not wd.exists()
+    assert report.acted_files == 1
+    archive = next(cfg.archive_dir.glob("lane-workdir-lane-dirty-*.tar.gz"))
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        member = next(n for n in names if n.endswith("untracked-result.txt"))
+        payload = tar.extractfile(member).read().decode()
+    assert payload == "the only copy of generated work"
+
+
+def test_workdir_kept_when_archive_fails(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    wd = _make_workdir(root, "lane-noarch", OLD)
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: False,
+    )
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._write_archive",
+        lambda *a, **k: (None, []),
+    )
+    report = lane_lane_workdirs(_cfg(root, execute=True), root)
+    assert wd.exists()
+    assert any("could not be written" in n for n in report.notes)
+
+
 # ---------------------------------------------------------------------------
 # cron-output
 # ---------------------------------------------------------------------------
@@ -347,6 +416,60 @@ def test_state_db_prunes_ended_and_stale_open_sessions(tmp_path):
     assert "old payload" in exported and "orphaned" in exported
 
 
+def test_state_db_revived_session_not_deleted(tmp_path):
+    root = tmp_path / "hermes"
+    db = _make_db(root)
+    # "old-ended" gains a message INSIDE the window (simulates a revival
+    # between selection/export and delete — revalidation must keep it)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "INSERT INTO messages (session_id, content, timestamp, role)"
+        " VALUES ('old-ended', 'revived activity', ?, 'assistant')",
+        (time.time() - 60,),
+    )
+    conn.commit()
+    conn.close()
+    report = lane_state_db(_cfg(root, execute=True), root)
+    conn = sqlite3.connect(db)
+    remaining = {
+        r[0] for r in conn.execute("SELECT id FROM sessions").fetchall()
+    }
+    assert "old-ended" in remaining  # kept, not deleted
+    assert "stale-open" not in remaining  # still pruned
+    assert conn.execute(
+        "SELECT COUNT(*) FROM messages WHERE session_id='old-ended'"
+    ).fetchone()[0] == 3
+    conn.close()
+    assert any("revived" in n for n in report.notes)
+
+
+def test_state_db_export_failure_blocks_deletion(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    db = _make_db(root)
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._export_rows_gzip_jsonl",
+        lambda *a, **k: None,
+    )
+    report = lane_state_db(_cfg(root, execute=True), root)
+    assert any("export failed" in e for e in report.errors)
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 5
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 5
+    conn.close()
+
+
+def test_profile_state_db_respects_kill_switch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME_RETENTION_STATE_DB_DISABLED", "1")
+    root = tmp_path / "hermes"
+    root.mkdir(parents=True)
+    db = _make_db(root / "profiles" / "p1")
+    reports = {r.lane: r for r in run_retention(_cfg(root, execute=True))}
+    assert reports["state-db[p1]"].enabled is False
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 5
+    conn.close()
+
+
 def test_state_db_missing_tables_is_note_not_error(tmp_path):
     root = tmp_path / "hermes"
     root.mkdir(parents=True)
@@ -410,6 +533,46 @@ def test_archive_gc_prunes_bulk_keeps_receipts(tmp_path):
     assert keep_a.exists() and keep_r.exists()
     assert recent_a.exists() and recent_r.exists()
     assert report.acted_files == 1
+
+
+# ---------------------------------------------------------------------------
+# archive integrity primitives
+# ---------------------------------------------------------------------------
+
+def test_slug_keeps_dots_no_collision(tmp_path):
+    root = tmp_path / "hermes"
+    (root / "a.b").mkdir(parents=True)
+    (root / "ab").mkdir(parents=True)
+    assert _slug_for(root, root / "a.b") != _slug_for(root, root / "ab")
+
+
+def test_unique_archive_base_avoids_same_run_collision(tmp_path):
+    cfg = _cfg(tmp_path / "hermes")
+    cfg.archive_dir.mkdir(parents=True)
+    first = _unique_archive_base(cfg, "logs")
+    (cfg.archive_dir / f"{first}.tar.gz").write_bytes(b"x")
+    second = _unique_archive_base(cfg, "logs")
+    assert first != second
+
+
+def test_write_archive_failed_member_not_deletable(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    good = _touch(root / "logs" / "good.log", OLD)
+    bad = _touch(root / "logs" / "bad.log", OLD)
+    cfg = _cfg(root, execute=True)
+
+    real_add = tarfile.TarFile.add
+
+    def flaky_add(self, name, *args, **kwargs):
+        if str(name).endswith("bad.log"):
+            raise OSError("read error")
+        return real_add(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(tarfile.TarFile, "add", flaky_add)
+    archive, verified = _write_archive(cfg, "logs", CLASS_BULK, [good, bad])
+    assert archive is not None
+    assert good in verified
+    assert bad not in verified  # must NOT be deleted by callers
 
 
 # ---------------------------------------------------------------------------

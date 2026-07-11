@@ -52,6 +52,47 @@ def test_rotation_default_and_garbage_env(monkeypatch):
     assert jobs._output_keep_last() == 0
 
 
+def test_rotation_never_escapes_output_dir(tmp_output, monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "1")
+    outside = tmp_output.parent.parent / "outside"
+    outside.mkdir(parents=True)
+    for i in range(5):
+        (outside / f"doc-{i}.md").write_text("must survive")
+    # a hand-edited traversal job id must not rotate outside OUTPUT_DIR
+    jobs.save_job_output("../../outside", "attack")
+    assert len(list(outside.glob("*.md"))) == 6  # 5 docs + the new output
+
+
+def test_rotation_respects_retention_kill_switch(tmp_output, monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "1")
+    monkeypatch.setenv("HERMES_HOME_RETENTION_DISABLED", "1")
+    job_dir = tmp_output / "job4"
+    job_dir.mkdir(parents=True)
+    for i in range(5):
+        (job_dir / f"2026-01-0{i + 1}_00-00-00.md").write_text(f"run {i}")
+    jobs.save_job_output("job4", "newest run")
+    assert len(_run_outputs("job4")) == 6  # kill switch halts rotation
+
+
+def test_rotation_sorts_by_mtime_not_name(tmp_output, monkeypatch):
+    import os as _os
+    import time as _time
+
+    monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "2")
+    job_dir = tmp_output / "job5"
+    job_dir.mkdir(parents=True)
+    legacy = job_dir / "zzz-legacy.md"  # sorts LAST by name but is OLDEST
+    legacy.write_text("old")
+    _os.utime(legacy, (_time.time() - 86400 * 30,) * 2)
+    fresh = job_dir / "2026-01-01_00-00-00.md"
+    fresh.write_text("fresh")
+    jobs.save_job_output("job5", "newest run")
+    outputs = _run_outputs("job5")
+    assert len(outputs) == 2
+    assert "zzz-legacy.md" not in outputs  # oldest by mtime dropped
+    assert "2026-01-01_00-00-00.md" in outputs
+
+
 def test_rotation_failure_never_breaks_write(tmp_output, monkeypatch):
     monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "1")
 

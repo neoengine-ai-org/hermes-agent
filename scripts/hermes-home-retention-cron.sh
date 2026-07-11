@@ -16,6 +16,10 @@
 #   HERMES_RETENTION_EXTRA_ARGS   appended to the python invocation
 set -u
 
+# launchd may start us without HOME; derive it rather than abort under set -u
+HOME="${HOME:-$(eval echo "~$(id -un)")}"
+export HOME
+
 MODE="${1:-check}"
 ROOT="${HERMES_RETENTION_ROOT:-$HOME/.hermes}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,19 +29,31 @@ STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 
 run_retention() {
     local flag="$1"
+    # EXTRA_ARGS come first so the pinned --root always wins (argparse
+    # last-occurrence semantics) — extra args cannot re-root the sweep
     # shellcheck disable=SC2086
     (cd "$MODULE_DIR" && python3 -m neoengine_local.hermes_home_retention \
-        --root "$ROOT" $flag ${HERMES_RETENTION_EXTRA_ARGS:-} 2>&1)
+        ${HERMES_RETENTION_EXTRA_ARGS:-} $flag --root "$ROOT" 2>&1)
 }
 
 write_handoff() {
     local status="$1" report="$2"
     mkdir -p "$HANDOFF_DIR" || return 0
+    # bound the payload: a huge report must not blow the execve env limit
+    # and silently lose the only alert (keep head + tail of the report)
+    local bounded
+    if [ "${#report}" -gt 80000 ]; then
+        bounded="$(printf '%s\n' "$report" | head -c 60000)
+[... report truncated for handoff; full output in the launchd log ...]
+$(printf '%s\n' "$report" | tail -c 20000)"
+    else
+        bounded="$report"
+    fi
     HANDOFF_TARGET="$HANDOFF_DIR/${STAMP}_home_retention_${status}.json" \
     HANDOFF_STATUS="$status" \
     HANDOFF_MODE="$MODE" \
     HANDOFF_STAMP="$STAMP" \
-    HANDOFF_REPORT="$report" \
+    HANDOFF_REPORT="$bounded" \
     python3 - <<'PYEOF'
 import json, os
 payload = {

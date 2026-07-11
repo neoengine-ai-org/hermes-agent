@@ -1058,8 +1058,22 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
+def _output_rotation_disabled() -> bool:
+    """The hermes-home-retention kill switches also stop write-time
+    rotation, so one env var halts ALL retention deletion in an incident."""
+    for name in (
+        "HERMES_HOME_RETENTION_DISABLED",
+        "HERMES_HOME_RETENTION_CRON_OUTPUT_DISABLED",
+    ):
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}:
+            return True
+    return False
+
+
 def _output_keep_last() -> int:
     """Per-job cap on retained run outputs. 0 disables rotation."""
+    if _output_rotation_disabled():
+        return 0
     raw = os.environ.get("HERMES_CRON_OUTPUT_KEEP", "").strip()
     if not raw:
         return 200
@@ -1071,17 +1085,26 @@ def _output_keep_last() -> int:
 
 def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
     """Drop the oldest run outputs beyond ``keep``. Best-effort: rotation
-    must never break output writing."""
+    must never break output writing, and must never delete outside
+    OUTPUT_DIR (job ids come from jobs.json, which can be hand-edited —
+    a traversal id like ``../..`` must not turn rotation into
+    arbitrary-directory deletion)."""
     if keep <= 0:
         return
     try:
+        resolved = job_output_dir.resolve()
+        output_root = OUTPUT_DIR.resolve()
+        if resolved != output_root and output_root not in resolved.parents:
+            return
+        if resolved == output_root:
+            return
         outputs = sorted(
             (
                 p
                 for p in job_output_dir.iterdir()
                 if p.suffix == ".md" and p.is_file() and not p.is_symlink()
             ),
-            key=lambda p: p.name,
+            key=lambda p: (p.stat().st_mtime, p.name),
         )
         for stale in outputs[: max(0, len(outputs) - keep)]:
             try:
