@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
-"""Print the PR-contribution diff fingerprint used for receipt mechanical freshness.
+"""Print the PR-contribution content fingerprint used for receipt mechanical freshness.
 
-The fingerprint is `sha256:<hex>` over the byte-exact output of a pinned
-three-dot git diff (the PR's contributed changes relative to the merge base):
+The fingerprint is `sha256:<hex>` over the **full content** (git blob object IDs,
+which are SHA-1 over the complete file bytes) of every path the PR contributes,
+at the current head. It is NOT a hash of `git diff` text.
 
-    git -c diff.renames=false -c core.quotePath=false \
-        diff --no-color --no-ext-diff --unified=3 <base-sha>...<head-sha>
+    paths   = git diff --name-status --no-renames <base-sha>...<head-sha>   # 3-dot
+    per path at head: <status>\\t<mode>\\t<full-blob-sha>\\t<path>
+    fingerprint = sha256(sorted lines)
+
+Why content, not diff text (opposite-frontier review, 2026-07-11):
+  1. Binary safety — a `git diff` of a binary/`-diff` path prints only an
+     abbreviated blob index ("Binary files differ"), so hashing diff text binds
+     unreviewed binary content to a ~7-hex prefix that can be ground to collide.
+     Blob object IDs are full 40-hex over the complete file bytes, so a binary
+     change cannot keep the same fingerprint without a full SHA-1 collision.
+  2. Same-file base drift — a three-dot diff excludes base-only edits to other
+     sections of a file the PR also touches (after update-branch those sections
+     are identical in base and head, so they never appear in the diff). Binding
+     to the file's head blob captures them: any change to a PR-touched file's
+     merged content — from the PR or from a base merge into that file — changes
+     its blob and forces a fresh review.
+
+A change to a file the PR does NOT touch does not move the fingerprint: that is
+outside this PR's reviewed contribution and is governed by its own review.
 
 Reviewers stamp this value into a receipt's `diff_fingerprint` field at review
 time; the PR risk classifier workflow computes the same value on the current
-head and passes it to review_receipt_validator.py as
---current-diff-fingerprint. A receipt whose head/base SHAs went stale purely
-because the head moved (e.g. GitHub update-branch base sync) stays valid IFF
-the two fingerprints match exactly — any content change to the PR's own diff
-(including context drift from base commits touching the same files) changes
-the fingerprint and forces a fresh review.
+head and passes it to review_receipt_validator.py as --current-diff-fingerprint.
+A receipt whose head/base SHAs went stale purely because the head moved (e.g. a
+base sync) stays valid IFF the two fingerprints match exactly.
 
-Exit non-zero on any git failure so callers fall back to strict (exact
-head-SHA) freshness. This tool makes no protected claims: it is an input to
-ADVISORY_PACKET validation, never merge evidence.
+Exit non-zero on any git failure so callers fall back to strict (exact head-SHA)
+freshness. Makes no protected claims: an input to ADVISORY_PACKET validation,
+never merge evidence.
 """
 
 from __future__ import annotations
@@ -29,32 +44,86 @@ import subprocess
 import sys
 
 FULL_SHA_LENGTH = 40
+_ABSENT_BLOB = "0" * 40  # sentinel for a path deleted at head (status D)
 
 
-def compute_diff_fingerprint(repo: str, base_sha: str, head_sha: str) -> str:
-    for label, value in (("base-sha", base_sha), ("head-sha", head_sha)):
-        if len(value) != FULL_SHA_LENGTH or any(c not in "0123456789abcdef" for c in value.lower()):
-            raise ValueError(f"--{label} must be a full 40-hex commit SHA, got {value!r}")
+def _git(repo: str, *args: str) -> str:
     proc = subprocess.run(
-        [
-            "git",
-            "-C",
-            repo,
-            "-c",
-            "diff.renames=false",
-            "-c",
-            "core.quotePath=false",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--unified=3",
-            f"{base_sha}...{head_sha}",
-        ],
+        ["git", "-C", repo, *args],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    return "sha256:" + hashlib.sha256(proc.stdout).hexdigest()
+    return proc.stdout.decode("utf-8", errors="surrogateescape")
+
+
+def _validate_sha(label: str, value: str) -> None:
+    if len(value) != FULL_SHA_LENGTH or any(c not in "0123456789abcdef" for c in value.lower()):
+        raise ValueError(f"--{label} must be a full 40-hex commit SHA, got {value!r}")
+
+
+def compute_content_fingerprint(repo: str, base_sha: str, head_sha: str) -> str:
+    """sha256 over the head blob content of every path the PR contributes.
+
+    Deterministic and identical when recomputed on a later head that carries the
+    same reviewed content, because it hashes full blob object IDs (content), not
+    commit SHAs or diff text.
+    """
+    _validate_sha("base-sha", base_sha)
+    _validate_sha("head-sha", head_sha)
+
+    # -z gives NUL-delimited, un-quoted records: STATUS\0PATH\0STATUS\0PATH...
+    # --no-renames so a rename is a delete + add (each bound independently).
+    raw = _git(
+        repo,
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-renames",
+        "--name-status",
+        "-z",
+        f"{base_sha}...{head_sha}",
+    )
+    tokens = raw.split("\0")
+    changed: list[tuple[str, str]] = []
+    i = 0
+    while i < len(tokens):
+        status = tokens[i]
+        if not status:
+            i += 1
+            continue
+        # copy/rename statuses (C##/R##) carry two paths; --no-renames avoids
+        # them, but stay defensive and consume the extra path if present.
+        if status[0] in {"R", "C"} and i + 2 < len(tokens):
+            path = tokens[i + 2]
+            i += 3
+        else:
+            path = tokens[i + 1] if i + 1 < len(tokens) else ""
+            i += 2
+        if path:
+            changed.append((status, path))
+
+    lines: list[str] = []
+    for status, path in sorted(changed, key=lambda item: item[1]):
+        if status.startswith("D"):
+            lines.append(f"D\t000000\t{_ABSENT_BLOB}\t{path}")
+            continue
+        # Full blob id (40-hex over complete file bytes) + mode at head.
+        entry = _git(repo, "ls-tree", "--full-tree", "-z", head_sha, "--", path)
+        record = entry.split("\0", 1)[0].strip()
+        if not record:
+            # Path reported changed but absent at head — treat as deletion.
+            lines.append(f"D\t000000\t{_ABSENT_BLOB}\t{path}")
+            continue
+        meta, _, tree_path = record.partition("\t")
+        mode, obj_type, blob_sha = meta.split()
+        if obj_type != "blob":
+            # Submodule (commit) or tree — bind to its recorded object id.
+            blob_sha = blob_sha
+        lines.append(f"{status}\t{mode}\t{blob_sha}\t{tree_path or path}")
+
+    payload = "\n".join(lines).encode("utf-8", errors="surrogateescape") + b"\n"
+    return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -64,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--head-sha", required=True, help="full 40-hex PR head SHA")
     args = parser.parse_args(argv)
     try:
-        print(compute_diff_fingerprint(args.repo, args.base_sha, args.head_sha))
+        print(compute_content_fingerprint(args.repo, args.base_sha, args.head_sha))
     except (ValueError, subprocess.CalledProcessError) as exc:
         detail = exc.stderr.decode(errors="replace").strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
         print(f"receipt_diff_fingerprint: {detail}", file=sys.stderr)

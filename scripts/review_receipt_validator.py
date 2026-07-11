@@ -65,8 +65,8 @@ RISK_ORDER = ["R0", "R1", "R2", "R3", "R4", "R5"]
 
 # Mechanical freshness (diff fingerprint) — a receipt whose head/base SHAs went
 # stale purely because the PR head moved (e.g. GitHub update-branch base sync)
-# may remain valid IFF the PR's contributed diff is byte-identical to what was
-# reviewed. Both sides must present a well-formed fingerprint and match exactly;
+# may remain valid IFF the PR-touched files' content is byte-identical to what
+# was reviewed. Both sides must present a well-formed fingerprint and match exactly;
 # every other path stays strict-fail. Protected receipt types are excluded:
 # founder/human/waiver/security/finance receipts always require exact head-SHA
 # freshness — mechanical freshness never substitutes for a protected approval.
@@ -434,7 +434,7 @@ def main(argv: list[str] | None = None) -> int:
         "--current-diff-fingerprint",
         default="",
         help=(
-            "sha256:<hex> fingerprint of the PR's contributed diff on the current head "
+            "sha256:<hex> content fingerprint of the PR-touched files on the current head "
             "(scripts/receipt_diff_fingerprint.py). When a receipt's SHAs are stale but its "
             "diff_fingerprint matches this value exactly, the receipt stays valid "
             "(mechanical freshness). Absent or malformed values keep strict behavior."
