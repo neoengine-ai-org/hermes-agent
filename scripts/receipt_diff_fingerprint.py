@@ -47,14 +47,14 @@ FULL_SHA_LENGTH = 40
 _ABSENT_BLOB = "0" * 40  # sentinel for a path deleted at head (status D)
 
 
-def _git(repo: str, *args: str) -> str:
+def _git_bytes(repo: str, *args: str) -> bytes:
     proc = subprocess.run(
         ["git", "-C", repo, *args],
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    return proc.stdout.decode("utf-8", errors="surrogateescape")
+    return proc.stdout
 
 
 def _validate_sha(label: str, value: str) -> None:
@@ -66,15 +66,22 @@ def compute_content_fingerprint(repo: str, base_sha: str, head_sha: str) -> str:
     """sha256 over the head blob content of every path the PR contributes.
 
     Deterministic and identical when recomputed on a later head that carries the
-    same reviewed content, because it hashes full blob object IDs (content), not
+    same reviewed content, because it binds full blob object IDs (content), not
     commit SHAs or diff text.
+
+    Canonical, byte-exact serialization: everything is done in bytes and every
+    record field is NUL-terminated. Git paths can contain any byte EXCEPT NUL,
+    so NUL is an unambiguous delimiter — no path can forge a field boundary, and
+    trailing path bytes (space/tab/CR/LF) are never stripped. (Opposite-frontier
+    review found that ad-hoc \\t-joined + .strip() text let two distinct file
+    sets serialize identically.)
     """
     _validate_sha("base-sha", base_sha)
     _validate_sha("head-sha", head_sha)
 
-    # -z gives NUL-delimited, un-quoted records: STATUS\0PATH\0STATUS\0PATH...
+    # -z gives NUL-delimited, un-quoted records in BYTES: STATUS\0PATH\0...
     # --no-renames so a rename is a delete + add (each bound independently).
-    raw = _git(
+    raw = _git_bytes(
         repo,
         "-c",
         "core.quotePath=false",
@@ -84,8 +91,8 @@ def compute_content_fingerprint(repo: str, base_sha: str, head_sha: str) -> str:
         "-z",
         f"{base_sha}...{head_sha}",
     )
-    tokens = raw.split("\0")
-    changed: list[tuple[str, str]] = []
+    tokens = raw.split(b"\0")
+    changed: list[tuple[bytes, bytes]] = []
     i = 0
     while i < len(tokens):
         status = tokens[i]
@@ -94,35 +101,35 @@ def compute_content_fingerprint(repo: str, base_sha: str, head_sha: str) -> str:
             continue
         # copy/rename statuses (C##/R##) carry two paths; --no-renames avoids
         # them, but stay defensive and consume the extra path if present.
-        if status[0] in {"R", "C"} and i + 2 < len(tokens):
+        if status[:1] in (b"R", b"C") and i + 2 < len(tokens):
             path = tokens[i + 2]
             i += 3
         else:
-            path = tokens[i + 1] if i + 1 < len(tokens) else ""
+            path = tokens[i + 1] if i + 1 < len(tokens) else b""
             i += 2
         if path:
             changed.append((status, path))
 
-    lines: list[str] = []
+    # Canonical record encoding: status\0 mode\0 blob\0 path\0  (all bytes).
+    records: list[bytes] = []
     for status, path in sorted(changed, key=lambda item: item[1]):
-        if status.startswith("D"):
-            lines.append(f"D\t000000\t{_ABSENT_BLOB}\t{path}")
+        if status[:1] == b"D":
+            records.append(b"D\x00000000\x00" + _ABSENT_BLOB.encode("ascii") + b"\x00" + path + b"\x00")
             continue
-        # Full blob id (40-hex over complete file bytes) + mode at head.
-        entry = _git(repo, "ls-tree", "--full-tree", "-z", head_sha, "--", path)
-        record = entry.split("\0", 1)[0].strip()
-        if not record:
+        # ls-tree -z record: "<mode> <type> <blob>\t<path>\0". The mode/type/blob
+        # prefix before the TAB is fixed-format and space-separated; take it and
+        # ignore the (already-known, exact) path bytes after the tab.
+        entry = _git_bytes(repo, "ls-tree", "--full-tree", "-z", head_sha, "--", path)
+        first = entry.split(b"\0", 1)[0]
+        if not first or b"\t" not in first:
             # Path reported changed but absent at head — treat as deletion.
-            lines.append(f"D\t000000\t{_ABSENT_BLOB}\t{path}")
+            records.append(b"D\x00000000\x00" + _ABSENT_BLOB.encode("ascii") + b"\x00" + path + b"\x00")
             continue
-        meta, _, tree_path = record.partition("\t")
-        mode, obj_type, blob_sha = meta.split()
-        if obj_type != "blob":
-            # Submodule (commit) or tree — bind to its recorded object id.
-            blob_sha = blob_sha
-        lines.append(f"{status}\t{mode}\t{blob_sha}\t{tree_path or path}")
+        meta = first.split(b"\t", 1)[0]
+        mode, _obj_type, blob_sha = meta.split()
+        records.append(status + b"\x00" + mode + b"\x00" + blob_sha + b"\x00" + path + b"\x00")
 
-    payload = "\n".join(lines).encode("utf-8", errors="surrogateescape") + b"\n"
+    payload = b"".join(records)
     return "sha256:" + hashlib.sha256(payload).hexdigest()
 
 

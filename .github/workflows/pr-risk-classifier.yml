@@ -286,6 +286,17 @@ jobs:
                 --base-sha "${{ github.event.pull_request.base.sha }}" \
                 --head-sha "${{ github.event.pull_request.head.sha }}")"; then
               FRESHNESS_ARGS=(--current-diff-fingerprint "$current_fp")
+              # Base mechanical-freshness is only safe when the head already
+              # contains the current base (its blobs reflect the merge). pr-head
+              # is a full clone (fetch-depth 0), so this is decisive; an
+              # unreachable/advanced base fails --is-ancestor (128/1) and stays
+              # strict. Only claim it when git PROVES ancestry (exit 0).
+              if [ "${{ github.event.pull_request.base.sha }}" != "" ] \
+                && git -C pr-head merge-base --is-ancestor \
+                    "${{ github.event.pull_request.base.sha }}" \
+                    "${{ github.event.pull_request.head.sha }}" 2>/dev/null; then
+                FRESHNESS_ARGS+=(--base-is-ancestor-of-head)
+              fi
             else
               echo "::warning::diff fingerprint computation failed; receipts require exact head SHA freshness"
             fi

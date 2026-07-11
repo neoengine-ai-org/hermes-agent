@@ -158,6 +158,42 @@ def test_fingerprint_captures_file_deletion(pr_repo: dict[str, object]) -> None:
     assert after != before
 
 
+def test_canonical_serialization_resists_path_delimiter_forgery(tmp_path: Path) -> None:
+    # Opposite-frontier round-2 BLOCKER: a path containing tab/newline must not be
+    # able to forge a field boundary so two distinct file sets hash the same.
+    # NUL-delimited byte serialization makes the two states below distinct.
+    def build(repo: Path, files: dict[str, str]) -> tuple[str, str]:
+        repo.mkdir()
+        _git(repo, "init", "--initial-branch=main")
+        _git(repo, "config", "user.email", "t@e.invalid")
+        _git(repo, "config", "user.name", "t")
+        (repo / "seed.txt").write_text("seed\n")
+        _git(repo, "add", "seed.txt")
+        _git(repo, "commit", "-m", "base")
+        base = _sha(repo)
+        _git(repo, "checkout", "-b", "feature")
+        for name, content in files.items():
+            p = repo / name
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content)
+            _git(repo, "add", name)
+        _git(repo, "commit", "-m", "feature")
+        return base, _sha(repo)
+
+    # State A: a single file whose NAME embeds a newline + a fake record.
+    repo_a = tmp_path / "a"
+    tricky_name = "x\nA\t100644\tdeadbeef\ty"
+    base_a, head_a = build(repo_a, {tricky_name: "alpha\n"})
+    fp_a = fp(str(repo_a), base_a, head_a)
+
+    # State B: two ordinary files x and y with different content.
+    repo_b = tmp_path / "b"
+    base_b, head_b = build(repo_b, {"x": "alpha\n", "y": "beta\n"})
+    fp_b = fp(str(repo_b), base_b, head_b)
+
+    assert fp_a != fp_b
+
+
 def test_rejects_short_or_invalid_shas(pr_repo: dict[str, object]) -> None:
     repo = str(pr_repo["repo"])
     with pytest.raises(ValueError):

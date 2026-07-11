@@ -222,6 +222,7 @@ def _receipt_invalid_reasons(
     pr_number: str,
     primary_provider: str = "",
     current_diff_fingerprint: str = "",
+    base_is_ancestor_of_head: bool = False,
 ) -> list[str]:
     review_type = str(receipt.get("review_type", ""))
     reasons: list[str] = []
@@ -230,13 +231,21 @@ def _receipt_invalid_reasons(
     for field in ("provider", "reviewer_identity", "pr_reviewed", "head_sha_reviewed", "base_sha_reviewed", "verdict", "review_timestamp", "evidence_url_or_path"):
         if not receipt.get(field):
             reasons.append(f"missing_receipt_field:{review_type}:{field}")
+    fresh = _mechanically_fresh(receipt, current_diff_fingerprint)
     head_sha_stale = receipt.get("head_sha_reviewed") != current_head_sha
     base_sha_stale = current_base_sha != "unknown" and receipt.get("base_sha_reviewed") not in {current_base_sha, "unknown"}
-    if (head_sha_stale or base_sha_stale) and not _mechanically_fresh(receipt, current_diff_fingerprint):
-        if head_sha_stale:
-            reasons.append(f"stale_review_receipt:{review_type}")
-        if base_sha_stale:
-            reasons.append(f"base_sha_mismatch:{review_type}")
+    # Head-staleness: the fingerprint binds the PR-touched files' head content, so
+    # a match means the reviewer's content is unchanged — relax on fingerprint alone.
+    if head_sha_stale and not fresh:
+        reasons.append(f"stale_review_receipt:{review_type}")
+    # Base-staleness: a fingerprint match only proves the merge is unchanged when
+    # the head already CONTAINS the current base (the head blobs reflect that
+    # base). If the base advanced past the head (PR is BEHIND, not yet synced),
+    # the head blobs do not reflect the new base, so relaxing here would accept
+    # unreviewed merge content. Require base_is_ancestor_of_head (opposite-frontier
+    # round-2 MAJOR). Absent/false => strict, fail-closed.
+    if base_sha_stale and not (fresh and base_is_ancestor_of_head):
+        reasons.append(f"base_sha_mismatch:{review_type}")
     if pr_number != "unknown" and str(receipt.get("pr_reviewed", "")).strip() != pr_number:
         reasons.append(f"pr_number_mismatch:{review_type}")
     verdict = str(receipt.get("verdict", ""))
@@ -297,6 +306,7 @@ def validate_review_receipts(
     primary_provider: str = "",
     enforced: bool = False,
     current_diff_fingerprint: str = "",
+    base_is_ancestor_of_head: bool = False,
 ) -> dict[str, object]:
     normalized_receipts = [_normalize_receipt(receipt) for receipt in receipts]
     required = _required_review_types(classification)
@@ -314,6 +324,7 @@ def validate_review_receipts(
             pr_number=str(classification.get("pr_number", "unknown")),
             primary_provider=primary_provider,
             current_diff_fingerprint=current_diff_fingerprint,
+            base_is_ancestor_of_head=base_is_ancestor_of_head,
         )
         if reasons:
             invalid_reasons.extend(reasons)
@@ -371,6 +382,7 @@ def validate_review_receipts(
         "current_head_sha": current_head_sha,
         "current_base_sha": current_base_sha,
         "current_diff_fingerprint": current_diff_fingerprint or "unknown",
+        "base_is_ancestor_of_head": base_is_ancestor_of_head,
         "mechanical_freshness_receipts": sorted(set(mechanical_freshness_receipts)),
         "primary_provider": primary_provider or "unknown",
         "required_review_types": required,
@@ -440,6 +452,17 @@ def main(argv: list[str] | None = None) -> int:
             "(mechanical freshness). Absent or malformed values keep strict behavior."
         ),
     )
+    parser.add_argument(
+        "--base-is-ancestor-of-head",
+        action="store_true",
+        help=(
+            "Set only when the current base SHA is an ancestor of the current head (the head "
+            "already contains the base, e.g. after a branch-sync). Required for mechanical "
+            "freshness to clear a base_sha_mismatch; without it a stale base stays strict-fail "
+            "even on a fingerprint match, so a base that advanced past the head cannot inject "
+            "unreviewed merge content."
+        ),
+    )
     parser.add_argument("--primary-provider", default="codex")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--enforce", action="store_true", help="Exit non-zero when review requirements are not merge-satisfied")
@@ -464,6 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         primary_provider=args.primary_provider,
         enforced=args.enforce,
         current_diff_fingerprint=args.current_diff_fingerprint,
+        base_is_ancestor_of_head=args.base_is_ancestor_of_head,
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

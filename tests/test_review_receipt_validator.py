@@ -514,7 +514,10 @@ FP_OTHER = "sha256:" + "b" * 64
 
 
 def validate_with_fingerprint(
-    data: dict[str, object], receipts: list[dict[str, object]], current_diff_fingerprint: str = ""
+    data: dict[str, object],
+    receipts: list[dict[str, object]],
+    current_diff_fingerprint: str = "",
+    base_is_ancestor_of_head: bool = False,
 ) -> dict[str, Any]:
     return review_receipt_validator.validate_review_receipts(
         data,
@@ -522,6 +525,7 @@ def validate_with_fingerprint(
         current_head_sha=HEAD_SHA,
         current_base_sha=BASE_SHA,
         current_diff_fingerprint=current_diff_fingerprint,
+        base_is_ancestor_of_head=base_is_ancestor_of_head,
     )
 
 
@@ -537,15 +541,36 @@ def test_stale_head_with_matching_diff_fingerprint_is_mechanically_fresh() -> No
     assert "stale_review_receipt:secondary" not in result["invalid_receipt_reasons"]
 
 
-def test_stale_head_and_base_with_matching_fingerprint_is_mechanically_fresh() -> None:
+def test_stale_base_with_fingerprint_and_ancestor_is_mechanically_fresh() -> None:
+    # Base staleness clears ONLY when the current base is an ancestor of the head
+    # (head reflects the merge) — the branch-sync case.
     result = validate_with_fingerprint(
         classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
         [receipt("secondary", head_sha_reviewed="oldhead", base_sha_reviewed="oldbase", diff_fingerprint=FP)],
         current_diff_fingerprint=FP,
+        base_is_ancestor_of_head=True,
     )
 
     assert result["review_ready"] is True
+    assert result["base_is_ancestor_of_head"] is True
     assert "base_sha_mismatch:secondary" not in result["invalid_receipt_reasons"]
+
+
+def test_stale_base_without_ancestor_stays_strict_even_on_fingerprint_match() -> None:
+    # Opposite-frontier round-2 MAJOR: base advanced past the head (not an
+    # ancestor) -> head blobs do not reflect the new base -> must stay strict even
+    # though the head-content fingerprint matches.
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead", base_sha_reviewed="oldbase", diff_fingerprint=FP)],
+        current_diff_fingerprint=FP,
+        base_is_ancestor_of_head=False,
+    )
+
+    assert result["review_ready"] is False
+    assert "base_sha_mismatch:secondary" in result["invalid_receipt_reasons"]
+    # Head staleness still clears (content unchanged); only the base gate holds.
+    assert "stale_review_receipt:secondary" not in result["invalid_receipt_reasons"]
 
 
 def test_stale_head_with_mismatched_fingerprint_stays_stale() -> None:
