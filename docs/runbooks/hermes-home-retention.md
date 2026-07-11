@@ -62,8 +62,10 @@ startup-triggered — a long-lived gateway rarely restarts, and the live DB
 predates any 90d cutoff, so it never fired here. It also cannot see profile
 DBs or non-DB lanes. The retention tool uses guarded direct SQL (checks
 tables exist, tolerates schema drift between the installed hermes and this
-checkout) with the same eligibility semantics as `prune_sessions`, plus
-export-before-delete.
+checkout) with deliberately WIDER eligibility than `prune_sessions`: ended
+sessions by `COALESCE(ended_at, started_at)`, `end_reason`-only sessions,
+and crashed "open" sessions with no in-window message — plus
+export-before-delete, which `prune_sessions` does not do.
 
 ## Archive-before-delete
 
@@ -83,9 +85,14 @@ Archive root: `~/.hermes/retention-archive/` (inside the job's own root).
   becoming the next 15 GiB.
 - Restore: `tar -xzf <archive> -C ~/.hermes` (arcnames are root-relative).
 
-Nothing is ever deleted without either (a) an archive containing it, or
-(b) for bulk re-derivable data in `--delete` mode, an explicit operator flag —
-`--delete` is never the default and never applies to receipt-class files.
+Nothing is ever deleted without an archive verifiably containing it, with
+one deliberate exception: **cache-class data** (npm/lsp caches under
+profiles) is re-derivable and is deleted without archive on `--execute`.
+There is no standalone delete-without-archive flag for log/receipt/DB
+lanes. A lane workdir holding ANY content a fresh clone could not
+reproduce — uncommitted changes, untracked or ignored files, stashes, or
+committed-but-unpushed work (`git log --branches --not --remotes`) — is
+archived as full working-tree content before removal.
 
 ## Lane-workdir cleanup at lane end
 
@@ -197,8 +204,9 @@ without cleanup is therefore still collected — fail-safe, not fail-open.
 ## Operator cadence
 
 1. Daily (timer): `--check` health gate.
-2. Weekly (timer or manual): `--execute` in archive mode.
-3. Never run `--execute --delete` unattended.
+2. Weekly (timer or manual): `--execute` in archive mode. Exit code 2
+   means a lane hit errors — the wrapper writes an `execute_failed`
+   handoff; read the run receipt.
 4. First-run expectation on 2026-07 data: lane-workdirs −2.1 GiB, dispatch
    logs −2.2 GiB, cron/output −1.0 GiB and ~190k inodes, state.db −2.5 to
    −3 GiB after VACUUM.

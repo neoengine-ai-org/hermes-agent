@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import io
+import itertools
 import json
 import os
 import shutil
@@ -529,48 +530,65 @@ def _process_sweep_mentions(needles: List[str]) -> Optional[bool]:
     return None  # sweep unavailable => caller must fail safe
 
 
-def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
-    """Capture status/diff/HEAD of a workdir clone before removal.
+_GIT_SNAPSHOT_ENV = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
 
-    Returns ``(members, is_dirty)`` — dirty means uncommitted tracked
-    changes OR untracked files, in which case the caller must archive the
-    full working tree, not just receipts (diffs do not carry untracked or
-    ignored file contents).
+
+def _run_git(workdir: Path, args: List[str]) -> Tuple[int, bytes, bytes]:
+    """Run git read-only in a workdir. GIT_OPTIONAL_LOCKS=0 stops `git
+    status` from refreshing .git/index — otherwise our own snapshot would
+    trip the nested-mtime revival re-check."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(workdir), *args],
+            capture_output=True,
+            timeout=60,
+            env=_GIT_SNAPSHOT_ENV,
+        )
+        return proc.returncode, proc.stdout, proc.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, b"", f"<unavailable: {exc}>".encode()
+
+
+def _git_snapshot(workdir: Path) -> Tuple[List[Tuple[str, bytes]], bool]:
+    """Capture status/diff/HEAD/unpushed/stash state of a workdir clone
+    before removal.
+
+    Returns ``(members, is_dirty)`` — dirty means the working tree holds
+    ANY content a fresh clone could not reproduce: uncommitted tracked
+    changes, untracked or ignored files, stash entries, or commits that
+    exist on no remote (committed-but-unpushed work). Dirty workdirs must
+    be archived as full working-tree content, not just receipts.
     """
     members: List[Tuple[str, bytes]] = []
     base = f"lane-workdir-snapshots/{workdir.name}"
     dirty = False
-    for name, git_args in (
+    for name, git_args, dirty_when in (
         # --ignored: ignored artifacts (build outputs, local results) count
         # as dirty too — a diff cannot reproduce them either
         ("status.txt",
-         ["status", "--porcelain=v1", "--branch", "--ignored=matching"]),
-        ("diff.patch", ["diff"]),
-        ("diff-cached.patch", ["diff", "--cached"]),
-        ("head.txt", ["rev-parse", "HEAD"]),
+         ["status", "--porcelain=v1", "--branch", "--ignored=matching"],
+         "non-branch-lines"),
+        ("diff.patch", ["diff"], None),
+        ("diff-cached.patch", ["diff", "--cached"], None),
+        ("head.txt", ["rev-parse", "HEAD"], None),
+        # commits on no remote: a deleted clone is their ONLY copy
+        ("unpushed.txt",
+         ["log", "--branches", "--not", "--remotes", "--format=%H %s"],
+         "any-output"),
+        ("stash.txt", ["stash", "list"], "any-output"),
     ):
-        try:
-            proc = subprocess.run(
-                ["git", "-C", str(workdir), *git_args],
-                capture_output=True,
-                timeout=60,
-            )
-            payload = proc.stdout if proc.returncode == 0 else (
-                b"<git error> " + proc.stderr
-            )
-            if name == "status.txt" and proc.returncode == 0:
-                dirty = any(
-                    line and not line.startswith("##")
-                    for line in proc.stdout.decode(
-                        "utf-8", "replace"
-                    ).splitlines()
-                )
-            elif name == "status.txt":
+        returncode, stdout, stderr = _run_git(workdir, git_args)
+        payload = stdout if returncode == 0 else b"<git error> " + stderr
+        if dirty_when is not None:
+            if returncode != 0:
                 dirty = True  # cannot prove clean => treat as dirty
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            payload = f"<unavailable: {exc}>".encode()
-            if name == "status.txt":
-                dirty = True
+            elif dirty_when == "non-branch-lines":
+                dirty = dirty or any(
+                    line and not line.startswith("##")
+                    for line in stdout.decode("utf-8", "replace").splitlines()
+                )
+            elif dirty_when == "any-output":
+                dirty = dirty or bool(stdout.strip())
         members.append((f"{base}/{name}", payload))
     return members, dirty
 
@@ -640,6 +658,11 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
                 except OSError:
                     continue
                 dir_bytes += _file_size(p)
+                # .git metadata churn is not lane work-product (and our own
+                # snapshot's `git status` may refresh .git/index) — real
+                # activity shows in working-tree files, registry, or ps
+                if ".git" in p.relative_to(workdir).parts:
+                    continue
                 newest_mtime = max(newest_mtime, _file_mtime(p))
             if newest_mtime > grace_cutoff:
                 # a nested write does not bump the top-level dir mtime —
@@ -698,6 +721,8 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
                         continue
                 except OSError:
                     continue
+                if ".git" in p.relative_to(workdir).parts:
+                    continue  # our own snapshot refreshes .git/index
                 recheck_mtime = max(recheck_mtime, _file_mtime(p))
             resweep = _process_sweep_mentions([lane_id, str(workdir)])
             if (
@@ -775,21 +800,31 @@ def _db_tables(conn: sqlite3.Connection) -> set:
 
 
 def _export_rows_gzip_jsonl(
-    cfg: RetentionConfig, slug: str, klass: str, rows: List[Dict[str, Any]]
-) -> Optional[Path]:
+    cfg: RetentionConfig,
+    slug: str,
+    klass: str,
+    rows: Iterable[Dict[str, Any]],
+) -> Tuple[str, Optional[Path], int]:
     """Durable gzipped-JSONL export (tmp-write, fsync, rename, dir fsync).
-    Returns None on failure — callers must NOT delete the source rows then."""
-    if not rows:
-        return None
+    Streams the iterable — never materializes the full row set in memory.
+    Returns ``(status, path, count)`` with status one of ``ok`` / ``empty``
+    / ``failed``. On ``failed`` callers must NOT delete the source rows."""
+    iterator = iter(rows)
+    try:
+        first = next(iterator)
+    except StopIteration:
+        return "empty", None, 0
     cfg.archive_dir.mkdir(parents=True, exist_ok=True)
     base = _unique_archive_base(cfg, slug)
     path = cfg.archive_dir / f"{base}.jsonl.gz"
     tmp = cfg.archive_dir / f"{base}.jsonl.gz.tmp"
+    count = 0
     try:
         with open(tmp, "wb") as raw:
             with gzip.open(raw, "wt", encoding="utf-8") as handle:
-                for row in rows:
+                for row in itertools.chain([first], iterator):
                     handle.write(json.dumps(row, default=str) + "\n")
+                    count += 1
             raw.flush()
             os.fsync(raw.fileno())
         os.replace(tmp, path)
@@ -797,7 +832,7 @@ def _export_rows_gzip_jsonl(
         receipt = {
             "created_utc": _utcnow_iso(),
             "target": slug,
-            "file_count": len(rows),
+            "file_count": count,
             "byte_count": path.stat().st_size,
             "oldest_mtime": None,
             "newest_mtime": None,
@@ -808,32 +843,35 @@ def _export_rows_gzip_jsonl(
             "tool_version": TOOL_VERSION,
         }
         _write_receipt(cfg, cfg.archive_dir / f"{base}.receipt.json", receipt)
-    except OSError:
+    except (OSError, sqlite3.Error):
         try:
             tmp.unlink()
         except OSError:
             pass
         _release_reservation(cfg.archive_dir / f"{base}.receipt.json")
-        return None
-    return path
+        return "failed", None, count
+    return "ok", path, count
 
 
 def _session_referencing_tables(
     conn: sqlite3.Connection, tables: set
-) -> List[Tuple[str, str]]:
+) -> Optional[List[Tuple[str, str]]]:
     """(table, fk_column) pairs for every table with a foreign key onto
     sessions, discovered from the live schema so drift is tolerated.
-    ``messages`` is excluded — it has its own export."""
+    ``messages`` is excluded — it has its own export. Returns None when
+    discovery fails — callers must then abort deletion (fail closed): a
+    table dropped from discovery would be cascade-deleted unexported."""
     refs: List[Tuple[str, str]] = []
     for table in sorted(tables):
         if table in {"sessions", "messages"} or table.startswith("sqlite_"):
             continue
+        ident = '"' + table.replace('"', '""') + '"'
         try:
             rows = conn.execute(
-                f"PRAGMA foreign_key_list({json.dumps(table)})"
+                f"PRAGMA foreign_key_list({ident})"
             ).fetchall()
         except sqlite3.Error:
-            continue
+            return None
         for row in rows:
             # row: (id, seq, table, from, to, on_update, on_delete, match)
             if row[2] == "sessions":
@@ -895,19 +933,21 @@ def _retain_one_db(
             return
         cutoff = cfg.db_cutoff
         session_ids = _eligible_session_ids(conn, cutoff)
-        if session_ids:
-            placeholders = ",".join("?" for _ in session_ids)
-            msg_count, msg_bytes = conn.execute(
+        msg_count, msg_bytes = 0, 0
+        for start in range(0, len(session_ids), DB_DELETE_BATCH):
+            batch = session_ids[start : start + DB_DELETE_BATCH]
+            placeholders = ",".join("?" for _ in batch)
+            row = conn.execute(
                 f"""
                 SELECT COUNT(*), COALESCE(SUM(LENGTH(COALESCE(content,''))
                     + LENGTH(COALESCE(reasoning_content,''))
                     + LENGTH(COALESCE(tool_calls,''))), 0)
                 FROM messages WHERE session_id IN ({placeholders})
                 """,
-                session_ids,
+                batch,
             ).fetchone()
-        else:
-            msg_count, msg_bytes = 0, 0
+            msg_count += row[0]
+            msg_bytes += row[1]
         report.candidate_files += msg_count + len(session_ids)
         report.candidate_bytes += int(msg_bytes)
         report.notes.append(
@@ -932,15 +972,27 @@ def _retain_one_db(
             )
         for row in session_rows:
             row.pop("system_prompt", None)  # bulk prompt text, not accounting
-        summary = _export_rows_gzip_jsonl(
+        summary_status, _, _ = _export_rows_gzip_jsonl(
             cfg, f"{slug}-sessions-summary", CLASS_RECEIPT, session_rows
         )
+        if summary_status == "failed":
+            report.errors.append(
+                f"{slug}: sessions-summary export failed — rows NOT deleted"
+            )
+            return
 
         # foreign_keys=ON makes ON DELETE CASCADE references (e.g. telegram
         # topic bindings) follow the session delete — export them first,
-        # discovered generically from the live schema
+        # discovered generically from the live schema. Discovery failure
+        # aborts (fail closed), same as export failure.
+        ref_tables = _session_referencing_tables(conn, tables)
+        if ref_tables is None:
+            report.errors.append(
+                f"{slug}: FK reference discovery failed — rows NOT deleted"
+            )
+            return
         ref_rows: List[Dict[str, Any]] = []
-        for table, column in _session_referencing_tables(conn, tables):
+        for table, column in ref_tables:
             for start in range(0, len(session_ids), DB_DELETE_BATCH):
                 batch = session_ids[start : start + DB_DELETE_BATCH]
                 placeholders = ",".join("?" for _ in batch)
@@ -963,10 +1015,10 @@ def _retain_one_db(
                     {"_table": table, **dict(zip(columns, row))}
                     for row in cursor.fetchall()
                 )
-        refs_export = _export_rows_gzip_jsonl(
+        refs_status, _, _ = _export_rows_gzip_jsonl(
             cfg, f"{slug}-session-refs", CLASS_RECEIPT, ref_rows
         )
-        if ref_rows and refs_export is None:
+        if refs_status == "failed":
             report.errors.append(
                 f"{slug}: session-refs export failed — rows NOT deleted"
             )
@@ -978,32 +1030,35 @@ def _retain_one_db(
             "SELECT COALESCE(MAX(id), 0) FROM messages"
         ).fetchone()[0]
 
-        message_rows: List[Dict[str, Any]] = []
-        for start in range(0, len(session_ids), DB_DELETE_BATCH):
-            batch = session_ids[start : start + DB_DELETE_BATCH]
-            placeholders = ",".join("?" for _ in batch)
-            cursor = conn.execute(
-                f"SELECT * FROM messages WHERE session_id IN ({placeholders})",
-                batch,
-            )
-            columns = [d[0] for d in cursor.description]
-            message_rows.extend(
-                dict(zip(columns, row)) for row in cursor.fetchall()
-            )
-        had_messages = bool(message_rows)
-        archive = _export_rows_gzip_jsonl(
-            cfg, f"{slug}-messages", CLASS_BULK, message_rows
+        def _iter_message_rows() -> Iterable[Dict[str, Any]]:
+            # streamed: the first execute run exports multi-GiB of message
+            # payload — materializing it as dicts would spike RSS
+            for start in range(0, len(session_ids), DB_DELETE_BATCH):
+                batch = session_ids[start : start + DB_DELETE_BATCH]
+                placeholders = ",".join("?" for _ in batch)
+                cursor = conn.execute(
+                    "SELECT * FROM messages "
+                    f"WHERE session_id IN ({placeholders})",
+                    batch,
+                )
+                columns = [d[0] for d in cursor.description]
+                while True:
+                    rows = cursor.fetchmany(1000)
+                    if not rows:
+                        break
+                    for row in rows:
+                        yield dict(zip(columns, row))
+
+        msg_status, archive, _ = _export_rows_gzip_jsonl(
+            cfg, f"{slug}-messages", CLASS_BULK, _iter_message_rows()
         )
         if archive is not None:
             report.archives.append(archive.name)
-        if (had_messages and archive is None) or (
-            session_rows and summary is None
-        ):
+        if msg_status == "failed":
             report.errors.append(
-                f"{slug}: export failed — rows NOT deleted"
+                f"{slug}: messages export failed — rows NOT deleted"
             )
             return
-        del message_rows
 
         deleted_messages = 0
         deleted_sessions = 0
@@ -1249,12 +1304,14 @@ def lane_profiles(cfg: RetentionConfig) -> List[LaneReport]:
                     files, cfg.keep_min, cfg.age_cutoff
                 )
                 if candidates:
+                    # None => per-file classifier, mirroring dispatch-logs
+                    # (*.md closeouts stay receipt-class in profiles too)
                     _prune_files(
                         cfg,
                         logs_report,
                         _slug_for(cfg.root, logs_dir),
                         candidates,
-                        CLASS_BULK,
+                        None,
                     )
         reports.append(logs_report)
     return reports
@@ -1278,8 +1335,8 @@ def lane_archive_gc(cfg: RetentionConfig) -> LaneReport:
             receipt = json.loads(receipt_path.read_text())
         except (OSError, ValueError):
             continue  # unreadable receipt => leave both files alone
-        if receipt.get("class") == CLASS_RECEIPT:
-            continue
+        if receipt.get("class") not in {CLASS_BULK, CLASS_CACHE}:
+            continue  # unknown/missing class defaults to KEEP, like receipts
         archive_name = receipt.get("archive")
         if not archive_name:
             continue
@@ -1462,11 +1519,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except ImportError:
             pass
-        except OSError:
+        except BlockingIOError:
             print(
                 f"{TOOL_NAME}: another retention run holds the lock — exiting"
             )
             return 0
+        except OSError as exc:
+            # lock SETUP failure is not contention — surface it loudly so
+            # the wrapper writes a handoff instead of silently skipping
+            print(f"{TOOL_NAME}: lock setup failed: {exc}", file=sys.stderr)
+            return 2
 
     try:
         reports = run_retention(cfg)
@@ -1476,6 +1538,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     print(format_report(cfg, reports))
     if args.check:
         return 1 if any(r.over_threshold for r in reports) else 0
+    if cfg.execute and any(r.errors for r in reports):
+        # lane errors never raise, but an execute run that hit any must
+        # exit non-zero so the cron wrapper writes a handoff alert
+        return 2
     return 0
 
 

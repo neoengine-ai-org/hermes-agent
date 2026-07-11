@@ -111,9 +111,6 @@ def test_rotation_sorts_by_mtime_not_name(tmp_output, monkeypatch):
 def test_rotation_failure_never_breaks_write(tmp_output, monkeypatch):
     monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "1")
 
-    def boom(job_output_dir, keep):
-        raise AssertionError("must be swallowed upstream")
-
     # simulate an unexpected rotation failure at the OSError boundary
     real_iterdir = jobs.Path.iterdir
 

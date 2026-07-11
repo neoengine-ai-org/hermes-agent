@@ -252,6 +252,77 @@ def test_dirty_workdir_full_content_archived(tmp_path, monkeypatch):
     assert payload == "the only copy of generated work"
 
 
+def test_unpushed_commit_counts_as_dirty_and_content_archived(
+    tmp_path, monkeypatch
+):
+    import subprocess as sp
+
+    root = tmp_path / "hermes"
+    wd = _make_workdir(root, "lane-unpushed", OLD)
+    sp.run(["git", "init", "-q", str(wd)], check=True)
+    (wd / "work.py").write_text("committed but never pushed")
+    sp.run(
+        ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t",
+         "add", "-A"],
+        check=True,
+    )
+    sp.run(
+        ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t",
+         "commit", "-qm", "local work"],
+        check=True,
+    )
+    # tree is CLEAN by porcelain status, but the commit exists on no remote
+    for p in [wd, *wd.rglob("*")]:
+        os.utime(p, (OLD, OLD))
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._process_sweep_mentions",
+        lambda needles: False,
+    )
+    cfg = _cfg(root, execute=True)
+    report = lane_lane_workdirs(cfg, root)
+    assert not wd.exists()
+    assert report.acted_files == 1
+    archive = next(
+        cfg.archive_dir.glob("lane-workdir-lane-unpushed-*.tar.gz")
+    )
+    with tarfile.open(archive) as tar:
+        names = tar.getnames()
+        member = next(n for n in names if n.endswith("work.py"))
+        payload = tar.extractfile(member).read().decode()
+    assert payload == "committed but never pushed"
+    assert any(n.endswith("unpushed.txt") for n in names)
+
+
+def test_state_db_ref_discovery_failure_blocks_deletion(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "hermes"
+    db = _make_db(root)
+    monkeypatch.setattr(
+        "neoengine_local.hermes_home_retention._session_referencing_tables",
+        lambda conn, tables: None,
+    )
+    report = lane_state_db(_cfg(root, execute=True), root)
+    assert any("discovery failed" in e for e in report.errors)
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 5
+    conn.close()
+
+
+def test_execute_with_lane_errors_exits_nonzero(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    root.mkdir(parents=True)
+    from neoengine_local import hermes_home_retention as mod
+
+    def failing_lane(cfg, home):
+        report = mod.LaneReport(lane="dispatch-logs")
+        report.errors.append("simulated unlink failure")
+        return report
+
+    monkeypatch.setattr(mod, "lane_dispatch_logs", failing_lane)
+    assert main(["--root", str(root), "--execute"]) == 2
+
+
 def test_workdir_kept_when_archive_fails(tmp_path, monkeypatch):
     root = tmp_path / "hermes"
     wd = _make_workdir(root, "lane-noarch", OLD)
@@ -451,7 +522,7 @@ def test_state_db_export_failure_blocks_deletion(tmp_path, monkeypatch):
     db = _make_db(root)
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._export_rows_gzip_jsonl",
-        lambda *a, **k: None,
+        lambda *a, **k: ("failed", None, 0),
     )
     report = lane_state_db(_cfg(root, execute=True), root)
     assert any("export failed" in e for e in report.errors)
@@ -459,6 +530,57 @@ def test_state_db_export_failure_blocks_deletion(tmp_path, monkeypatch):
     assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 5
     assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 5
     conn.close()
+
+
+def test_state_db_rowid_replay_revalidation(tmp_path, monkeypatch):
+    """A message replayed with an OLD timestamp after the export snapshot
+    still revives its session (rowid > snapshot branch of the OR)."""
+    root = tmp_path / "hermes"
+    db = _make_db(root)
+    from neoengine_local import hermes_home_retention as mod
+
+    real_export = mod._export_rows_gzip_jsonl
+    state = {"injected": False}
+
+    def inject_after_messages_export(cfg, slug, klass, rows):
+        result = real_export(cfg, slug, klass, rows)
+        if slug.endswith("-messages") and not state["injected"]:
+            state["injected"] = True
+            side = sqlite3.connect(db)
+            side.execute(
+                "INSERT INTO messages (session_id, content, timestamp, role)"
+                " VALUES ('old-ended', 'replayed old msg', ?, 'assistant')",
+                (OLD,),  # OLD timestamp — only the rowid check can catch it
+            )
+            side.commit()
+            side.close()
+        return result
+
+    monkeypatch.setattr(
+        mod, "_export_rows_gzip_jsonl", inject_after_messages_export
+    )
+    report = lane_state_db(_cfg(root, execute=True), root)
+    conn = sqlite3.connect(db)
+    remaining = {
+        r[0] for r in conn.execute("SELECT id FROM sessions").fetchall()
+    }
+    assert "old-ended" in remaining  # revived by rowid snapshot check
+    assert "stale-open" not in remaining
+    conn.close()
+    assert any("revived" in n for n in report.notes)
+
+
+def test_archive_gc_keeps_unknown_class(tmp_path):
+    root = tmp_path / "hermes"
+    cfg = _cfg(root, execute=True, bulk_archive_max_age_days=90.0)
+    ancient = time.time() - 120 * DAY
+    a, r = _write_fake_archive(cfg, "no-class", "", ancient)
+    # receipt with missing class => default KEEP
+    r.write_text(json.dumps({"archive": a.name}))
+    os.utime(r, (ancient, ancient))
+    report = lane_archive_gc(cfg)
+    assert a.exists() and r.exists()
+    assert report.acted_files == 0
 
 
 def test_profile_state_db_respects_kill_switch(tmp_path, monkeypatch):
