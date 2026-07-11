@@ -1058,16 +1058,91 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     return due
 
 
+def _output_rotation_disabled() -> bool:
+    """The hermes-home-retention kill switches also stop write-time
+    rotation, so one env var halts ALL retention deletion in an incident."""
+    for name in (
+        "HERMES_HOME_RETENTION_DISABLED",
+        "HERMES_HOME_RETENTION_CRON_OUTPUT_DISABLED",
+    ):
+        if os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}:
+            return True
+    return False
+
+
+def _output_keep_last() -> int:
+    """Per-job cap on retained run outputs. 0 disables rotation."""
+    if _output_rotation_disabled():
+        return 0
+    raw = os.environ.get("HERMES_CRON_OUTPUT_KEEP", "").strip()
+    if not raw:
+        return 500
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 500
+
+
+def _output_rotation_min_age_seconds() -> float:
+    """Age floor for write-time rotation. Outputs younger than this are
+    never rotation-deleted, so the archive-first retention sweep (which
+    handles anything older) gets to them before rotation does. Write-time
+    rotation is only the safety valve for runaway jobs."""
+    raw = os.environ.get("HERMES_CRON_OUTPUT_MIN_AGE_DAYS", "").strip()
+    try:
+        days = float(raw) if raw else 30.0
+    except ValueError:
+        days = 30.0
+    return max(0.0, days) * 86400.0
+
+
+def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
+    """Drop the oldest run outputs beyond ``keep`` that are also past the
+    age floor. Best-effort: rotation must never break output writing, and
+    must never delete outside OUTPUT_DIR (job ids come from jobs.json,
+    which can be hand-edited — a traversal id like ``../..`` must not turn
+    rotation into arbitrary-directory deletion)."""
+    if keep <= 0:
+        return
+    try:
+        if OUTPUT_DIR.is_symlink() or job_output_dir.is_symlink():
+            return
+        resolved = job_output_dir.resolve()
+        output_root = OUTPUT_DIR.resolve()
+        if resolved == output_root or output_root not in resolved.parents:
+            return
+        import time as _time
+
+        age_cutoff = _time.time() - _output_rotation_min_age_seconds()
+        outputs = sorted(
+            (
+                p
+                for p in job_output_dir.iterdir()
+                if p.suffix == ".md" and p.is_file() and not p.is_symlink()
+            ),
+            key=lambda p: (p.stat().st_mtime, p.name),
+        )
+        for stale in outputs[: max(0, len(outputs) - keep)]:
+            try:
+                if stale.stat().st_mtime >= age_cutoff:
+                    continue
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def save_job_output(job_id: str, output: str):
     """Save job output to file."""
     ensure_dirs()
     job_output_dir = OUTPUT_DIR / job_id
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
-    
+
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"
-    
+
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1082,7 +1157,8 @@ def save_job_output(job_id: str, output: str):
         except OSError:
             pass
         raise
-    
+
+    _rotate_job_output(job_output_dir, _output_keep_last())
     return output_file
 
 
