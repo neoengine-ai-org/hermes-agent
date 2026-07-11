@@ -11,7 +11,9 @@ merge-blocking check failure.
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
+import re
 from pathlib import Path
 from typing import Any, cast
 
@@ -57,8 +59,26 @@ RECEIPT_FIELDS = [
     "protected_claims_checked",
     "review_timestamp",
     "evidence_url_or_path",
+    "diff_fingerprint",
 ]
 RISK_ORDER = ["R0", "R1", "R2", "R3", "R4", "R5"]
+
+# Mechanical freshness (diff fingerprint) — a receipt whose head/base SHAs went
+# stale purely because the PR head moved (e.g. GitHub update-branch base sync)
+# may remain valid IFF the PR's contributed diff is byte-identical to what was
+# reviewed. Both sides must present a well-formed fingerprint and match exactly;
+# every other path stays strict-fail. Protected receipt types are excluded:
+# founder/human/waiver/security/finance receipts always require exact head-SHA
+# freshness — mechanical freshness never substitutes for a protected approval.
+DIFF_FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+PROTECTED_FRESHNESS_RECEIPT_TYPES = {
+    "tier4_authority_waiver",
+    "tier4_break_glass",
+    "human_protected",
+    "founder",
+    "security",
+    "finance_sensitive",
+}
 
 
 def _list_value(value: object) -> list[str]:
@@ -133,7 +153,27 @@ def _normalize_receipt(receipt: dict[str, object]) -> dict[str, object]:
     normalized["protected_claims_checked"] = _list_value(normalized["protected_claims_checked"])
     normalized["review_timestamp"] = str(normalized["review_timestamp"]).strip()
     normalized["evidence_url_or_path"] = str(normalized["evidence_url_or_path"]).strip()
+    normalized["diff_fingerprint"] = str(normalized["diff_fingerprint"]).strip().lower()
     return normalized
+
+
+def _mechanically_fresh(receipt: dict[str, object], current_diff_fingerprint: str) -> bool:
+    """True when a stale-SHA receipt still covers the exact reviewed diff.
+
+    Fail-closed on every branch: requires a non-protected receipt type, a
+    well-formed sha256 fingerprint on BOTH the receipt and the current PR
+    state, and exact equality. A missing/malformed fingerprint on either side
+    means the receipt is treated as stale, preserving the strict historical
+    behavior.
+    """
+    review_type = str(receipt.get("review_type", ""))
+    if review_type in PROTECTED_FRESHNESS_RECEIPT_TYPES:
+        return False
+    recorded = str(receipt.get("diff_fingerprint", "")).strip().lower()
+    current = str(current_diff_fingerprint or "").strip().lower()
+    if not DIFF_FINGERPRINT_RE.fullmatch(recorded) or not DIFF_FINGERPRINT_RE.fullmatch(current):
+        return False
+    return hmac.compare_digest(recorded, current)
 
 
 def _is_template_placeholder_receipt(receipt: dict[str, object]) -> bool:
@@ -181,6 +221,7 @@ def _receipt_invalid_reasons(
     risk_class: str,
     pr_number: str,
     primary_provider: str = "",
+    current_diff_fingerprint: str = "",
 ) -> list[str]:
     review_type = str(receipt.get("review_type", ""))
     reasons: list[str] = []
@@ -189,10 +230,13 @@ def _receipt_invalid_reasons(
     for field in ("provider", "reviewer_identity", "pr_reviewed", "head_sha_reviewed", "base_sha_reviewed", "verdict", "review_timestamp", "evidence_url_or_path"):
         if not receipt.get(field):
             reasons.append(f"missing_receipt_field:{review_type}:{field}")
-    if receipt.get("head_sha_reviewed") != current_head_sha:
-        reasons.append(f"stale_review_receipt:{review_type}")
-    if current_base_sha != "unknown" and receipt.get("base_sha_reviewed") not in {current_base_sha, "unknown"}:
-        reasons.append(f"base_sha_mismatch:{review_type}")
+    head_sha_stale = receipt.get("head_sha_reviewed") != current_head_sha
+    base_sha_stale = current_base_sha != "unknown" and receipt.get("base_sha_reviewed") not in {current_base_sha, "unknown"}
+    if (head_sha_stale or base_sha_stale) and not _mechanically_fresh(receipt, current_diff_fingerprint):
+        if head_sha_stale:
+            reasons.append(f"stale_review_receipt:{review_type}")
+        if base_sha_stale:
+            reasons.append(f"base_sha_mismatch:{review_type}")
     if pr_number != "unknown" and str(receipt.get("pr_reviewed", "")).strip() != pr_number:
         reasons.append(f"pr_number_mismatch:{review_type}")
     verdict = str(receipt.get("verdict", ""))
@@ -252,12 +296,14 @@ def validate_review_receipts(
     current_base_sha: str = "unknown",
     primary_provider: str = "",
     enforced: bool = False,
+    current_diff_fingerprint: str = "",
 ) -> dict[str, object]:
     normalized_receipts = [_normalize_receipt(receipt) for receipt in receipts]
     required = _required_review_types(classification)
     risk_class = str(classification.get("risk_class", "R0"))
     invalid_reasons: list[str] = []
     valid_by_type: dict[str, list[dict[str, object]]] = {review_type: [] for review_type in RECEIPT_TYPES}
+    mechanical_freshness_receipts: list[str] = []
 
     for receipt in normalized_receipts:
         reasons = _receipt_invalid_reasons(
@@ -267,12 +313,15 @@ def validate_review_receipts(
             risk_class=risk_class,
             pr_number=str(classification.get("pr_number", "unknown")),
             primary_provider=primary_provider,
+            current_diff_fingerprint=current_diff_fingerprint,
         )
         if reasons:
             invalid_reasons.extend(reasons)
         else:
             review_type = str(receipt["review_type"])
             valid_by_type.setdefault(review_type, []).append(receipt)
+            if str(receipt.get("head_sha_reviewed", "")) != current_head_sha:
+                mechanical_freshness_receipts.append(review_type)
 
     tier4_required = _tier4_required(classification)
     tier4_waiver_satisfied = bool(valid_by_type.get("tier4_authority_waiver") or valid_by_type.get("tier4_break_glass"))
@@ -321,6 +370,8 @@ def validate_review_receipts(
         "non_claims": non_claims,
         "current_head_sha": current_head_sha,
         "current_base_sha": current_base_sha,
+        "current_diff_fingerprint": current_diff_fingerprint or "unknown",
+        "mechanical_freshness_receipts": sorted(set(mechanical_freshness_receipts)),
         "primary_provider": primary_provider or "unknown",
         "required_review_types": required,
         "satisfied_required_review_types": satisfied,
@@ -379,6 +430,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--receipts-json")
     parser.add_argument("--head-sha", default="unknown")
     parser.add_argument("--base-sha", default="unknown")
+    parser.add_argument(
+        "--current-diff-fingerprint",
+        default="",
+        help=(
+            "sha256:<hex> fingerprint of the PR's contributed diff on the current head "
+            "(scripts/receipt_diff_fingerprint.py). When a receipt's SHAs are stale but its "
+            "diff_fingerprint matches this value exactly, the receipt stays valid "
+            "(mechanical freshness). Absent or malformed values keep strict behavior."
+        ),
+    )
     parser.add_argument("--primary-provider", default="codex")
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--enforce", action="store_true", help="Exit non-zero when review requirements are not merge-satisfied")
@@ -402,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
         current_base_sha=args.base_sha,
         primary_provider=args.primary_provider,
         enforced=args.enforce,
+        current_diff_fingerprint=args.current_diff_fingerprint,
     )
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

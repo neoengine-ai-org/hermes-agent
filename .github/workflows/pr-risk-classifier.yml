@@ -273,6 +273,23 @@ jobs:
             echo pr-head-bootstrap-enforcement > review-receipt-validator-source.txt
             ENFORCE_ARGS=(--enforce)
           fi
+          # Mechanical freshness: compute the current diff fingerprint with the
+          # TRUSTED helper only, and pass it only when the trusted validator
+          # advertises the flag. Any missing piece (helper absent on base,
+          # validator too old, git failure) falls back to strict exact-head-SHA
+          # freshness — fail-closed by construction.
+          FRESHNESS_ARGS=()
+          if [ -f trusted-classifier/scripts/receipt_diff_fingerprint.py ] \
+            && python "$VALIDATOR" --help | grep -q -- '--current-diff-fingerprint'; then
+            if current_fp="$(python trusted-classifier/scripts/receipt_diff_fingerprint.py \
+                --repo pr-head \
+                --base-sha "${{ github.event.pull_request.base.sha }}" \
+                --head-sha "${{ github.event.pull_request.head.sha }}")"; then
+              FRESHNESS_ARGS=(--current-diff-fingerprint "$current_fp")
+            else
+              echo "::warning::diff fingerprint computation failed; receipts require exact head SHA freshness"
+            fi
+          fi
           python "$VALIDATOR" \
             --classification ci-classification.json \
             --pr-body pr-body.md \
@@ -280,6 +297,7 @@ jobs:
             --base-sha "${{ github.event.pull_request.base.sha }}" \
             --primary-provider codex \
             --output-dir . \
+            "${FRESHNESS_ARGS[@]}" \
             "${ENFORCE_ARGS[@]}"
 
       - name: Backfill dry-run review readiness outputs
