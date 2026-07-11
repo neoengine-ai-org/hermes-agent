@@ -156,9 +156,16 @@ without cleanup is therefore still collected — fail-safe, not fail-open.
   that gained an in-window message after selection is kept. Exports must
   succeed durably (fsync + rename) before any row is deleted.
   `PRAGMA foreign_keys=ON` so ON DELETE CASCADE references (telegram
-  bindings) follow. Residual accepted risk: VACUUM briefly holds an
-  exclusive lock against the live gateway; it fails soft on SQLITE_BUSY
-  and the checkpoint-busy result is surfaced as a report note.
+  bindings) follow, with those rows exported receipt-class first
+  (fail-closed: an unreadable reference table aborts deletion).
+- Residual accepted risks (same-trust-domain operator Mac): VACUUM briefly
+  holds an exclusive lock against the live gateway (fails soft on
+  SQLITE_BUSY; checkpoint-busy surfaced as a note); an FK row attached to
+  an already-dead session between export and delete would cascade
+  unexported (bindings attach to active sessions, which revalidation
+  keeps); transitive cascades (grandchild tables of a session-referencing
+  table) are deleted but not exported — no such table exists in the
+  current schema.
 - The kill switches also stop write-time cron rotation
   (`HERMES_HOME_RETENTION_DISABLED` / `..._CRON_OUTPUT_DISABLED`), so one
   env var halts all retention deletion in an incident. Rotation refuses

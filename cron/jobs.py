@@ -1105,7 +1105,7 @@ def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
     if keep <= 0:
         return
     try:
-        if OUTPUT_DIR.is_symlink():
+        if OUTPUT_DIR.is_symlink() or job_output_dir.is_symlink():
             return
         resolved = job_output_dir.resolve()
         output_root = OUTPUT_DIR.resolve()

@@ -241,6 +241,17 @@ def _unique_archive_base(cfg: RetentionConfig, slug: str) -> str:
         counter += 1
 
 
+def _release_reservation(receipt_path: Path) -> None:
+    """Remove an O_EXCL reservation receipt left behind by a failed archive
+    write — an empty receipt must not leak (archive-gc skips unreadable
+    receipts forever)."""
+    try:
+        if receipt_path.exists() and receipt_path.stat().st_size == 0:
+            receipt_path.unlink()
+    except OSError:
+        pass
+
+
 def _fsync_dir(directory: Path) -> None:
     try:
         fd = os.open(str(directory), os.O_RDONLY)
@@ -315,12 +326,14 @@ def _write_archive(
             tmp_archive.unlink()
         except OSError:
             pass
+        _release_reservation(receipt_path)
         return None, []
     # readback: only files verifiably inside the archive may be deleted
     try:
         with tarfile.open(archive_path) as tar:
             present = set(tar.getnames())
     except (OSError, tarfile.TarError):
+        _release_reservation(receipt_path)
         return None, []
     verified = [path for arcname, path in added if arcname in present]
     mtimes = [_file_mtime(p) for p in verified] or [time.time()]
@@ -340,6 +353,7 @@ def _write_archive(
     try:
         _write_receipt(cfg, receipt_path, receipt)
     except OSError:
+        _release_reservation(receipt_path)
         return None, []
     return archive_path, verified
 
@@ -371,6 +385,8 @@ def _safe_unlink(
     if expected is not None and (
         stat.st_size != expected.st_size
         or stat.st_mtime_ns != expected.st_mtime_ns
+        or stat.st_ino != expected.st_ino
+        or stat.st_dev != expected.st_dev
     ):
         report.notes.append(f"skipped {path.name}: changed since scan")
         return False
@@ -673,11 +689,19 @@ def lane_lane_workdirs(cfg: RetentionConfig, home: Path) -> LaneReport:
                 )
                 continue
             # last-instant re-check: lane may have revived since eligibility
-            # (registry, top-level mtime, AND a fresh process sweep — a lane
-            # can start between the first sweep and here)
+            # (registry, nested newest mtime — a worker may have written a
+            # result since the scan — AND a fresh process sweep)
+            recheck_mtime = _file_mtime(workdir)
+            for p in workdir.rglob("*"):
+                try:
+                    if p.is_symlink() or not p.is_file():
+                        continue
+                except OSError:
+                    continue
+                recheck_mtime = max(recheck_mtime, _file_mtime(p))
             resweep = _process_sweep_mentions([lane_id, str(workdir)])
             if (
-                _file_mtime(workdir) > grace_cutoff
+                recheck_mtime > grace_cutoff
                 or (
                     registry.exists()
                     and _registry_says_alive(registry, lane_id)
@@ -789,6 +813,7 @@ def _export_rows_gzip_jsonl(
             tmp.unlink()
         except OSError:
             pass
+        _release_reservation(cfg.archive_dir / f"{base}.receipt.json")
         return None
     return path
 
@@ -925,8 +950,14 @@ def _retain_one_db(
                         f'WHERE "{column}" IN ({placeholders})',
                         batch,
                     )
-                except sqlite3.Error:
-                    continue
+                except sqlite3.Error as exc:
+                    # fail CLOSED: an unreadable reference table means the
+                    # cascade would delete rows we could not export
+                    report.errors.append(
+                        f"{slug}: cannot export {table} refs ({exc}) — "
+                        "rows NOT deleted"
+                    )
+                    return
                 columns = [d[0] for d in cursor.description]
                 ref_rows.extend(
                     {"_table": table, **dict(zip(columns, row))}
