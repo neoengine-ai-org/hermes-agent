@@ -1109,8 +1109,75 @@ def _integrity_check_reason(
     return None
 
 
+_INDEX_ROW_MISSING_RE = re.compile(
+    r"^integrity_check returned "
+    r"'row \d+ missing from index (?P<index>[A-Za-z_][A-Za-z0-9_]*)'$"
+)
+
+
+def _quote_sqlite_identifier(identifier: str) -> str:
+    """Quote a SQLite identifier that came from SQLite metadata text."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _index_repair_candidate(reason: str) -> Optional[str]:
+    """Return the single repairable index from an integrity_check reason.
+
+    The guard should self-heal only the narrow, observed table/index divergence
+    shape: ``row N missing from index <identifier>``. Broader corruption like
+    malformed pages, rowid-order errors, or schema damage still fails closed and
+    takes the normal corrupt backup path.
+    """
+    match = _INDEX_ROW_MISSING_RE.match(reason)
+    if not match:
+        return None
+    return match.group("index")
+
+
+def _try_reindex_repair(resolved: Path, reason: str) -> bool:
+    """Attempt a bounded ``REINDEX`` for integrity_check index divergence.
+
+    Returns True only when the reason is the narrow index-missing shape, the
+    index exists, REINDEX succeeds, and a full post-repair integrity_check is
+    clean. Any uncertainty returns False so the caller still raises
+    KanbanDbCorruptError and preserves the damaged DB.
+    """
+    index_name = _index_repair_candidate(reason)
+    if not index_name:
+        return False
+    conn: Optional[sqlite3.Connection] = None
+    try:
+        conn = sqlite3.connect(str(resolved), isolation_level=None, timeout=30)
+        row = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' AND name=? COLLATE BINARY",
+            (index_name,),
+        ).fetchone()
+        if not row:
+            return False
+        conn.execute(f"REINDEX {_quote_sqlite_identifier(index_name)}")
+        if _integrity_check_reason(conn) is not None:
+            return False
+    except (sqlite3.DatabaseError, sqlite3.OperationalError, OSError):
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+    key = str(resolved)
+    _INITIALIZED_PATHS.discard(key)
+    _LAST_INTEGRITY_PROBE[key] = time.monotonic()
+    _log.warning(
+        "kanban db integrity guard repaired index divergence with REINDEX %s on %s",
+        index_name,
+        resolved,
+    )
+    return True
+
+
 def _raise_if_corrupt_reason(resolved: Path, reason: Optional[str]) -> None:
     if reason is None:
+        return
+    if _try_reindex_repair(resolved, reason):
         return
     backup = _backup_corrupt_db(resolved)
     raise KanbanDbCorruptError(resolved, backup, reason)
@@ -1288,12 +1355,14 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
 def _guard_existing_db_is_healthy(path: Path) -> bool:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
-    Opens the probe in read-only URI mode. A guard must never recover,
+    Opens the probe in read-only URI mode. The probe itself must never recover,
     checkpoint, create sidecars, or take write locks on a file it is
-    evaluating for corruption. If the file is malformed, copy it (and
-    any WAL/SHM sidecars) to a timestamped backup and raise
-    :class:`KanbanDbCorruptError` so callers cannot silently recreate
-    the schema on top of a damaged DB.
+    evaluating for corruption. If the only detected problem is SQLite's narrow
+    table/index divergence shape (``row N missing from index <name>``), the
+    guard may run a bounded ``REINDEX <name>`` and re-check before continuing;
+    broader corruption is copied (with any WAL/SHM sidecars) to a timestamped
+    backup and raises :class:`KanbanDbCorruptError` so callers cannot silently
+    recreate the schema on top of a damaged DB.
 
     Returns ``True`` when the read-only guard verified the path, skipped a
     fresh/empty file, or reused this process's trusted cache. Returns

@@ -254,6 +254,73 @@ def test_periodic_reprobe_detects_corruption_after_first_connect(
         kb.connect(db_path=db_path)
 
 
+def test_index_only_integrity_corruption_is_reindexed_without_backup(
+    tmp_path, monkeypatch
+):
+    """The observed lane-heartbeat index divergence should self-heal.
+
+    SQLite ``integrity_check`` can report a table/index divergence such as
+    ``row 15 missing from index idx_lane_heartbeats_state`` even though the
+    table pages are intact. That class is repairable with ``REINDEX`` and must
+    not fall into the generic corrupt-backup crash-loop path.
+    """
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    key = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(key)
+    kb._LAST_INTEGRITY_PROBE.pop(key, None)
+
+    real_reason = kb._integrity_check_reason
+    calls: list[str] = []
+
+    def synthetic_index_failure(conn, *, pragma="integrity_check"):
+        calls.append(pragma)
+        if len(calls) == 1:
+            return (
+                "integrity_check returned "
+                "'row 15 missing from index idx_lane_heartbeats_state'"
+            )
+        return real_reason(conn, pragma=pragma)
+
+    monkeypatch.setattr(kb, "_integrity_check_reason", synthetic_index_failure)
+
+    conn = kb.connect(db_path=db_path)
+    try:
+        assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        conn.close()
+
+    assert calls == ["integrity_check", "integrity_check"]
+    assert key in kb._INITIALIZED_PATHS
+    assert key in kb._LAST_INTEGRITY_PROBE
+    assert list(tmp_path.glob("kanban.db.corrupt.*")) == []
+
+
+def test_non_index_integrity_corruption_still_fails_closed(tmp_path, monkeypatch):
+    """The reindex path must be narrow: non-index corruption still backs up."""
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    key = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(key)
+    kb._LAST_INTEGRITY_PROBE.pop(key, None)
+
+    monkeypatch.setattr(
+        kb,
+        "_integrity_check_reason",
+        lambda conn, *, pragma="integrity_check": (
+            "integrity_check returned 'database disk image is malformed'"
+        ),
+    )
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(db_path=db_path)
+
+    assert "database disk image is malformed" in excinfo.value.reason
+    assert excinfo.value.backup_path is not None
+    assert excinfo.value.backup_path.exists()
+    assert key not in kb._INITIALIZED_PATHS
+
+
 def test_reprobe_not_run_within_default_interval(tmp_path, monkeypatch):
     """Within the (default 300s) interval a cached path opens exactly one
     sqlite connection — no probe connection on the hot path."""
