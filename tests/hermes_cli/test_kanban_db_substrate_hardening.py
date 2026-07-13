@@ -321,6 +321,83 @@ def test_non_index_integrity_corruption_still_fails_closed(tmp_path, monkeypatch
     assert key not in kb._INITIALIZED_PATHS
 
 
+def test_mixed_integrity_findings_do_not_reindex_before_backup(tmp_path, monkeypatch):
+    """A repairable first finding plus any other finding must fail closed."""
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    key = str(db_path.resolve())
+    kb._INITIALIZED_PATHS.discard(key)
+    kb._LAST_INTEGRITY_PROBE.pop(key, None)
+
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    class TracedConnection:
+        def __init__(self, inner):
+            self.inner = inner
+            self.row_factory = inner.row_factory
+
+        def execute(self, sql, *args, **kwargs):
+            statements.append(str(sql))
+            return self.inner.execute(sql, *args, **kwargs)
+
+        def executescript(self, sql, *args, **kwargs):
+            statements.append(str(sql))
+            return self.inner.executescript(sql, *args, **kwargs)
+
+        def close(self):
+            return self.inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+    def traced_connect(*args, **kwargs):
+        target = str(args[0]) if args else ""
+        conn = real_connect(*args, **kwargs)
+        if not target.startswith("file:"):
+            return TracedConnection(conn)
+        return conn
+
+    monkeypatch.setattr(kb.sqlite3, "connect", traced_connect)
+    monkeypatch.setattr(
+        kb,
+        "_integrity_check_reason",
+        lambda conn, *, pragma="integrity_check": (
+            "integrity_check returned "
+            "['row 15 missing from index idx_lane_heartbeats_state', "
+            "'database disk image is malformed']"
+        ),
+    )
+
+    with pytest.raises(kb.KanbanDbCorruptError) as excinfo:
+        kb.connect(db_path=db_path)
+
+    assert excinfo.value.backup_path is not None
+    assert not any(sql.strip().upper().startswith("REINDEX") for sql in statements)
+    assert key not in kb._INITIALIZED_PATHS
+
+
+def test_integrity_check_reason_preserves_multiple_rows():
+    class FakeCursor:
+        def fetchall(self):
+            return [
+                ("row 15 missing from index idx_lane_heartbeats_state",),
+                ("database disk image is malformed",),
+            ]
+
+    class FakeConnection:
+        def execute(self, sql):
+            assert sql == "PRAGMA integrity_check"
+            return FakeCursor()
+
+    reason = kb._integrity_check_reason(FakeConnection())  # type: ignore[arg-type]
+
+    assert reason is not None
+    assert "row 15 missing from index idx_lane_heartbeats_state" in reason
+    assert "database disk image is malformed" in reason
+    assert getattr(kb, "_index_repair_candidate")(reason) is None
+
+
 def test_reprobe_not_run_within_default_interval(tmp_path, monkeypatch):
     """Within the (default 300s) interval a cached path opens exactly one
     sqlite connection — no probe connection on the hot path."""

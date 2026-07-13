@@ -1103,10 +1103,14 @@ def _integrity_check_reason(
     *,
     pragma: str = "integrity_check",
 ) -> Optional[str]:
-    row = conn.execute(f"PRAGMA {pragma}").fetchone()
-    if not row or (row[0] or "").lower() != "ok":
-        return f"{pragma} returned {row[0] if row else '<no row>'!r}"
-    return None
+    rows = [row[0] for row in conn.execute(f"PRAGMA {pragma}").fetchall()]
+    if len(rows) == 1 and (rows[0] or "").lower() == "ok":
+        return None
+    if not rows:
+        return f"{pragma} returned '<no row>'"
+    if len(rows) == 1:
+        return f"{pragma} returned {rows[0]!r}"
+    return f"{pragma} returned {rows!r}"
 
 
 _INDEX_ROW_MISSING_RE = re.compile(
