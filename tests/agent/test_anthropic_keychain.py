@@ -163,3 +163,39 @@ class TestReadClaudeCodeCredentialsPriority:
             creds = read_claude_code_credentials()
 
         assert creds is None
+
+
+def test_resolve_anthropic_token_loads_secure_claude_code_env_file(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    auth_file = codex_dir / "cc-auth.env"
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=cc-test-token\n")
+    auth_file.chmod(0o600)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
+
+    assert anthropic_adapter.resolve_anthropic_token() == "cc-test-token"
+
+
+def test_resolve_anthropic_token_ignores_world_readable_claude_code_env_file(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+
+    codex_dir = tmp_path / ".codex"
+    codex_dir.mkdir()
+    auth_file = codex_dir / "cc-auth.env"
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=cc-leaky-token\n")
+    auth_file.chmod(0o644)
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
+
+    assert anthropic_adapter.resolve_anthropic_token() is None

@@ -1087,6 +1087,33 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
+def _read_claude_code_oauth_token_env_file() -> Optional[str]:
+    """Read Claude Code setup-token env file for non-interactive runtimes.
+
+    Long-lived launchd/cron lanes do not inherit an interactive shell, but
+    operators commonly persist `claude setup-token` output in
+    `~/.codex/cc-auth.env` for Claude Code headless use.  Load only the exact
+    `CLAUDE_CODE_OAUTH_TOKEN` assignment, require owner-private permissions,
+    and never log the value.
+    """
+    path = Path.home() / ".codex" / "cc-auth.env"
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if st.st_mode & 0o077:
+        return None
+    try:
+        for line in path.read_text().splitlines():
+            if not line.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
+                continue
+            token = line.split("=", 1)[1].strip().strip("'\"")
+            return token or None
+    except OSError:
+        return None
+    return None
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
@@ -1109,8 +1136,12 @@ def resolve_anthropic_token() -> Optional[str]:
             return preferred
         return token
 
-    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens),
+    # with a secure ~/.codex/cc-auth.env fallback for launchd/cron runtimes
+    # that intentionally run with a stripped environment.
+    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip() or (
+        _read_claude_code_oauth_token_env_file() or ""
+    )
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
