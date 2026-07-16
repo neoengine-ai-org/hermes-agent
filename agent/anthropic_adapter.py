@@ -16,6 +16,7 @@ import logging
 import os
 import platform
 import subprocess
+import stat
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1101,7 +1102,7 @@ def _read_claude_code_oauth_token_env_file() -> Optional[str]:
         st = path.stat()
     except OSError:
         return None
-    if st.st_mode & 0o077:
+    if not stat.S_ISREG(st.st_mode) or st.st_mode & 0o077:
         return None
     try:
         for line in path.read_text().splitlines():

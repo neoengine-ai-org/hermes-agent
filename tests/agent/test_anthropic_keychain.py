@@ -199,3 +199,57 @@ def test_resolve_anthropic_token_ignores_world_readable_claude_code_env_file(tmp
     monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
 
     assert anthropic_adapter.resolve_anthropic_token() is None
+
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o644])
+def test_resolve_anthropic_token_rejects_non_owner_private_env_file(tmp_path, monkeypatch, mode):
+    """Any group or other permission on the fallback file fails closed."""
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=file-value\n")
+    auth_file.chmod(mode)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
+
+    assert anthropic_adapter.resolve_anthropic_token() is None
+
+
+def test_resolve_anthropic_token_env_beats_private_file_and_is_not_logged(tmp_path, monkeypatch, caplog):
+    """An explicit process value wins and neither credential value is logged."""
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    file_value = "file-only-value"
+    env_value = "explicit-env-value"
+    auth_file.write_text(f"CLAUDE_CODE_OAUTH_TOKEN={file_value}\n")
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", env_value)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
+
+    assert anthropic_adapter.resolve_anthropic_token() == env_value
+    assert file_value not in caplog.text
+    assert env_value not in caplog.text
+
+
+def test_resolve_anthropic_token_rejects_non_regular_env_file(tmp_path, monkeypatch):
+    """The fallback must be a private regular file, not a directory or device."""
+    from agent import anthropic_adapter
+
+    (tmp_path / ".codex" / "cc-auth.env").mkdir(parents=True)
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
+
+    assert anthropic_adapter.resolve_anthropic_token() is None
