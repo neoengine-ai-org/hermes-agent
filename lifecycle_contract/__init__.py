@@ -100,7 +100,7 @@ class LifecycleEvent:
     evidence_digest: str
     lifecycle_state: LifecycleState
     authority_class: AuthorityClass
-    non_claims: tuple[str, ...]
+    non_claims: tuple[str, ...] | list[str]
     schema_version: str
 
     def __post_init__(self) -> None:
@@ -122,12 +122,18 @@ class LifecycleEvent:
             raise ValueError("commit_sha must be an exact lowercase 40-character SHA")
         if not _SHA256_RE.fullmatch(self.evidence_digest):
             raise ValueError("evidence_digest must be a lowercase SHA-256")
+        if not isinstance(self.lifecycle_state, LifecycleState):
+            raise ValueError("lifecycle_state must be a LifecycleState")
         if self.authority_class is not AuthorityClass.OBSERVATION:
             raise ValueError(
                 "authority escalation is prohibited by the neutral contract"
             )
-        if not self.non_claims or any(not claim for claim in self.non_claims):
-            raise ValueError("non_claims are required")
+        if (
+            not isinstance(self.non_claims, (tuple, list))
+            or not self.non_claims
+            or any(not isinstance(claim, str) or not claim for claim in self.non_claims)
+        ):
+            raise ValueError("non_claims must be a non-empty tuple or list of non-empty strings")
 
 
 class LifecycleAdapter(Protocol):

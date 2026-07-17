@@ -98,3 +98,36 @@ def test_compatibility_is_pinned_to_neoengine_799_head():
     assert COMPATIBILITY_REFERENCE.issue == "NeoEngine #799"
     assert COMPATIBILITY_REFERENCE.head == "96a051f2075aaece4f8741dae09425cbf2458a04"
     assert COMPATIBILITY_REFERENCE.schema_digest
+
+
+@pytest.mark.parametrize("invalid_state", ["observed", "unknown", None, object()])
+def test_event_rejects_non_enum_lifecycle_state_at_runtime(invalid_state):
+    with pytest.raises(ValueError, match="lifecycle_state"):
+        replace(synthetic_lifecycle_event(), lifecycle_state=invalid_state)
+
+
+@pytest.mark.parametrize(
+    "invalid_non_claims",
+    [
+        (),
+        [],
+        "No action is authorized.",
+        {"No action is authorized."},
+        iter(("No action is authorized.",)),
+        ("",),
+        [""],
+        (1,),
+        [None],
+    ],
+)
+def test_event_requires_non_empty_tuple_or_list_of_non_empty_strings(invalid_non_claims):
+    with pytest.raises(ValueError, match="non_claims"):
+        replace(synthetic_lifecycle_event(), non_claims=invalid_non_claims)
+
+
+@pytest.mark.parametrize(
+    "valid_non_claims",
+    [("No action is authorized.",), ["No action is authorized."]],
+)
+def test_event_accepts_tuple_or_list_non_claims_of_non_empty_strings(valid_non_claims):
+    assert replace(synthetic_lifecycle_event(), non_claims=valid_non_claims).non_claims == valid_non_claims
