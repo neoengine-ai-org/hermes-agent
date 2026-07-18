@@ -11,7 +11,7 @@ from gateway.runtime.provider_error_sanitizer import (
     looks_like_gateway_provider_error,
 )
 
-TELEGRAM_NOISY_STATUS_RE = re.compile(
+CHAT_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
     r"|compression\s+summary\s+failed"
@@ -31,9 +31,15 @@ TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+# Backward-compatible import surface for gateway.run and third-party plugins.
+TELEGRAM_NOISY_STATUS_RE = CHAT_NOISY_STATUS_RE
+
 GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
     {"local", "api_server", "webhook", "msgraph_webhook"}
 )
+# These are programmatic payload/log surfaces, not human chat delivery. If the
+# MS Graph adapter begins sending directly to Teams, remove it from this list
+# so status text is redacted and filtered before delivery.
 
 
 def prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> str | None:
@@ -48,7 +54,7 @@ def prepare_gateway_status_message(platform: Any, event_type: str, message: str)
         return text
 
     text = redact_gateway_user_facing_secrets(text)
-    if TELEGRAM_NOISY_STATUS_RE.search(text):
+    if CHAT_NOISY_STATUS_RE.search(text):
         return None
     if looks_like_gateway_provider_error(text):
         return gateway_provider_error_reply(text)

@@ -25,6 +25,23 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _connect_kanban_with_lock_retry(kb, board: Optional[str], attempts: int = 3):
+    """Retry transient attach-lock timeouts for notifier cursor writes."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return kb.connect(board=board)
+        except kb.KanbanInitLockTimeout:
+            if attempt >= attempts:
+                raise
+            logger.warning(
+                "kanban notifier attach lock busy; retrying cursor operation "
+                "(%d/%d)",
+                attempt,
+                attempts,
+            )
+            time.sleep(0.1 * attempt)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -582,7 +599,7 @@ class GatewayKanbanWatchersMixin:
         subscription. Unsub cursors in one board can't touch another's.
         """
         from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+        conn = _connect_kanban_with_lock_retry(_kb, board)
         try:
             _kb.advance_notify_cursor(
                 conn,
@@ -597,7 +614,7 @@ class GatewayKanbanWatchersMixin:
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+        conn = _connect_kanban_with_lock_retry(_kb, board)
         try:
             _kb.remove_notify_sub(
                 conn,
@@ -618,7 +635,7 @@ class GatewayKanbanWatchersMixin:
     ) -> None:
         """Sync helper: undo a claimed notification cursor after send failure."""
         from hermes_cli import kanban_db as _kb
-        conn = _kb.connect(board=board)
+        conn = _connect_kanban_with_lock_retry(_kb, board)
         try:
             _kb.rewind_notify_cursor(
                 conn,

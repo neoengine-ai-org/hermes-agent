@@ -2208,20 +2208,12 @@ def _output_rotation_min_age_seconds() -> float:
 
 
 def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
-    """Delete oldest outputs beyond the hard cap.
-
-    The age floor prioritizes old files for removal, but it must never let a
-    high-frequency job grow without bound. If there are not enough old files
-    to satisfy the count cap, the oldest young files are removed as well.
-    """
+    """Delete the oldest outputs beyond the hard count cap."""
     if keep <= 0:
         return
     try:
         if job_output_dir.is_symlink():
             return
-        import time as _time
-
-        age_cutoff = _time.time() - _output_rotation_min_age_seconds()
         outputs = sorted(
             (
                 path
@@ -2231,9 +2223,7 @@ def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
             key=lambda path: (path.stat().st_mtime, path.name),
         )
         excess = max(0, len(outputs) - keep)
-        old = [path for path in outputs if path.stat().st_mtime < age_cutoff]
-        young = [path for path in outputs if path.stat().st_mtime >= age_cutoff]
-        for stale in (old + young)[:excess]:
+        for stale in outputs[:excess]:
             try:
                 stale.unlink()
             except OSError:

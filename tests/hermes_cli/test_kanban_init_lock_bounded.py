@@ -95,3 +95,35 @@ def test_first_init_connect_fails_closed_when_lock_held(kanban_home, monkeypatch
     finally:
         release.set()
         t.join(timeout=5)
+
+
+@pytest.mark.skipif(kb.fcntl is None, reason="POSIX flock required")
+def test_initialized_connect_fails_closed_during_exclusive_maintenance(
+    kanban_home, monkeypatch,
+):
+    """A cached fast-path connect must not bypass an offline DB swap."""
+    monkeypatch.setattr(kb, "_INIT_LOCK_TIMEOUT_SECONDS", 0.6)
+    db_path = kb.kanban_db_path(board="default")
+    kb.connect().close()
+    assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def _maintenance():
+        with kb.exclusive_maintenance_lock(db_path):
+            holding.set()
+            release.wait(timeout=10)
+
+    thread = threading.Thread(target=_maintenance, daemon=True)
+    thread.start()
+    assert holding.wait(timeout=5)
+    try:
+        start = time.monotonic()
+        with pytest.raises(kb.KanbanInitLockTimeout):
+            kb.connect()
+        elapsed = time.monotonic() - start
+        assert 0.4 <= elapsed < 3.0
+    finally:
+        release.set()
+        thread.join(timeout=5)

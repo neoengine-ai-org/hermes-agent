@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import inspect
 
-from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.kanban_watchers import (
+    GatewayKanbanWatchersMixin,
+    _connect_kanban_with_lock_retry,
+)
 
 KANBAN_METHODS = [
     "_kanban_notifier_watcher",
@@ -43,6 +46,28 @@ def test_watcher_loops_are_coroutines():
     # The two long-running watchers are async loops.
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_notifier_watcher)
     assert inspect.iscoroutinefunction(GatewayKanbanWatchersMixin._kanban_dispatcher_watcher)
+
+
+def test_cursor_connect_retries_transient_attach_lock(monkeypatch):
+    from hermes_cli import kanban_db as kb
+
+    sentinel = object()
+    attempts = {"count": 0}
+
+    class FakeKb:
+        KanbanInitLockTimeout = kb.KanbanInitLockTimeout
+
+        @staticmethod
+        def connect(*, board=None):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise kb.KanbanInitLockTimeout("maintenance in progress")
+            assert board == "default"
+            return sentinel
+
+    monkeypatch.setattr("gateway.kanban_watchers.time.sleep", lambda _delay: None)
+    assert _connect_kanban_with_lock_retry(FakeKb, "default") is sentinel
+    assert attempts["count"] == 3
 
 
 def test_singleton_dispatcher_lock_is_exclusive(tmp_path):

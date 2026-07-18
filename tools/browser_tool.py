@@ -2678,11 +2678,7 @@ def _extract_relevant_content(
         call_kwargs = {
             "task": "web_extract",
             "messages": [{"role": "user", "content": extraction_prompt}],
-            "max_tokens": resolve_llm_max_tokens(
-                2048,
-                prompt=extraction_prompt,
-                task_type="browser snapshot extraction",
-            ),
+            "max_tokens": resolve_llm_max_tokens(2048),
             "temperature": 0.1,
         }
         model = _get_extraction_model()
@@ -4243,11 +4239,7 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
                     ],
                 }
             ],
-            "max_tokens": resolve_llm_max_tokens(
-                1024,
-                prompt=vision_prompt,
-                task_type="browser screenshot vision",
-            ),
+            "max_tokens": resolve_llm_max_tokens(1024),
             "temperature": vision_temperature,
             "timeout": vision_timeout,
         }
