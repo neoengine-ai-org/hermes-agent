@@ -7,6 +7,7 @@ import logging
 import os
 import posixpath
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -604,6 +605,22 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    # macOS places the per-user temporary directory below
+    # /private/var/folders/.../T. That is an ordinary scratch workspace, not
+    # protected system state, and ACP edit approval intentionally permits it.
+    # Check the canonical OS temp root before the broader /private/var guard;
+    # every sibling under /private/var remains protected.
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        resolved_real = os.path.realpath(resolved)
+        normalized_real = os.path.realpath(normalized)
+        if any(
+            candidate == temp_root or candidate.startswith(temp_root + os.sep)
+            for candidate in (resolved_real, normalized_real)
+        ):
+            return None
+    except (OSError, ValueError):
+        pass
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err
