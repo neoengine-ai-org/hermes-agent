@@ -49,12 +49,12 @@ def test_status_message_filter_facade_delegates_without_changing_contract(monkey
     assert calls == [(Platform.TELEGRAM, "lifecycle", "raw status")]
 
 
-def test_status_message_filter_facade_preserves_existing_behavior():
-    """The old gateway.run helper remains behavior-compatible for callers/tests."""
+def test_status_message_filter_facade_applies_chat_safety_policy():
+    """The facade suppresses operational noise on every chat surface."""
     noisy = "⏳ Retrying in 4.2s (attempt 1/3)..."
 
     assert gateway_run._prepare_gateway_status_message(Platform.TELEGRAM, "warn", noisy) is None
-    assert gateway_run._prepare_gateway_status_message(Platform.DISCORD, "warn", noisy) == noisy
+    assert gateway_run._prepare_gateway_status_message(Platform.DISCORD, "warn", noisy) is None
 
 
 def test_auto_resume_freshness_facade_preserves_private_import_surface():

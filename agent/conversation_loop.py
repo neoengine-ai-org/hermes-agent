@@ -4081,9 +4081,9 @@ def run_conversation(
                         conversation_history = None
                         if len(messages) < original_len:
                             retry_count = 0
-                            primary_recovery_attempted = False
+                            _retry.primary_recovery_attempted = False
                             time.sleep(2)
-                            restart_with_compressed_messages = True
+                            _retry.restart_with_compressed_messages = True
                             break
 
                     # Before falling back, try rebuilding the primary

@@ -31,7 +31,7 @@ Three distinct failure modes the user community hit during rollout:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -308,11 +308,11 @@ def test_codex_stream_nonetype_iterable_typeerror_falls_back():
     agent = _make_codex_agent()
 
     mock_client = MagicMock()
-    mock_client.responses.stream.side_effect = TypeError("'NoneType' object is not iterable")
+    mock_client.responses.create.side_effect = TypeError("'NoneType' object is not iterable")
 
     fallback_response = SimpleNamespace(output=[], status="completed")
     with patch.object(
-        agent, "_run_codex_create_stream_fallback", return_value=fallback_response
+        agent, "_run_codex_raw_sse_fallback", return_value=fallback_response
     ) as mock_fallback:
         result = agent._run_codex_stream({}, client=mock_client)
 
@@ -321,25 +321,19 @@ def test_codex_stream_nonetype_iterable_typeerror_falls_back():
 
 
 def test_codex_stream_nonetype_iterable_typeerror_uses_raw_sse_after_stream_fallback_breaks():
-    """If both SDK streaming paths hit the parser bug, use raw SSE parsing."""
+    """The unified SDK stream path falls back directly to raw SSE parsing."""
     agent = _make_codex_agent()
 
     mock_client = MagicMock()
-    mock_client.responses.stream.side_effect = TypeError("'NoneType' object is not iterable")
+    mock_client.responses.create.side_effect = TypeError("'NoneType' object is not iterable")
 
     fallback_response = SimpleNamespace(output=[], status="completed")
     with patch.object(
-        agent,
-        "_run_codex_create_stream_fallback",
-        side_effect=TypeError("'NoneType' object is not iterable"),
-    ) as mock_stream_fallback:
-        with patch.object(
-            agent, "_run_codex_raw_sse_fallback", return_value=fallback_response
-        ) as mock_raw_sse_fallback:
-            result = agent._run_codex_stream({}, client=mock_client)
+        agent, "_run_codex_raw_sse_fallback", return_value=fallback_response
+    ) as mock_raw_sse_fallback:
+        result = agent._run_codex_stream({}, client=mock_client)
 
     assert result is fallback_response
-    mock_stream_fallback.assert_called_once_with({}, client=mock_client)
     mock_raw_sse_fallback.assert_called_once_with({}, client=mock_client)
 
 
@@ -348,23 +342,17 @@ def test_codex_stream_prelude_error_uses_raw_sse_after_stream_fallback_typeerror
     agent = _make_codex_agent()
 
     mock_client = MagicMock()
-    mock_client.responses.stream.side_effect = RuntimeError(
+    mock_client.responses.create.side_effect = RuntimeError(
         "Expected to have received `response.created` before `error`"
     )
 
     fallback_response = SimpleNamespace(output=[], status="completed")
     with patch.object(
-        agent,
-        "_run_codex_create_stream_fallback",
-        side_effect=TypeError("'NoneType' object is not iterable"),
-    ) as mock_stream_fallback:
-        with patch.object(
-            agent, "_run_codex_raw_sse_fallback", return_value=fallback_response
-        ) as mock_raw_sse_fallback:
-            result = agent._run_codex_stream({}, client=mock_client)
+        agent, "_run_codex_raw_sse_fallback", return_value=fallback_response
+    ) as mock_raw_sse_fallback:
+        result = agent._run_codex_stream({}, client=mock_client)
 
     assert result is fallback_response
-    mock_stream_fallback.assert_called_once_with({}, client=mock_client)
     mock_raw_sse_fallback.assert_called_once_with({}, client=mock_client)
 
 

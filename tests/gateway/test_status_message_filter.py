@@ -20,11 +20,11 @@ def test_status_filter_suppresses_telegram_auxiliary_and_retry_noise():
         assert prepare_gateway_status_message(Platform.TELEGRAM, "warn", message) is None
 
 
-def test_status_filter_keeps_non_telegram_messages_unchanged():
-    """The extracted seam must not change Discord/local diagnostics."""
+def test_status_filter_protects_chat_and_keeps_local_diagnostics():
+    """Chat suppresses noise while local/programmatic diagnostics stay raw."""
     message = "  ⏳ Retrying in 4.2s (attempt 1/3)...  "
 
-    assert prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) == message.strip()
+    assert prepare_gateway_status_message(Platform.DISCORD, "lifecycle", message) is None
     assert prepare_gateway_status_message("local", "lifecycle", message) == message.strip()
 
 

@@ -1216,6 +1216,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
+        except TypeError as exc:
+            if "NoneType" in str(exc) and "not iterable" in str(exc):
+                return agent._run_codex_raw_sse_fallback(
+                    api_kwargs, client=active_client
+                )
+            raise
+        except RuntimeError as exc:
+            if "response.created" in str(exc) and "error" in str(exc):
+                return agent._run_codex_raw_sse_fallback(
+                    api_kwargs, client=active_client
+                )
+            raise
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
@@ -1271,6 +1283,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,
                 )
+            except TypeError as exc:
+                if "NoneType" in str(exc) and "not iterable" in str(exc):
+                    return agent._run_codex_raw_sse_fallback(
+                        api_kwargs, client=active_client
+                    )
+                raise
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 if attempt < max_stream_retries:
                     logger.debug(
@@ -1301,6 +1319,193 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     pass
 
 
+class _RawCodexNamespace(SimpleNamespace):
+    def to_dict(self) -> dict:
+        return _to_plain_dict(self)
+
+
+def _to_plain_dict(value: Any) -> Any:
+    if isinstance(value, SimpleNamespace):
+        return {key: _to_plain_dict(item) for key, item in vars(value).items()}
+    if isinstance(value, list):
+        return [_to_plain_dict(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _to_plain_dict(item) for key, item in value.items()}
+    return value
+
+
+def _to_raw_namespace(value: Any) -> Any:
+    if isinstance(value, dict):
+        return _RawCodexNamespace(
+            **{key: _to_raw_namespace(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return [_to_raw_namespace(item) for item in value]
+    return value
+
+
+def _synthesize_message_item(text: str) -> dict[str, Any]:
+    return {
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text}],
+    }
+
+
+def _read_httpx_stream_error_body(response: Any) -> str:
+    try:
+        raw_body = response.read()
+    except Exception:
+        return str(getattr(response, "text", "") or "")
+    if isinstance(raw_body, bytes):
+        encoding = getattr(response, "encoding", None) or "utf-8"
+        return raw_body.decode(encoding, errors="replace")
+    return str(raw_body or "")
+
+
+def _header_items(source: Any) -> list[tuple[Any, Any]]:
+    if source is None:
+        return []
+    try:
+        return list(dict(source).items())
+    except Exception:
+        items = getattr(source, "items", None)
+        if callable(items):
+            try:
+                return list(items())
+            except Exception:
+                return []
+    return []
+
+
+def run_codex_raw_sse_fallback(agent, api_kwargs: dict, client: Any = None):
+    """Parse Responses SSE directly when the SDK stream parser breaks."""
+    import httpx as _httpx
+
+    active_client = client or agent._ensure_primary_openai_client(
+        reason="codex_raw_sse_fallback"
+    )
+    fallback_kwargs = dict(api_kwargs)
+    fallback_kwargs["stream"] = True
+    fallback_kwargs = agent._get_transport().preflight_kwargs(
+        fallback_kwargs, allow_stream=True
+    )
+
+    request_body = dict(fallback_kwargs)
+    extra_headers = request_body.pop("extra_headers", None)
+    extra_body = request_body.pop("extra_body", None)
+    if isinstance(extra_body, dict):
+        request_body.update(extra_body)
+
+    headers: dict[str, str] = {}
+    for source in (
+        getattr(active_client, "default_headers", None),
+        getattr(active_client, "auth_headers", None),
+        extra_headers,
+    ):
+        headers.update(
+            {
+                str(key): str(value)
+                for key, value in _header_items(source)
+                if value is not None
+            }
+        )
+    if not any(key.lower() == "content-type" for key in headers):
+        headers["Content-Type"] = "application/json"
+
+    base_url = str(getattr(active_client, "base_url", "")).rstrip("/")
+    if not base_url:
+        raise RuntimeError("Codex raw SSE fallback missing client base_url.")
+
+    terminal_response: dict[str, Any] | None = None
+    collected_output_items: list[dict[str, Any]] = []
+    collected_text_deltas: list[str] = []
+    with _httpx.Client(timeout=600) as http_client:
+        with http_client.stream(
+            "POST",
+            f"{base_url}/responses",
+            headers=headers,
+            json=request_body,
+        ) as response:
+            if response.status_code >= 400:
+                body = _read_httpx_stream_error_body(response)
+                try:
+                    body = json.dumps(json.loads(body), ensure_ascii=False)
+                except Exception:
+                    pass
+                raise RuntimeError(f"HTTP {response.status_code}: {body}")
+
+            for line in response.iter_lines():
+                if agent._interrupt_requested:
+                    raise InterruptedError(
+                        "Agent interrupted during Codex raw SSE fallback"
+                    )
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "Codex raw SSE fallback skipped non-JSON event: %s",
+                        payload[:200],
+                    )
+                    continue
+
+                event_type = str(event.get("type") or "")
+                agent._touch_activity("receiving raw SSE response")
+                if event_type == "error":
+                    from run_agent import _StreamErrorEvent
+
+                    raise _StreamErrorEvent(
+                        str(event.get("message") or "stream emitted error event").strip(),
+                        code=event.get("code"),
+                        param=event.get("param"),
+                    )
+                if event_type == "response.output_text.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        collected_text_deltas.append(delta)
+                        agent._fire_stream_delta(delta)
+                elif event_type == "response.output_text.done":
+                    text = event.get("text")
+                    if isinstance(text, str) and text and not collected_text_deltas:
+                        collected_text_deltas.append(text)
+                elif event_type == "response.output_item.done":
+                    item = event.get("item")
+                    if isinstance(item, dict):
+                        collected_output_items.append(item)
+                elif event_type in {
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                }:
+                    response_obj = event.get("response")
+                    if isinstance(response_obj, dict):
+                        terminal_response = response_obj
+                    if event_type == "response.completed":
+                        break
+
+    if terminal_response is None:
+        terminal_response = {"status": "completed"}
+    output = terminal_response.get("output")
+    if not isinstance(output, list) or not output:
+        if collected_output_items:
+            terminal_response["output"] = collected_output_items
+        elif collected_text_deltas:
+            terminal_response["output"] = [
+                _synthesize_message_item("".join(collected_text_deltas))
+            ]
+        elif output is None:
+            terminal_response["output"] = []
+    if "output_text" not in terminal_response and collected_text_deltas:
+        terminal_response["output_text"] = "".join(collected_text_deltas)
+    return _to_raw_namespace(terminal_response)
+
+
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):
     """Backward-compatible alias for the unified event-driven path.
 
@@ -1316,6 +1521,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
 __all__ = [
     "run_codex_app_server_turn",
     "run_codex_stream",
+    "run_codex_raw_sse_fallback",
     "run_codex_create_stream_fallback",
     "_consume_codex_event_stream",
     "make_codex_app_server_event_bridge",
