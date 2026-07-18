@@ -2197,16 +2197,6 @@ def _output_keep_last() -> int:
         return _CRON_OUTPUT_DEFAULT_KEEP
 
 
-def _output_rotation_min_age_seconds() -> float:
-    """Return the age floor below which write-time rotation cannot delete."""
-    raw = os.environ.get("HERMES_CRON_OUTPUT_MIN_AGE_DAYS", "").strip()
-    try:
-        days = float(raw) if raw else 30.0
-    except ValueError:
-        days = 30.0
-    return max(0.0, days) * 86400.0
-
-
 def _rotate_job_output(job_output_dir: Path, keep: int) -> None:
     """Delete the oldest outputs beyond the hard count cap."""
     if keep <= 0:

@@ -48,12 +48,10 @@ lane liveness; state.db uses 30d row retention).
 
 Additionally, `cron/jobs.py:save_job_output` rotates at write time as a
 **safety valve for runaway jobs only**: outputs beyond the newest
-`HERMES_CRON_OUTPUT_KEEP` (default 500) AND older than
-`HERMES_CRON_OUTPUT_MIN_AGE_DAYS` (default 30) are dropped without archive.
-Because the archive-first sweep handles everything older than 14 days
-weekly, rotation only ever fires on outputs the sweep failed to visit for
-over a month. Rotation refuses traversal job ids and symlinked output
-roots, honors the retention kill switches, and sorts by mtime.
+`HERMES_CRON_OUTPUT_KEEP` (default 500) are dropped without archive,
+oldest first. The hard count cap is authoritative even for high-frequency
+jobs whose outputs are all recent. Rotation refuses traversal job ids and
+symlinked output roots, honors the retention kill switches, and sorts by mtime.
 
 ### Why not the existing `maybe_auto_prune_and_vacuum`?
 

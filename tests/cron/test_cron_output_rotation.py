@@ -11,8 +11,6 @@ def tmp_output(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
-    # most tests exercise the count cap; the age floor has its own test
-    monkeypatch.setenv("HERMES_CRON_OUTPUT_MIN_AGE_DAYS", "0")
     return tmp_path / "cron" / "output"
 
 
@@ -35,16 +33,14 @@ def test_rotation_caps_outputs(tmp_output, monkeypatch):
     assert "2026-01-03_00-00-00.md" not in outputs
 
 
-def test_rotation_age_floor_never_defeats_hard_cap(tmp_output, monkeypatch):
+def test_rotation_hard_cap_applies_to_young_outputs(tmp_output, monkeypatch):
     monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "1")
-    monkeypatch.setenv("HERMES_CRON_OUTPUT_MIN_AGE_DAYS", "30")
     job_dir = tmp_output / "job-young"
     job_dir.mkdir(parents=True)
     for i in range(5):
         (job_dir / f"2026-01-0{i + 1}_00-00-00.md").write_text(f"run {i}")
     jobs.save_job_output("job-young", "newest run")
-    # All files are younger than the floor, but the count cap remains the
-    # authoritative disk-fill backstop for high-frequency jobs.
+    # Recently written files still obey the authoritative disk-fill backstop.
     assert len(_run_outputs("job-young")) == 1
 
 
