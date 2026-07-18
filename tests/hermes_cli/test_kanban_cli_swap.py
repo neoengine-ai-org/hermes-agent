@@ -276,6 +276,7 @@ def test_swap_backup_dir(tmp_path, capsys):
 
 
 @requires_lsof
+@pytest.mark.live_system_guard_bypass
 def test_swap_refuses_while_writer_attached(tmp_path, capsys):
     db = tmp_path / "k.db"
     _make_healthy_db(db, rows=9)
@@ -443,6 +444,7 @@ def test_swap_atomically_restores_on_post_swap_corruption(tmp_path, capsys, monk
 
 
 @requires_lsof
+@pytest.mark.live_system_guard_bypass
 def test_swap_force_overrides_attached_writer(tmp_path, capsys):
     db = tmp_path / "k.db"
     _make_healthy_db(db, rows=9)

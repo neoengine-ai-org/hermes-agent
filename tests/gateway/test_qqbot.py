@@ -1,15 +1,13 @@
 """Tests for the QQ Bot platform adapter."""
 
 import asyncio
-import json
 import os
-import sys
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +57,7 @@ class TestQQAdapterInit:
 
     def test_dm_policy_default(self):
         adapter = self._make(app_id="a", client_secret="b")
-        assert adapter._dm_policy == "open"
+        assert adapter._dm_policy == "pairing"
 
     def test_dm_policy_explicit(self):
         adapter = self._make(app_id="a", client_secret="b", dm_policy="allowlist")
@@ -67,7 +65,7 @@ class TestQQAdapterInit:
 
     def test_group_policy_default(self):
         adapter = self._make(app_id="a", client_secret="b")
-        assert adapter._group_policy == "open"
+        assert adapter._group_policy == "pairing"
 
     def test_allow_from_parsing_string(self):
         adapter = self._make(app_id="a", client_secret="b", allow_from="x, y , z")
@@ -192,6 +190,21 @@ class TestVoiceAttachmentSSRFProtection:
         assert kwargs.get("follow_redirects") is True
         assert kwargs.get("event_hooks", {}).get("response") == [_ssrf_redirect_guard]
 
+    def test_connect_accepts_is_reconnect_param(self):
+        """connect() must accept is_reconnect for interface conformance with
+        the base adapter, which the reconnect watcher calls with
+        is_reconnect=True."""
+        from gateway.platforms.qqbot import QQAdapter
+
+        adapter = QQAdapter(_make_config(app_id="a", client_secret="b"))
+        adapter._ensure_token = mock.AsyncMock(side_effect=RuntimeError("stop after client init"))
+
+        # Both forms must not raise TypeError.
+        connected_default = asyncio.run(adapter.connect())
+        connected_explicit = asyncio.run(adapter.connect(is_reconnect=True))
+        assert connected_default is False
+        assert connected_explicit is False
+
 
 # ---------------------------------------------------------------------------
 # WebSocket proxy handling
@@ -269,9 +282,15 @@ class TestDmAllowed:
         from gateway.platforms.qqbot import QQAdapter
         return QQAdapter(_make_config(**extra))
 
-    def test_open_policy(self):
+    def test_open_policy_requires_opt_in(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b", dm_policy="open")
+        assert adapter._is_dm_allowed("any_user") is False
+
+    def test_open_policy_with_opt_in(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_ALLOW_ALL_USERS", "true")
         adapter = self._make_adapter(app_id="a", client_secret="b", dm_policy="open")
         assert adapter._is_dm_allowed("any_user") is True
+        assert adapter._is_dm_intake_allowed("any_user") is True
 
     def test_disabled_policy(self):
         adapter = self._make_adapter(app_id="a", client_secret="b", dm_policy="disabled")
@@ -311,6 +330,19 @@ class TestGroupAllowed:
         adapter = self._make_adapter(app_id="a", client_secret="b", group_policy="allowlist", group_allow_from="grp1")
         assert adapter._is_group_allowed("grp2", "user1") is False
 
+    def test_pairing_default_blocks_groups(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        assert adapter._group_policy == "pairing"
+        assert adapter._is_group_allowed("grp1", "user1") is False
+
+    def test_pairing_default_strict_dm_auth_denies_unknown(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        assert adapter._dm_policy == "pairing"
+        assert adapter._is_dm_allowed("any_user") is False
+
+    def test_pairing_default_forwards_dm_to_gateway_intake(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        assert adapter._is_dm_intake_allowed("any_user") is True
 
 # ---------------------------------------------------------------------------
 # _resolve_stt_config
@@ -1233,14 +1265,14 @@ class TestAdapterInteractionDispatch:
             "user_openid": "user-1",
             "data": {
                 "type": 11,
-                "resolved": {"button_data": "approve:s:deny", "button_id": "deny"},
+                "resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:deny", "button_id": "deny"},
             },
         })
 
         assert len(ack_calls) == 1
         assert ack_calls[0][0] == "i-1"
         assert len(received) == 1
-        assert received[0].button_data == "approve:s:deny"
+        assert received[0].button_data == "approve:agent:main:qqbot:c2c:u:deny"
         assert received[0].scene == "c2c"
 
     @pytest.mark.asyncio
@@ -1262,7 +1294,7 @@ class TestAdapterInteractionDispatch:
         adapter.set_interaction_callback(cb)
         await adapter._on_interaction({
             "chat_type": 2,  # no id
-            "data": {"resolved": {"button_data": "approve:s:deny"}},
+            "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:deny"}},
         })
 
         assert ack_calls == []
@@ -1286,7 +1318,7 @@ class TestAdapterInteractionDispatch:
             "id": "i-2",
             "chat_type": 2,
             "user_openid": "u",
-            "data": {"resolved": {"button_data": "approve:s:deny"}},
+            "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:deny"}},
         })
 
     @pytest.mark.asyncio
@@ -1304,7 +1336,7 @@ class TestAdapterInteractionDispatch:
             "id": "i-3",
             "chat_type": 2,
             "user_openid": "u",
-            "data": {"resolved": {"button_data": "approve:s:deny"}},
+            "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:deny"}},
         })
 
 
@@ -1570,13 +1602,13 @@ class TestDefaultInteractionDispatch:
                 "id": "i",
                 "chat_type": 2,
                 "user_openid": "u-42",
-                "data": {"resolved": {"button_data": "approve:sess-abc:allow-once"}},
+                "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u-42:allow-once"}},
             })
             await adapter._default_interaction_dispatch(event)
         finally:
             tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("sess-abc", "once", False)]
+        assert resolve_calls == [("agent:main:qqbot:c2c:u-42", "once", False)]
 
     @pytest.mark.asyncio
     async def test_approval_click_always_maps_to_always(self):
@@ -1594,13 +1626,13 @@ class TestDefaultInteractionDispatch:
             from gateway.platforms.qqbot.keyboards import parse_interaction_event
             event = parse_interaction_event({
                 "id": "i", "chat_type": 2, "user_openid": "u",
-                "data": {"resolved": {"button_data": "approve:s:allow-always"}},
+                "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:allow-always"}},
             })
             await adapter._default_interaction_dispatch(event)
         finally:
             tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("s", "always", False)]
+        assert resolve_calls == [("agent:main:qqbot:c2c:u", "always", False)]
 
     @pytest.mark.asyncio
     async def test_approval_click_deny_maps_to_deny(self):
@@ -1618,13 +1650,40 @@ class TestDefaultInteractionDispatch:
             from gateway.platforms.qqbot.keyboards import parse_interaction_event
             event = parse_interaction_event({
                 "id": "i", "chat_type": 2, "user_openid": "u",
-                "data": {"resolved": {"button_data": "approve:s:deny"}},
+                "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:deny"}},
             })
             await adapter._default_interaction_dispatch(event)
         finally:
             tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("s", "deny", False)]
+        assert resolve_calls == [("agent:main:qqbot:c2c:u", "deny", False)]
+
+
+    @pytest.mark.asyncio
+    async def test_approval_click_rejects_unauthorized_operator(self):
+        adapter = self._make_adapter()
+        resolve_calls = []
+
+        def fake_resolve(session_key, choice, resolve_all=False):
+            resolve_calls.append((session_key, choice, resolve_all))
+            return 1
+
+        import tools.approval
+        orig = tools.approval.resolve_gateway_approval
+        tools.approval.resolve_gateway_approval = fake_resolve
+        try:
+            from gateway.platforms.qqbot.keyboards import parse_interaction_event
+            event = parse_interaction_event({
+                "id": "i", "chat_type": 1,
+                "group_openid": "g-1",
+                "group_member_openid": "attacker",
+                "data": {"resolved": {"button_data": "approve:agent:main:qqbot:group:g-1:owner:allow-once"}},
+            })
+            await adapter._default_interaction_dispatch(event)
+        finally:
+            tools.approval.resolve_gateway_approval = orig
+
+        assert resolve_calls == []
 
     @pytest.mark.asyncio
     async def test_update_prompt_click_writes_response_file(self, tmp_path, monkeypatch):
@@ -1700,7 +1759,7 @@ class TestDefaultInteractionDispatch:
             from gateway.platforms.qqbot.keyboards import parse_interaction_event
             event = parse_interaction_event({
                 "id": "i", "chat_type": 2, "user_openid": "u",
-                "data": {"resolved": {"button_data": "approve:s:deny"}},
+                "data": {"resolved": {"button_data": "approve:agent:main:qqbot:c2c:u:deny"}},
             })
             # Must not raise.
             await adapter._default_interaction_dispatch(event)
@@ -2172,3 +2231,26 @@ class TestCloseCodeClassification:
         assert 4001 in fatal_codes
         assert 4915 in fatal_codes
 
+
+class TestReadEventsClosedWsGuard:
+    """Regression: a closed-but-non-None ws must raise on entry, not return
+    normally, so _listen_loop goes through reconnect/backoff instead of
+    busy-looping at 100% CPU (issues #31193 / #31771)."""
+
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b", **extra))
+
+    def test_read_events_raises_when_ws_closed_on_entry(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+        adapter._ws = SimpleNamespace(closed=True)
+        with pytest.raises(RuntimeError):
+            asyncio.run(adapter._read_events())
+
+    def test_read_events_raises_when_ws_none(self):
+        adapter = self._make_adapter()
+        adapter._running = True
+        adapter._ws = None
+        with pytest.raises(RuntimeError):
+            asyncio.run(adapter._read_events())

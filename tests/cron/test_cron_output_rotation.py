@@ -59,6 +59,7 @@ def test_rotation_disabled_with_zero(tmp_output, monkeypatch):
 
 
 def test_rotation_default_and_garbage_env(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
     monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "not-a-number")
     assert jobs._output_keep_last() == 500
     monkeypatch.delenv("HERMES_CRON_OUTPUT_KEEP")
@@ -74,8 +75,9 @@ def test_rotation_never_escapes_output_dir(tmp_output, monkeypatch):
     for i in range(5):
         (outside / f"doc-{i}.md").write_text("must survive")
     # a hand-edited traversal job id must not rotate outside OUTPUT_DIR
-    jobs.save_job_output("../../outside", "attack")
-    assert len(list(outside.glob("*.md"))) == 6  # 5 docs + the new output
+    with pytest.raises(ValueError, match="Invalid cron job id"):
+        jobs.save_job_output("../../outside", "attack")
+    assert len(list(outside.glob("*.md"))) == 5
 
 
 def test_rotation_respects_retention_kill_switch(tmp_output, monkeypatch):

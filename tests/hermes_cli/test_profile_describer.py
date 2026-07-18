@@ -79,14 +79,11 @@ def _fake_aux_response(content: str):
 
 
 def _patch_aux_client(content: str):
-    client = MagicMock()
-    client.chat.completions.create = MagicMock(return_value=_fake_aux_response(content))
-    return (
-        patch(
-            "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "test-model"),
-        ),
-        client,
+    # describe_profile now routes through call_llm (#35566) — mock it at the
+    # source module.
+    return patch(
+        "agent.auxiliary_client.call_llm",
+        return_value=_fake_aux_response(content),
     )
 
 
@@ -103,8 +100,7 @@ def test_describer_writes_description_with_auto_true(profile_env, monkeypatch):
     )
 
     payload = jsonlib.dumps({"description": "writes Python codebases"})
-    aux_patch, client = _patch_aux_client(payload)
-    with aux_patch, patch(
+    with _patch_aux_client(payload) as mock_call, patch(
         "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
     ):
         outcome = describer.describe_profile("myprof")
@@ -114,7 +110,7 @@ def test_describer_writes_description_with_auto_true(profile_env, monkeypatch):
     meta = profiles_mod.read_profile_meta(profile_env)
     assert meta["description"] == "writes Python codebases"
     assert meta["description_auto"] is True
-    assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 256
+    assert mock_call.call_args.kwargs["max_tokens"] == 256
 
 
 def test_describer_refuses_to_overwrite_user_authored(profile_env, monkeypatch):
@@ -141,8 +137,7 @@ def test_describer_overwrite_flag_replaces_user_authored(profile_env, monkeypatc
     monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
 
     payload = jsonlib.dumps({"description": "new auto-gen"})
-    aux_patch, _client = _patch_aux_client(payload)
-    with aux_patch, patch(
+    with _patch_aux_client(payload), patch(
         "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
     ):
         outcome = describer.describe_profile("myprof", overwrite=True)
@@ -158,8 +153,7 @@ def test_describer_handles_malformed_llm_response(profile_env, monkeypatch):
     monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
 
     # Non-JSON: describer falls back to taking the first paragraph as the description.
-    aux_patch, _client = _patch_aux_client("Plain text description that sneaks in")
-    with aux_patch, patch(
+    with _patch_aux_client("Plain text description that sneaks in"), patch(
         "agent.auxiliary_client.get_auxiliary_extra_body", return_value={}
     ):
         outcome = describer.describe_profile("myprof")

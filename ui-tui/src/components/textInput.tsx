@@ -24,7 +24,9 @@ type InkExt = typeof Ink & {
 }
 
 const ink = Ink as unknown as InkExt
-const { Box, Text, useStdin, useInput, useStdout, stringWidth, useCursorAdvance, useDeclaredCursor, useTerminalFocus } = ink
+
+const { Box, Text, useStdin, useInput, useStdout, stringWidth, useCursorAdvance, useDeclaredCursor, useTerminalFocus } =
+  ink
 
 const ESC = '\x1b'
 const INV = `${ESC}[7m`
@@ -34,7 +36,9 @@ const DIM_OFF = `${ESC}[22m`
 const FWD_DEL_RE = new RegExp(`${ESC}\\[3(?:[~$^]|;)`)
 const PRINTABLE = /^[ -~\u00a0-\uffff]+$/
 const BRACKET_PASTE = new RegExp(`${ESC}?\\[20[01]~`, 'g')
+const FRAME_BATCH_MS = 16
 const MULTI_CLICK_MS = 500
+type MinimalEnv = Record<string, string | undefined>
 
 const invert = (s: string) => INV + s + INV_OFF
 const dim = (s: string) => DIM + s + DIM_OFF
@@ -89,6 +93,60 @@ function snapPos(s: string, p: number) {
   }
 
   return last
+}
+
+export interface TextInsertResult {
+  cursor: number
+  value: string
+}
+
+export function applyPrintableInsert(
+  value: string,
+  cursor: number,
+  text: string,
+  range?: { end: number; start: number } | null
+): null | TextInsertResult {
+  if (!PRINTABLE.test(text)) {
+    return null
+  }
+
+  if (range) {
+    return {
+      cursor: range.start + text.length,
+      value: value.slice(0, range.start) + text + value.slice(range.end)
+    }
+  }
+
+  return {
+    cursor: cursor + text.length,
+    value: value.slice(0, cursor) + text + value.slice(cursor)
+  }
+}
+
+export const shouldRouteMultiCharInputAsPaste = (text: string): boolean => text.includes('\n')
+
+export function shouldPreserveCtrlJNewline(env: MinimalEnv = process.env): boolean {
+  if (env.WT_SESSION) {
+    return true
+  }
+
+  if (env.SSH_CONNECTION || env.SSH_CLIENT || env.SSH_TTY) {
+    return true
+  }
+
+  if (env.GHOSTTY_RESOURCES_DIR || env.GHOSTTY_BIN_DIR) {
+    return true
+  }
+
+  if ((env.TERM ?? '').toLowerCase() === 'xterm-ghostty') {
+    return true
+  }
+
+  if ((env.TERM_PROGRAM ?? '').toLowerCase() === 'ghostty') {
+    return true
+  }
+
+  return (env.WSL_DISTRO_NAME ?? '').toLowerCase().includes('microsoft')
 }
 
 function prevPos(s: string, p: number) {
@@ -206,6 +264,81 @@ const ASCII_PRINTABLE_RE = /^[\x20-\x7e]+$/
  * length 1 but are still produced by IME compositions and must not be
  * fast-echoed.
  */
+/**
+ * Resolves which cursor position `cursorLayout` should be computed from.
+ *
+ * The fast-echo path defers the React `setCur` by 16ms to batch
+ * re-renders during heavy typing. If an unrelated render flushes this
+ * component during that window and the layout used the stale `cur`
+ * React state, the layout effect inside `useDeclaredCursor` would
+ * publish a stale cursor declaration and clobber the Ink-level bump
+ * from `noteCursorAdvance(...)` (the cursor-drift regression closed by
+ * PR #26717's Copilot follow-up). `curRef.current` is always
+ * up-to-date, so it — never the possibly-stale `cur` state — must be
+ * the source of truth here.
+ *
+ * Extracted as a pure function (rather than inlining `curRef.current`
+ * directly at the call site) so the invariant is unit-testable without
+ * mounting Ink/React: construct a scenario where `cur` and
+ * `curRefCurrent` genuinely diverge and assert the layout matches the
+ * fresh ref value, not the stale state.
+ */
+export function resolveCursorLayout(display: string, cur: number, curRefCurrent: number, columns: number) {
+  void cur // intentionally unused for layout — see doc comment above
+
+  return cursorLayout(display, curRefCurrent, columns)
+}
+
+/**
+ * Pure computation for the fast-echo backspace bypass: given the
+ * current value/cursor (already validated by `canFastBackspaceShape`),
+ * returns what the new value/cursor should be, the exact stdout write
+ * ("\b \b"), and the delta to report to Ink's `noteCursorAdvance`.
+ *
+ * Bundling the write + notifier delta into a single return value means
+ * the "every fast-echo write must be paired with a matching
+ * noteCursorAdvance call" invariant is enforced by the return shape
+ * itself (a caller can't apply `write` without also having
+ * `advanceDelta` in hand) rather than by two independent call sites
+ * that happen to sit near each other in source.
+ */
+export function fastBackspaceEffect(
+  current: string,
+  cursor: number
+): { advanceDelta: number; newCursor: number; newValue: string; removed: string; write: string } {
+  const t = prevPos(current, cursor)
+  const removed = current.slice(t, cursor)
+
+  return {
+    advanceDelta: -1,
+    newCursor: t,
+    newValue: current.slice(0, t) + current.slice(cursor),
+    removed,
+    write: '\b \b'
+  }
+}
+
+/**
+ * Pure computation for the fast-echo append bypass: given the current
+ * value/cursor (already validated by `canFastAppendShape`) and the
+ * inserted text, returns the new value/cursor, the exact stdout write
+ * (the inserted text itself), and the delta to report to Ink's
+ * `noteCursorAdvance`. See `fastBackspaceEffect` for why write + delta
+ * are bundled into one return value.
+ */
+export function fastAppendEffect(
+  current: string,
+  cursor: number,
+  text: string
+): { advanceDelta: number; newCursor: number; newValue: string; write: string } {
+  return {
+    advanceDelta: text.length,
+    newCursor: cursor + text.length,
+    newValue: current.slice(0, cursor) + text + current.slice(cursor),
+    write: text
+  }
+}
+
 export function canFastAppendShape(
   current: string,
   cursor: number,
@@ -303,11 +436,31 @@ export function supportsFastEchoTerminal(env: NodeJS.ProcessEnv = process.env): 
     return false
   }
 
+  // tmux adds a PTY multiplexing layer that desyncs stdout.write() cursor
+  // advances from its internal cursor model, causing cursor drift and ghost
+  // whitespace under the fast-echo bypass path.
+  //
+  // `TMUX` catches the local case. It is NOT forwarded over SSH, so when the
+  // TUI runs on a remote host launched from inside local tmux we only see a
+  // tmux-flavored `TERM` (tmux sets `tmux`/`tmux-256color`); match that too so
+  // remote-over-tmux sessions still fall back to the safe render path. We
+  // deliberately do NOT match `screen*`: GNU screen sets the same TERM and has
+  // no reported drift, so widening to screen would disable the optimization for
+  // those users with no evidence of a bug.
+  const term = (env.TERM ?? '').trim().toLowerCase()
+
+  if ((env.TMUX ?? '').trim().length > 0 || term === 'tmux' || term.startsWith('tmux-')) {
+    return false
+  }
+
   // Termux terminals are especially sensitive to bypass-path cursor drift and
   // stale paints at soft-wrap boundaries on tall/narrow viewports. Keep this
   // off by default in Termux mode; allow explicit opt-in for local debugging.
   if (isTermuxTuiMode(env)) {
-    const override = String(env.HERMES_TUI_TERMUX_FAST_ECHO ?? '').trim().toLowerCase()
+    const override = String(env.HERMES_TUI_TERMUX_FAST_ECHO ?? '')
+      .trim()
+      .toLowerCase()
+
     if (override) {
       return /^(?:1|true|yes|on)$/i.test(override)
     }
@@ -400,10 +553,7 @@ export function TextInput({
   const selRef = useRef<null | { end: number; start: number }>(null)
   const vRef = useRef(value)
   const self = useRef(false)
-  const pasteBuf = useRef('')
-  const pasteEnd = useRef<null | number>(null)
-  const pasteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const pastePos = useRef(0)
+  const keyBurstTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const editVersionRef = useRef(0)
   const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingParentValue = useRef<string | null>(null)
@@ -442,7 +592,7 @@ export function TextInput({
   // for layout. The cursorLayout call is cheap (one wrap-text pass
   // over a single-line string in the common case), so dropping useMemo
   // is fine.
-  const layout = cursorLayout(display, curRef.current, columns)
+  const layout = resolveCursorLayout(display, cur, curRef.current, columns)
 
   const boxRef = useDeclaredCursor({
     line: layout.line,
@@ -536,8 +686,8 @@ export function TextInput({
 
   useEffect(
     () => () => {
-      if (pasteTimer.current) {
-        clearTimeout(pasteTimer.current)
+      if (keyBurstTimer.current) {
+        clearTimeout(keyBurstTimer.current)
       }
 
       if (parentChangeTimer.current) {
@@ -573,7 +723,7 @@ export function TextInput({
       return
     }
 
-    parentChangeTimer.current = setTimeout(flushParentChange, 16)
+    parentChangeTimer.current = setTimeout(flushParentChange, FRAME_BATCH_MS)
   }
 
   const cancelLocalRender = () => {
@@ -591,10 +741,11 @@ export function TextInput({
     localRenderTimer.current = setTimeout(() => {
       localRenderTimer.current = null
       setCur(curRef.current)
-    }, 16)
+    }, FRAME_BATCH_MS)
   }
 
-  const canFastEchoBase = () => supportsFastEchoTerminal() && focus && termFocus && !selected && !mask && !!stdout?.isTTY
+  const canFastEchoBase = () =>
+    supportsFastEchoTerminal() && focus && termFocus && !selected && !mask && !!stdout?.isTTY
 
   const canFastAppend = (current: string, cursor: number, text: string) =>
     canFastEchoBase() && canFastAppendShape(current, cursor, text, columns, lineWidthRef.current)
@@ -695,21 +846,26 @@ export function TextInput({
     return !!h
   }
 
-  const flushPaste = () => {
-    const text = pasteBuf.current
-    const at = pastePos.current
-    const end = pasteEnd.current ?? at
-    pasteBuf.current = ''
-    pasteEnd.current = null
-    pasteTimer.current = null
+  const flushKeyBurst = () => {
+    if (keyBurstTimer.current) {
+      clearTimeout(keyBurstTimer.current)
+      keyBurstTimer.current = null
+    }
 
-    if (!text) {
+    flushParentChange()
+  }
+
+  const scheduleKeyBurstCommit = (next: string, nextCur: number) => {
+    commit(next, nextCur, true, false, false)
+
+    if (keyBurstTimer.current) {
       return
     }
 
-    if (!emitPaste({ cursor: at, text, value: vRef.current }) && PRINTABLE.test(text)) {
-      commit(vRef.current.slice(0, at) + text + vRef.current.slice(end), at + text.length)
-    }
+    keyBurstTimer.current = setTimeout(() => {
+      keyBurstTimer.current = null
+      flushParentChange()
+    }, FRAME_BATCH_MS)
   }
 
   const clearSel = () => {
@@ -850,6 +1006,8 @@ export function TextInput({
       // follow-up on #19835). The pass-through predicate is a no-op for
       // ordinary typing and plain paste when voice is unbound to 'v'.
       if (shouldPassThroughToGlobalHandler(inp, k, voiceRecordKey)) {
+        flushKeyBurst()
+
         return
       }
 
@@ -859,6 +1017,8 @@ export function TextInput({
         eventRaw === '\x16' ||
         (isMac && isActionMod(k) && inp.toLowerCase() === 'v')
       ) {
+        flushKeyBurst()
+
         if (cbPaste.current) {
           return void emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
         }
@@ -875,6 +1035,8 @@ export function TextInput({
       }
 
       if (isMac && isActionMod(k) && inp.toLowerCase() === 'c') {
+        flushKeyBurst()
+
         const range = selRange()
 
         if (range) {
@@ -887,6 +1049,8 @@ export function TextInput({
       }
 
       if (k.upArrow || k.downArrow) {
+        flushKeyBurst()
+
         const next = lineNav(vRef.current, curRef.current, k.upArrow ? -1 : 1)
 
         if (next !== null) {
@@ -899,11 +1063,14 @@ export function TextInput({
       }
 
       if (k.return) {
-        if (k.shift || k.ctrl || (isMac ? isActionMod(k) : k.meta)) {
-          flushParentChange()
+        flushKeyBurst()
+
+        const sequence = (event.keypress as { sequence?: string }).sequence
+        const preserveBareLineFeed = shouldPreserveCtrlJNewline() && sequence === '\n'
+
+        if (k.shift || k.ctrl || preserveBareLineFeed || (isMac ? isActionMod(k) : k.meta)) {
           commit(ins(vRef.current, curRef.current, '\n'), curRef.current + 1)
         } else {
-          flushParentChange()
           cbSubmit.current?.(vRef.current)
         }
 
@@ -921,6 +1088,13 @@ export function TextInput({
       const actionDeleteWord = (mod && inp === 'w') || isMacActionFallback(k, inp, 'w')
       const range = selRange()
       const delFwd = k.delete || fwdDel.current
+
+      const isPrintableInput =
+        (event.keypress.isPasted || inp.length > 0) && PRINTABLE.test(inp.replace(BRACKET_PASTE, ''))
+
+      if (!isPrintableInput) {
+        flushKeyBurst()
+      }
 
       if (mod && inp === 'z') {
         return swap(undo, redo)
@@ -981,16 +1155,16 @@ export function TextInput({
           v = v.slice(0, t) + v.slice(c)
           c = t
         } else if (canFastBackspace(v, c)) {
-          const t = prevPos(v, c)
-          v = v.slice(0, t) + v.slice(c)
-          c = t
-          stdout!.write('\b \b')
+          const effect = fastBackspaceEffect(v, c)
+          v = effect.newValue
+          c = effect.newCursor
+          stdout!.write(effect.write)
           // The "\b \b" sequence ends with the cursor one column to the
           // LEFT of where Ink last parked it. Tell Ink so its `displayCursor`
           // (and log-update's relative-move basis on the next frame) stays
           // in sync — otherwise the cursor parks one cell to the right of
           // the caret on the next unrelated re-render.
-          noteCursorAdvance(-1)
+          noteCursorAdvance(effect.advanceDelta)
           commit(v, c, true, false, false, Math.max(0, lineWidthRef.current - 1))
 
           return
@@ -1050,34 +1224,50 @@ export function TextInput({
         }
 
         if (text.length > 1 || text.includes('\n')) {
-          if (!pasteBuf.current) {
-            pastePos.current = range ? range.start : c
-            pasteEnd.current = range ? range.end : pastePos.current
+          if (shouldRouteMultiCharInputAsPaste(text)) {
+            flushKeyBurst()
+
+            if (!emitPaste({ cursor: c, text, value: v })) {
+              commit(ins(v, c, text), c + text.length)
+            }
+
+            return
           }
 
-          pasteBuf.current += text
+          const inserted = applyPrintableInsert(v, c, text, range)
 
-          if (pasteTimer.current) {
-            clearTimeout(pasteTimer.current)
+          if (!inserted) {
+            return
           }
 
-          pasteTimer.current = setTimeout(flushPaste, 50)
+          v = inserted.value
+          c = inserted.cursor
+          scheduleKeyBurstCommit(v, c)
 
           return
         }
 
-        if (PRINTABLE.test(text)) {
+        {
+          const inserted = applyPrintableInsert(v, c, text, range)
+
+          if (!inserted) {
+            return
+          }
+
           if (range) {
-            v = v.slice(0, range.start) + text + v.slice(range.end)
-            c = range.start + text.length
+            v = inserted.value
+            c = inserted.cursor
           } else {
             const simpleAppend = canFastAppend(v, c, text)
+            const preInsertValue = v
+            const preInsertCursor = c
 
-            v = v.slice(0, c) + text + v.slice(c)
-            c += text.length
+            v = inserted.value
+            c = inserted.cursor
 
             if (simpleAppend) {
-              stdout!.write(text)
+              const effect = fastAppendEffect(preInsertValue, preInsertCursor, text)
+              stdout!.write(effect.write)
               // ASCII-printable text advances the physical cursor by exactly
               // text.length cells (canFastAppendShape rejects non-ASCII,
               // wide chars, newlines). Notify Ink so the cached displayCursor
@@ -1085,14 +1275,12 @@ export function TextInput({
               // any unrelated re-render that happens before the 16ms
               // setCur/setParent flush parks the cursor text.length cells
               // too far right (#cursor-drift).
-              noteCursorAdvance(text.length)
+              noteCursorAdvance(effect.advanceDelta)
               commit(v, c, true, false, false, lineWidthRef.current + stringWidth(text))
 
               return
             }
           }
-        } else {
-          return
         }
       } else {
         return
@@ -1125,11 +1313,13 @@ export function TextInput({
         if (e.button === 2) {
           e.stopImmediatePropagation?.()
           const decision = decideRightClickAction(vRef.current, selRange())
+
           if (decision.action === 'copy') {
             void writeClipboardText(decision.text)
 
             return
           }
+
           emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
 
           return
@@ -1201,9 +1391,7 @@ interface TextInputProps {
   voiceRecordKey?: ParsedVoiceRecordKey
 }
 
-export type RightClickDecision =
-  | { action: 'copy'; text: string }
-  | { action: 'paste' }
+export type RightClickDecision = { action: 'copy'; text: string } | { action: 'paste' }
 
 /**
  * Decide what right-click should do on the composer:
@@ -1222,10 +1410,12 @@ export function decideRightClickAction(
 ): RightClickDecision {
   if (range && range.end > range.start) {
     const text = value.slice(range.start, range.end)
+
     if (text) {
       return { action: 'copy', text }
     }
   }
+
   return { action: 'paste' }
 }
 

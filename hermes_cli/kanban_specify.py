@@ -41,7 +41,12 @@ from typing import Optional
 from agent.token_budget_policy import resolve_llm_max_tokens
 from hermes_cli import kanban_db as kb
 
-HERMES_KANBAN_SPECIFY_MAX_TOKENS = os.getenv("HERMES_KANBAN_SPECIFY_MAX_TOKENS")
+from utils import env_int
+
+HERMES_KANBAN_SPECIFY_MAX_TOKENS = max(
+    1500,
+    env_int("HERMES_KANBAN_SPECIFY_MAX_TOKENS", 6000),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +166,7 @@ def specify_task(
     error, malformed response) — those surface via ``ok=False`` so the
     ``--all`` sweep can continue past individual failures.
     """
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
         return SpecifyOutcome(task_id, False, "unknown task id")
@@ -171,21 +176,10 @@ def specify_task(
         )
 
     try:
-        from agent.auxiliary_client import get_auxiliary_extra_body, get_text_auxiliary_client
+        from agent.auxiliary_client import call_llm
     except Exception as exc:  # pragma: no cover — import smoke test
         logger.debug("specify: auxiliary client import failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
-
-    try:
-        client, model = get_text_auxiliary_client("triage_specifier")
-    except Exception as exc:
-        logger.debug("specify: get_text_auxiliary_client failed: %s", exc)
-        return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
-
-    if client is None or not model:
-        return SpecifyOutcome(
-            task_id, False, "no auxiliary client configured"
-        )
 
     user_msg = _USER_TEMPLATE.format(
         task_id=task.id,
@@ -194,8 +188,11 @@ def specify_task(
     )
 
     try:
-        resp = client.chat.completions.create(
-            model=model,
+        # Route through call_llm so auxiliary.triage_specifier.* config
+        # (provider/model/base_url, extra_body, reasoning_effort, retries)
+        # all apply — the direct-create path dropped extra_body (#35566).
+        resp = call_llm(
+            task="triage_specifier",
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_msg},
@@ -207,7 +204,6 @@ def specify_task(
                 task_type="kanban task specification json",
             ),
             timeout=timeout or 120,
-            extra_body=get_auxiliary_extra_body() or None,
         )
     except Exception as exc:
         logger.info(
@@ -254,7 +250,7 @@ def specify_task(
                 task_id, False, "LLM response missing title and body"
             )
 
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         ok = kb.specify_triage_task(
             conn,
             task_id,
@@ -276,7 +272,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
 
     ``tenant`` narrows the sweep; ``None`` returns every triage task.
     """
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         tasks = kb.list_tasks(
             conn,
             status="triage",

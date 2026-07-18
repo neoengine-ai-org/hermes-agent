@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -105,6 +106,7 @@ def test_neowealth_dispatcher_preflight_runs_before_worktree_and_passes_packet(t
     monkeypatch.setattr(module, "agent_env", lambda: dict(os.environ))
     module.provider_canary = SimpleNamespace(canary=lambda *args, **kwargs: {"status": "PASS"})
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: FakeProc())
+    monkeypatch.setattr(module, "process_start_token", lambda _pid: "test-start")
 
     result = module.launch_agent(pkt, lane)
 
@@ -133,7 +135,7 @@ def test_neowealth_duplicate_expected_claim_fails_closed_before_spawn(tmp_path, 
     module.ensure_default_dev_lane_registrations()
     store = DevLaneStore(module.DEV_LANE_HEARTBEAT_ROOT)
     work_item_id = "neowealth:startup-proof:codex"
-    now = "2026-06-24T00:00:00Z"
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     store.add_work_item({"work_item_id": work_item_id, "repo_scope": "neowealth", "authorized_scopes": ["**"], "status": "queued"})
     store.claim_work(work_item_id, "codex", "other-live-session", now, 999999, "claims/other.json")
     touched = {"worktree": False, "spawn": False}
@@ -141,10 +143,11 @@ def test_neowealth_duplicate_expected_claim_fails_closed_before_spawn(tmp_path, 
     monkeypatch.setattr(module.subprocess, "Popen", lambda *args, **kwargs: touched.__setitem__("spawn", True))
     lane = {"lane": "codex", "provider": "codex", "scope": "startup", "lane_type": "primary_implementation"}
 
-    with pytest.raises(RuntimeError, match="active_claim_exists"):
-        module.launch_agent(packet(lane), lane)
+    result = module.launch_agent(packet(lane), lane)
 
     assert touched == {"worktree": False, "spawn": False}
+    assert result["spawned"] is False
+    assert result["lane_control"]["action"] == "active-claim-exists"
 
 
 def test_neowealth_protected_item_does_not_spawn_provider(tmp_path, monkeypatch):

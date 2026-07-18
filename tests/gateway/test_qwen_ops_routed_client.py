@@ -118,6 +118,8 @@ def _make_runner(
         }
     )
     adapter = MagicMock()
+    adapter.authorization_is_upstream = False
+    adapter.enforces_own_access_policy = False
     adapter.send = AsyncMock()
     runner.adapters = {platform: adapter}
     runner._voice_mode = {}

@@ -48,15 +48,12 @@ def _mock_client_returning(content: str):
 
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    """Patch get_text_auxiliary_client at its source + at the module that
-    imported it lazily inside specify_task. Both patches are needed
-    because kanban_specify imports the function inside the function body.
+    """Patch call_llm at its source module — specify_task now routes through
+    it (#35566) instead of building a raw client. Returns (patcher, mock) so
+    callers can still assert on the call.
     """
-    client = _mock_client_returning(content)
-    return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
-    ), client
+    mock_fn = MagicMock(return_value=_fake_aux_response(content))
+    return patch("agent.auxiliary_client.call_llm", mock_fn), mock_fn
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +100,7 @@ def test_specify_task_happy_path(kanban_home):
     assert outcome.ok is True
     assert outcome.task_id == tid
     assert outcome.new_title == "Refined rough"
-    assert client.chat.completions.create.call_args.kwargs["max_tokens"] == 2048
+    assert client.call_args.kwargs["max_tokens"] == spec._configured_max_tokens()
 
     with kb.connect() as conn:
         task = kb.get_task(conn, tid)
@@ -143,7 +140,7 @@ def test_specify_task_rejects_non_triage_task(kanban_home):
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
     # LLM must not be invoked for a non-triage task — fail cheap.
-    assert client.chat.completions.create.call_count == 0
+    assert client.call_count == 0
 
 
 def test_specify_task_unknown_id(kanban_home):
@@ -152,7 +149,7 @@ def test_specify_task_unknown_id(kanban_home):
         outcome = spec.specify_task("t_nope")
     assert outcome.ok is False
     assert "unknown task" in outcome.reason
-    assert client.chat.completions.create.call_count == 0
+    assert client.call_count == 0
 
 
 def test_specify_task_no_aux_client_configured(kanban_home):
@@ -160,13 +157,14 @@ def test_specify_task_no_aux_client_configured(kanban_home):
         tid = kb.create_task(conn, title="rough", triage=True)
 
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(None, ""),
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError("No LLM provider configured"),
     ):
         outcome = spec.specify_task(tid)
 
     assert outcome.ok is False
-    assert "auxiliary client" in outcome.reason
+    # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
+    assert "LLM error" in outcome.reason
     # Task must stay in triage — we never touched it.
     with kb.connect() as conn:
         assert kb.get_task(conn, tid).status == "triage"
@@ -177,10 +175,9 @@ def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
         tid = kb.create_task(conn, title="rough", triage=True)
 
     client = MagicMock()
-    client.chat.completions.create = MagicMock(side_effect=RuntimeError("429 rate limited"))
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, "test-model"),
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError("429 rate limited"),
     ):
         outcome = spec.specify_task(tid)
 
@@ -289,8 +286,8 @@ def test_cli_specify_all_returns_1_when_every_task_fails(kanban_home, capsys):
         kb.create_task(conn, title="b", triage=True)
 
     with patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(None, ""),  # no aux client → every task fails
+        "agent.auxiliary_client.call_llm",
+        side_effect=RuntimeError("No LLM provider configured"),  # every task fails
     ):
         rc = _run_cli("specify", "--all")
 

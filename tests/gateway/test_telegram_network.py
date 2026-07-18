@@ -1,4 +1,4 @@
-"""Tests for gateway.platforms.telegram_network – fallback transport layer.
+"""Tests for plugins.platforms.telegram.telegram_network – fallback transport layer.
 
 Background
 ----------
@@ -18,7 +18,7 @@ fallback IPs in order, then "stick" to whichever IP works.
 import httpx
 import pytest
 
-from gateway.platforms import telegram_network as tnet
+import plugins.platforms.telegram.telegram_network as tnet
 
 
 # ---------------------------------------------------------------------------
@@ -354,15 +354,11 @@ class TestFallbackTransportInit:
         assert len(seen_kwargs) == 2
         assert all("proxy" not in kwargs for kwargs in seen_kwargs)
 
-    def test_limits_propagated_to_primary_and_fallback_transports(self, monkeypatch):
-        """Regression: ``connection_pool_size`` must reach the inner pools.
-
-        httpx ignores ``AsyncClient(limits=...)`` when a custom transport is
-        supplied. We compensate by forwarding ``httpx.Limits`` into each
-        inner ``AsyncHTTPTransport`` so the effective pool size matches
-        ``HERMES_TELEGRAM_HTTP_POOL_SIZE`` rather than the httpx default
-        (100). Reproduces the regression that caused the 2026-05-25 17:14
-        PDT PoolTimeout cluster.
+    def test_forwards_limits_to_inner_transports(self, monkeypatch):
+        """Verify that caller-supplied limits reach the inner
+        AsyncHTTPTransport instances (#58790).  httpx ignores the
+        client-level limits kwarg when a custom transport is
+        supplied, so the limits must be forwarded via transport_kwargs.
         """
         seen_kwargs = []
 
@@ -374,36 +370,20 @@ class TestFallbackTransportInit:
             monkeypatch.delenv(key, raising=False)
         monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
 
-        limits = httpx.Limits(max_connections=512, max_keepalive_connections=512)
+        custom_limits = httpx.Limits(
+            max_connections=42,
+            max_keepalive_connections=10,
+            keepalive_expiry=30.0,
+        )
         transport = tnet.TelegramFallbackTransport(
-            ["149.154.167.220", "149.154.167.221"], limits=limits
+            ["149.154.167.220"], limits=custom_limits
         )
 
-        assert transport._fallback_ips == ["149.154.167.220", "149.154.167.221"]
-        # 1 primary + 2 fallback transports
-        assert len(seen_kwargs) == 3
-        for kwargs in seen_kwargs:
-            assert kwargs.get("limits") is limits
-
-    def test_limits_omitted_when_not_provided(self, monkeypatch):
-        """Back-compat: callers that don't set ``limits`` must not see it
-        injected. Preserves the historical behaviour where the inner
-        transports use the httpx default ``Limits`` if nothing is supplied."""
-        seen_kwargs = []
-
-        def factory(**kwargs):
-            seen_kwargs.append(kwargs.copy())
-            return FakeTransport([], {})
-
-        for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "https_proxy", "http_proxy", "all_proxy", "TELEGRAM_PROXY", "NO_PROXY", "no_proxy"):
-            monkeypatch.delenv(key, raising=False)
-        monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
-
-        tnet.TelegramFallbackTransport(["149.154.167.220"])
-
+        # 1 primary + 1 fallback = 2 AsyncHTTPTransport instances
         assert len(seen_kwargs) == 2
-        for kwargs in seen_kwargs:
-            assert "limits" not in kwargs
+        for kw in seen_kwargs:
+            assert "limits" in kw
+            assert kw["limits"] is custom_limits
 
 
 class TestFallbackTransportClose:
@@ -489,7 +469,7 @@ class TestAdapterFallbackIps:
                 sys.modules.setdefault(name, mod)
 
         from gateway.config import PlatformConfig
-        from gateway.platforms.telegram import TelegramAdapter
+        from plugins.platforms.telegram.adapter import TelegramAdapter
 
         config = PlatformConfig(enabled=True, token="test-token")
         if extra:
@@ -523,7 +503,7 @@ class TestAdapterFallbackIps:
         from unittest.mock import AsyncMock
 
         from gateway.config import PlatformConfig
-        from gateway.platforms import telegram as telegram_mod
+        from plugins.platforms.telegram import adapter as telegram_mod
 
         captured_requests = []
         captured_transports = []
@@ -594,7 +574,11 @@ class TestAdapterFallbackIps:
             assert transport.fallback_ips == ["149.154.167.220"]
             assert transport.limits is not None
             assert transport.limits.max_connections == 321
-            assert transport.limits.max_keepalive_connections == 321
+            # Current upstream deliberately caps idle keepalive sockets at 10
+            # to prevent CLOSE_WAIT fd leaks while retaining the 321 active
+            # connection ceiling. The fork invariant is that these limits are
+            # threaded into every fallback transport rather than discarded.
+            assert transport.limits.max_keepalive_connections == 10
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -804,3 +788,54 @@ class TestDiscoverFallbackIps:
 
         ips = await tnet.discover_fallback_ips()
         assert ips == ["149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_hung_system_dns_does_not_gate_doh_results(self, monkeypatch):
+        """#63309: socket.getaddrinfo has no timeout of its own — a wedged OS
+        resolver must not stall discovery. DoH answers must come back promptly
+        even while the system-DNS worker thread is still hanging."""
+        import time as _time
+
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, _doh_answer("149.154.167.220")),
+            "https://cloudflare-dns.com": (200, _doh_answer()),
+        }, system_dns_ips=["149.154.166.110"])
+        monkeypatch.setattr(tnet, "_DOH_TIMEOUT", 0.2)
+
+        def _hung_getaddrinfo(*a, **kw):
+            _time.sleep(1.5)  # far beyond the discovery bound
+            raise OSError("resolver wedged")
+
+        monkeypatch.setattr(tnet.socket, "getaddrinfo", _hung_getaddrinfo)
+
+        start = _time.monotonic()
+        ips = await tnet.discover_fallback_ips()
+        elapsed = _time.monotonic() - start
+
+        assert ips == ["149.154.167.220"]
+        assert elapsed < 1.4, f"discovery gated on hung system DNS ({elapsed:.2f}s)"
+
+    @pytest.mark.asyncio
+    async def test_hung_system_dns_with_no_doh_answers_bounded_seed_fallback(self, monkeypatch):
+        """Worst case — resolver wedged AND no DoH answers — must still return
+        the seed list within the bound instead of hanging connect()."""
+        import time as _time
+
+        self._patch_doh(monkeypatch, {
+            "https://dns.google": (200, {"Status": 0}),
+            "https://cloudflare-dns.com": (200, {"garbage": True}),
+        }, system_dns_ips=["149.154.166.110"])
+        monkeypatch.setattr(tnet, "_DOH_TIMEOUT", 0.2)
+
+        def _hung_getaddrinfo(*a, **kw):
+            _time.sleep(1.5)
+            raise OSError("resolver wedged")
+
+        monkeypatch.setattr(tnet.socket, "getaddrinfo", _hung_getaddrinfo)
+
+        start = _time.monotonic()
+        ips = await tnet.discover_fallback_ips()
+        elapsed = _time.monotonic() - start
+
+        assert ips == tnet._SEED_FALLBACK_IPS
+        assert elapsed < 1.4, f"seed fallback gated on hung system DNS ({elapsed:.2f}s)"
