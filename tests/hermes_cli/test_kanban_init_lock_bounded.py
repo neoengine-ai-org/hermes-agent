@@ -6,12 +6,9 @@ long-lived gateway dispatcher's next-tick `connect()` forever — no timeout, no
 recovery, board silently stops being worked.
 
 Two fixes, both covered here:
-1. Fast path: once a path is initialized in this process, `connect()` skips the
-   cross-process init lock entirely (nothing left to serialize), so a held lock
-   cannot block a steady-state connect.
-2. Bounded acquire: even on first-init, `_cross_process_init_lock` retries a
-   non-blocking acquire up to a deadline, then proceeds (with a WARNING) rather
-   than hanging.
+1. Fast path: once initialized, connects take a concurrent shared attach lock.
+2. Bounded acquire: attach/init fails closed on timeout, so offline maintenance
+   can never be bypassed by a connect that waited longer than the deadline.
 """
 
 from __future__ import annotations
@@ -53,15 +50,24 @@ def _hold_init_lock(db_path: Path):
     return release, t
 
 
-def test_initialized_path_connect_skips_init_lock(kanban_home):
-    """A connect to an already-initialized path must not block on the init lock."""
+def test_initialized_path_connects_share_attach_lock(kanban_home):
+    """Steady-state connects must not serialize behind peer readers."""
     db_path = kb.kanban_db_path(board="default")
     # Initialize once.
     kb.connect().close()
     assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
 
-    # Hold the init lock; a fast-path connect must return promptly anyway.
-    release, t = _hold_init_lock(db_path)
+    holding = threading.Event()
+    release = threading.Event()
+
+    def _reader():
+        with kb._cross_process_attach_lock(db_path):
+            holding.set()
+            release.wait(timeout=10)
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    assert holding.wait(timeout=5)
     try:
         start = time.monotonic()
         kb.connect().close()
@@ -72,21 +78,20 @@ def test_initialized_path_connect_skips_init_lock(kanban_home):
         t.join(timeout=5)
 
 
-def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch):
-    """First-init connect must time out the cross-process lock and proceed,
-    not hang forever, when another holder owns it."""
+def test_first_init_connect_fails_closed_when_lock_held(kanban_home, monkeypatch):
+    """First-init connect must time out rather than bypass maintenance."""
     monkeypatch.setattr(kb, "_INIT_LOCK_TIMEOUT_SECONDS", 0.6)
     db_path = kb.kanban_db_path(board="default")
 
     release, t = _hold_init_lock(db_path)
     try:
         start = time.monotonic()
-        conn = kb.connect()  # path NOT yet initialized — must take the bounded path
-        conn.close()
+        with pytest.raises(kb.KanbanInitLockTimeout):
+            kb.connect()
         elapsed = time.monotonic() - start
-        # Proceeded within roughly the timeout window (not unbounded).
+        # Failed within roughly the timeout window (not unbounded).
         assert 0.4 <= elapsed < 3.0, f"expected bounded ~0.6s acquire, got {elapsed:.2f}s"
-        assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
+        assert str(db_path.resolve()) not in kb._INITIALIZED_PATHS
     finally:
         release.set()
         t.join(timeout=5)

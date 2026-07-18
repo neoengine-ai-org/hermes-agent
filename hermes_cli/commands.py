@@ -1187,7 +1187,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #   - moa: high-cost slash mode, available through /hermes moa to avoid
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
-_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug"})
+#   - version: low-frequency diagnostics; reached via /hermes version on Slack
+#     so the pinned /btw and /bg aliases still fit under Slack's hard cap.
+_SLACK_VIA_HERMES_ONLY = frozenset({"credits", "billing", "moa", "debug", "version"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1271,9 +1273,6 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    for priority_name in ("btw", "bg", "reset", "q"):
-        _add_command_variant(priority_name)
-
     # Add each gateway command with aliases while registry order is still
     # respected. Aliases for early/core commands must not be starved by later
     # canonical entries when Slack's 50-command cap is reached.
@@ -1312,6 +1311,7 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
 
     by_norm = {_norm_menu(name): (name, desc) for name, desc in telegram_bot_commands()}
     reserved_norm = {_norm_menu(name) for name in _SLACK_RESERVED_COMMANDS}
+    protected_norm = set(by_norm) | {_norm_menu(name) for name in _SLACK_PRIORITY_ALIASES}
     for norm_name, (tg_name, tg_desc) in by_norm.items():
         if norm_name in reserved_norm:
             continue
@@ -1319,12 +1319,29 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         while len(entries) >= _SLACK_MAX_SLASH_COMMANDS:
             victim_idx = next(
-                (idx for idx, (name, _desc, _hint) in enumerate(entries) if name in low_priority),
+                (
+                    idx
+                    for idx, (name, _desc, _hint) in enumerate(entries)
+                    if name in low_priority and _norm_menu(name) not in protected_norm
+                ),
                 None,
             )
             if victim_idx is None:
+                # Preserve every Telegram-visible command. If the curated list
+                # still needs room, evict a Slack-only convenience from the
+                # tail rather than silently breaking cross-platform parity.
+                victim_idx = next(
+                    (
+                        idx
+                        for idx in range(len(entries) - 1, 1, -1)
+                        if _norm_menu(entries[idx][0]) not in protected_norm
+                    ),
+                    None,
+                )
+            if victim_idx is None:
                 break
-            entries.pop(victim_idx)
+            victim_name, _victim_desc, _victim_hint = entries.pop(victim_idx)
+            seen.discard(victim_name)
         _add(tg_name.replace("_", "-"), tg_desc, "")
 
     return entries

@@ -19,7 +19,9 @@ TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|configured\s+compression\s+model\s+.+\s+failed"
     r"|no\s+auxiliary\s+llm\s+provider\s+configured"
     r"|auto-lowered\s+compression\s+threshold"
+    r"|compacting\s+context\s+[—-]\s+summarizing\s+earlier\s+conversation"
     r"|preflight\s+compression"
+    r"|session\s+compressed\s+\d+\s+times"
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
@@ -29,13 +31,20 @@ TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+GATEWAY_RAW_TEXT_PLATFORMS = frozenset(
+    {"local", "api_server", "webhook", "msgraph_webhook"}
+)
+
 
 def prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> str | None:
     """Filter/sanitize agent status callbacks before platform delivery."""
     text = str(message or "").strip()
     if not text:
         return None
-    if gateway_platform_value(platform) != "telegram":
+    # Local/programmatic consumers need diagnostics verbatim. Every other
+    # surface is treated as human-facing chat, including plugin platforms we
+    # do not know about yet, so the safety policy fails closed.
+    if gateway_platform_value(platform) in GATEWAY_RAW_TEXT_PLATFORMS:
         return text
 
     text = redact_gateway_user_facing_secrets(text)

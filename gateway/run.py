@@ -457,16 +457,6 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 
 
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
-    """Backward-compatible facade for final gateway response sanitization."""
-    return sanitize_gateway_final_response(platform, text)
-
-
-def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
-    """Backward-compatible facade for status callback filtering."""
-    return prepare_gateway_status_message(platform, event_type, message)
-
-
-def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to chat surfaces.
 
     Every human-facing chat surface (Telegram, WhatsApp, Discord, Slack,
@@ -21470,6 +21460,49 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging, _safe_stderr
     setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Periodic process resource logging (gateway only). Start it after the
+    # runner exists so fd pressure can trigger active client cleanup.
+    _memory_monitor_module = None
+    _memory_monitor_interval = 300.0
+    _memory_monitor_rss_high_mb: Optional[int] = None
+    _memory_monitor_rss_critical_mb: Optional[int] = None
+    try:
+        from gateway import memory_monitor as _memory_monitor
+
+        try:
+            from hermes_cli.config import load_config as _load_cli_config
+
+            _mm_cfg = (
+                (_load_cli_config() or {})
+                .get("logging", {})
+                .get("memory_monitor", {})
+                or {}
+            )
+        except Exception:
+            _mm_cfg = {}
+        if _mm_cfg.get("enabled", True):
+            try:
+                _memory_monitor_interval = float(
+                    _mm_cfg.get("interval_seconds", 300)
+                )
+            except (TypeError, ValueError):
+                _memory_monitor_interval = 300.0
+
+            def _optional_memory_monitor_int(name: str) -> Optional[int]:
+                try:
+                    value = _mm_cfg.get(name)
+                    return None if value is None else int(value)
+                except (TypeError, ValueError):
+                    return None
+
+            _memory_monitor_module = _memory_monitor
+            _memory_monitor_rss_high_mb = _optional_memory_monitor_int("rss_high_mb")
+            _memory_monitor_rss_critical_mb = _optional_memory_monitor_int(
+                "rss_critical_mb"
+            )
+    except Exception as _mm_exc:
+        logger.debug("Failed to configure resource monitor: %s", _mm_exc)
 
     # Startup security posture audit — warn-on-load, never blocks. Surfaces
     # root / weak-SSH / ephemeral-container / unauthenticated-listener posture

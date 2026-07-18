@@ -4050,7 +4050,7 @@ def run_conversation(
                     # Before surfacing a dead-end Telegram alert, compact once
                     # and rebuild the request if there is enough context to
                     # make compaction meaningful.
-                    _pressure_tokens = max(approx_tokens, approx_request_tokens)
+                    _pressure_tokens = max(approx_tokens, request_pressure_tokens)
                     _pressure_threshold = min(
                         agent.context_compressor.threshold_tokens,
                         max(

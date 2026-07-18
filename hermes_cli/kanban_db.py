@@ -1370,10 +1370,14 @@ DEFAULT_BUSY_TIMEOUT_MS = 120_000
 # Bounded acquire for the cross-process init lock (#36644). The original bare
 # blocking flock had no timeout, so a wedged holder blocked the dispatcher's
 # next-tick connect forever. We retry a non-blocking acquire up to this
-# deadline, polling at this interval, then proceed without the cross-process
-# lock (the in-process _INIT_LOCK + idempotent init remain the backstop).
+# deadline, polling at this interval. A timeout fails closed: proceeding while
+# an offline swap holds the same sidecar lock can attach to a half-swapped DB.
 _INIT_LOCK_TIMEOUT_SECONDS = 10.0
 _INIT_LOCK_POLL_SECONDS = 0.05
+
+
+class KanbanInitLockTimeout(RuntimeError):
+    """Raised when a DB attach/init lock cannot be acquired safely."""
 
 
 def _resolve_busy_timeout_ms() -> int:
@@ -1425,13 +1429,10 @@ def _bounded_cross_process_init_lock(path: Path):
     critical section (or a stale lock held by a wedged worker) blocked every
     other ``connect()`` — including the long-lived gateway dispatcher's
     next-tick connect — forever, with no traceback and no recovery short of a
-    restart. We now retry a non-blocking acquire up to a deadline; on timeout
-    we log a WARNING and proceed WITHOUT the cross-process lock. That is safe:
-    the in-process ``_INIT_LOCK`` still serializes same-process threads, and
-    the init work itself is idempotent (``CREATE TABLE IF NOT EXISTS`` +
-    additive migrations), so the worst case of two processes racing first-init
-    is redundant work, not corruption. A bounded "proceed anyway" beats an
-    unbounded hang that silently stops the board.
+    restart. We now retry a non-blocking acquire up to a deadline and fail
+    closed on timeout. The same sidecar is held exclusively by offline swap;
+    opening the DB without it would reintroduce the live-inode replacement
+    corruption window this lock is designed to close.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = _kanban_lock_sidecar(path, "init.lock")
@@ -1468,11 +1469,14 @@ def _bounded_cross_process_init_lock(path: Path):
                     time.sleep(_INIT_LOCK_POLL_SECONDS)
         if not acquired:
             _log.warning(
-                "kanban init lock for %s not acquired within %.0fs — proceeding "
-                "without the cross-process lock (in-process lock + idempotent "
-                "init are the correctness backstop). A stuck holder is no longer "
-                "able to block this connect indefinitely (#36644).",
+                "kanban init lock for %s not acquired within %.0fs — refusing "
+                "to attach while another process may be initializing or swapping "
+                "the board (#36644).",
                 lock_path, _INIT_LOCK_TIMEOUT_SECONDS,
+            )
+            raise KanbanInitLockTimeout(
+                f"could not acquire kanban init lock {lock_path} within "
+                f"{_INIT_LOCK_TIMEOUT_SECONDS}s"
             )
         yield
     finally:
@@ -1489,6 +1493,52 @@ def _bounded_cross_process_init_lock(path: Path):
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
+@contextlib.contextmanager
+def _cross_process_attach_lock(path: Path):
+    """Allow concurrent steady-state connects while excluding maintenance.
+
+    POSIX connects take a shared lock, so cached paths no longer serialize on
+    the exclusive initialization lock. ``exclusive_maintenance_lock`` takes
+    the same sidecar exclusively and therefore still blocks every new attach.
+    Windows has no shared byte-range lock in ``msvcrt``; use the bounded
+    exclusive path there for correctness.
+    """
+    if _IS_WINDOWS:
+        with _bounded_cross_process_init_lock(path):
+            yield
+        return
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = _kanban_lock_sidecar(path, "init.lock")
+    handle = lock_path.open("a+b")
+    acquired = False
+    try:
+        import fcntl
+
+        deadline = time.monotonic() + _INIT_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (BlockingIOError, OSError):
+                if time.monotonic() >= deadline:
+                    raise KanbanInitLockTimeout(
+                        f"could not acquire kanban attach lock {lock_path} within "
+                        f"{_INIT_LOCK_TIMEOUT_SECONDS}s"
+                    )
+                time.sleep(_INIT_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            if acquired:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
 
@@ -2176,7 +2226,7 @@ def _conn_main_db_path(conn: sqlite3.Connection) -> Optional[str]:
         for _seq, name, path in conn.execute("PRAGMA database_list"):
             if name == "main" and path:
                 return str(path)
-    except sqlite3.Error:
+    except (sqlite3.Error, TypeError):
         return None
     return None
 
@@ -2300,6 +2350,35 @@ def connect(
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    resolved = str(path.resolve())
+
+    # Lock-free-with-respect-to-other-readers steady state: cached connects use
+    # a SHARED attach lock, so they run concurrently while still excluding an
+    # offline swap's EXCLUSIVE maintenance lock. Periodic integrity re-probes
+    # also happen under this shared lock and never serialize peer readers.
+    if resolved in _INITIALIZED_PATHS:
+        with _cross_process_attach_lock(path):
+            _validate_sqlite_header(path)
+            guard_verified = _guard_existing_db_is_healthy(path)
+            if guard_verified and resolved in _INITIALIZED_PATHS:
+                conn = _sqlite_connect(path)
+                try:
+                    conn.row_factory = sqlite3.Row
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                    conn.execute("PRAGMA synchronous=FULL")
+                    conn.execute("PRAGMA wal_autocheckpoint=100")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    conn.execute("PRAGMA secure_delete=ON")
+                    conn.execute("PRAGMA cell_size_check=ON")
+                    return conn
+                except Exception:
+                    conn.close()
+                    raise
+        # The cached guard can deliberately evict WAL-without-SHM paths so the
+        # live read/write connection verifies them. Re-enter through the
+        # exclusive initialization path after releasing the shared lock.
+
     with _cross_process_init_lock(path):
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
@@ -2308,7 +2387,6 @@ def connect(
         # pages, broken internal metadata). Cached per-path after first success
         # via _INITIALIZED_PATHS so it only runs once per process per path.
         guard_verified = _guard_existing_db_is_healthy(path)
-        resolved = str(path.resolve())
         conn = _sqlite_connect(path)
         try:
             conn.row_factory = sqlite3.Row

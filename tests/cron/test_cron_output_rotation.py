@@ -35,7 +35,7 @@ def test_rotation_caps_outputs(tmp_output, monkeypatch):
     assert "2026-01-03_00-00-00.md" not in outputs
 
 
-def test_rotation_age_floor_protects_young_outputs(tmp_output, monkeypatch):
+def test_rotation_age_floor_never_defeats_hard_cap(tmp_output, monkeypatch):
     monkeypatch.setenv("HERMES_CRON_OUTPUT_KEEP", "1")
     monkeypatch.setenv("HERMES_CRON_OUTPUT_MIN_AGE_DAYS", "30")
     job_dir = tmp_output / "job-young"
@@ -43,9 +43,9 @@ def test_rotation_age_floor_protects_young_outputs(tmp_output, monkeypatch):
     for i in range(5):
         (job_dir / f"2026-01-0{i + 1}_00-00-00.md").write_text(f"run {i}")
     jobs.save_job_output("job-young", "newest run")
-    # all files are younger than the floor: nothing rotation-deleted; the
-    # archive-first sweep owns anything older
-    assert len(_run_outputs("job-young")) == 6
+    # All files are younger than the floor, but the count cap remains the
+    # authoritative disk-fill backstop for high-frequency jobs.
+    assert len(_run_outputs("job-young")) == 1
 
 
 def test_rotation_disabled_with_zero(tmp_output, monkeypatch):

@@ -246,12 +246,10 @@ class TestTruncateSnapshot:
         # Should mention how many lines were truncated
         assert "more line" in result.lower()
 
-    def test_threshold_aligned_with_web_extract_budget(self):
-        """Snapshot and web_extract share the truncate-and-store pattern —
-        the per-page budget the model sees must stay aligned between them."""
+    def test_threshold_uses_compact_fork_budget(self):
+        """Browser snapshots retain the fork's compact inline page budget."""
         from tools.browser_tool import SNAPSHOT_SUMMARIZE_THRESHOLD
-        from tools.web_tools import DEFAULT_EXTRACT_CHAR_LIMIT
-        assert SNAPSHOT_SUMMARIZE_THRESHOLD == DEFAULT_EXTRACT_CHAR_LIMIT
+        assert SNAPSHOT_SUMMARIZE_THRESHOLD == 4_000
 
     def test_truncation_stores_full_snapshot_and_points_to_it(self):
         """Truncated snapshots save the complete text to cache/web (like web_extract)."""
