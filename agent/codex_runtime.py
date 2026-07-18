@@ -1421,6 +1421,7 @@ def run_codex_raw_sse_fallback(agent, api_kwargs: dict, client: Any = None):
     terminal_response: dict[str, Any] | None = None
     collected_output_items: list[dict[str, Any]] = []
     collected_text_deltas: list[str] = []
+    writer_token = claim_stream_writer(agent)
     with _httpx.Client(timeout=600) as http_client:
         with http_client.stream(
             "POST",
@@ -1440,6 +1441,10 @@ def run_codex_raw_sse_fallback(agent, api_kwargs: dict, client: Any = None):
                 if agent._interrupt_requested:
                     raise InterruptedError(
                         "Agent interrupted during Codex raw SSE fallback"
+                    )
+                if not stream_writer_is_current(agent, writer_token):
+                    raise InterruptedError(
+                        "Codex raw SSE fallback superseded by a newer stream"
                     )
                 if not line or not line.startswith("data:"):
                     continue
