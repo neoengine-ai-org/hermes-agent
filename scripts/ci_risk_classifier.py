@@ -458,13 +458,43 @@ def _run_git(args: list[str]) -> str:
     return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
 
 
-def changed_files_from_git(base: str | None, head: str | None) -> list[str]:
-    if base and head:
-        diff_range = f"{base}...{head}"
-    else:
-        diff_range = os.getenv("GITHUB_BASE_REF") or "origin/main...HEAD"
-    out = _run_git(["diff", "--name-only", diff_range])
-    return [line for line in out.splitlines() if line]
+def changed_files_from_github_files_api(path: str) -> list[str]:
+    """Return the authoritative PR-file list from GitHub's Files API artifact.
+
+    An empty JSON array is a valid zero-diff PR.  Missing, malformed, or
+    incomplete API data is deliberately rejected instead of being replaced by
+    a local git diff, which can be unavailable or misleading in shallow CI
+    checkouts.
+    """
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to read GitHub Files API result: {exc}") from exc
+    if not isinstance(payload, list):
+        raise ValueError("GitHub Files API result must be a JSON array")
+
+    files: list[str] = []
+    for item in payload:
+        if not isinstance(item, dict) or not isinstance(item.get("filename"), str) or not item["filename"]:
+            raise ValueError("GitHub Files API result contains an entry without a filename")
+        files.append(item["filename"])
+    if len(files) != len(set(files)):
+        raise ValueError("GitHub Files API result contains duplicate filenames")
+    return files
+
+
+def additions_from_github_files_api(path: str) -> int:
+    """Return additions from the same authoritative GitHub Files API artifact."""
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"unable to read GitHub Files API result: {exc}") from exc
+    if not isinstance(payload, list) or any(
+        not isinstance(item, dict) or not isinstance(item.get("additions"), int) or item["additions"] < 0
+        for item in payload
+    ):
+        raise ValueError("GitHub Files API result contains an entry without a valid additions count")
+    return sum(item["additions"] for item in payload)
 
 
 def additions_from_git(base: str | None, head: str | None) -> int:
@@ -1207,7 +1237,12 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base")
     parser.add_argument("--head")
-    parser.add_argument("--changed-file", action="append", default=[])
+    files_source = parser.add_mutually_exclusive_group(required=True)
+    files_source.add_argument("--changed-file", action="append", default=None)
+    files_source.add_argument(
+        "--github-files-json",
+        help="JSON array returned by GitHub's pull-request Files API; an empty array is authoritative.",
+    )
     parser.add_argument("--pr-body")
     parser.add_argument("--additions", type=int)
     parser.add_argument("--output-dir", default=".")
@@ -1221,12 +1256,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--base-classification", help="Existing trusted base classification JSON to wrap with trusted execution metadata")
     args = parser.parse_args(argv)
 
-    files = args.changed_file or changed_files_from_git(args.base, args.head)
+    try:
+        files = (
+            changed_files_from_github_files_api(args.github_files_json)
+            if args.github_files_json is not None
+            else args.changed_file
+        )
+        api_additions = additions_from_github_files_api(args.github_files_json) if args.github_files_json is not None else None
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.base_classification:
         base_classification = json.loads(Path(args.base_classification).read_text(encoding="utf-8"))
     else:
         body = read_body(args.pr_body)
-        additions = args.additions if args.additions is not None else additions_from_git(args.base, args.head)
+        additions = args.additions if args.additions is not None else (api_additions if api_additions is not None else additions_from_git(args.base, args.head))
         base_classification = classify(files, body, additions, args.pr_number, args.repo, args.title).as_dict()
     head_classification = None
     if args.compare_head_classification:

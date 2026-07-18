@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -1125,3 +1126,53 @@ def test_head_classifier_cannot_weaken_model_tier_or_frontier_requirements() -> 
     assert "missing_governance_or_merge_authority_change" in weakenings
     assert "missing_cc_review_required" in weakenings
     assert "missing_opposite_frontier_required" in weakenings
+
+
+def test_explicit_empty_github_files_api_result_does_not_use_git_diff(tmp_path: Path, monkeypatch) -> None:
+    files_api_result = tmp_path / "pr-files.json"
+    files_api_result.write_text("[]\n", encoding="utf-8")
+    pr_body = tmp_path / "pr-body.md"
+    pr_body.write_text(body(**{"Impacted surfaces": "receipt_only"}), encoding="utf-8")
+
+    def git_diff_must_not_run(*_args, **_kwargs):
+        raise AssertionError("an explicit GitHub Files API result must not fall back to git diff")
+
+    monkeypatch.setattr(ci_risk_classifier, "_run_git", git_diff_must_not_run)
+    output_dir = tmp_path / "classification"
+    exit_code = ci_risk_classifier.main(
+        [
+            "--github-files-json", str(files_api_result),
+            "--pr-body", str(pr_body),
+            "--output-dir", str(output_dir),
+        ]
+    )
+
+    result = json.loads((output_dir / "ci-classification.json").read_text(encoding="utf-8"))
+    assert exit_code == 0
+    assert result["impacted_surfaces"] == ["receipt_only"]
+    assert result["reason"].startswith("Inferred from 0 changed file(s)")
+
+
+def test_missing_changed_file_source_fails_closed_without_git_diff(monkeypatch) -> None:
+    def git_diff_must_not_run(*_args, **_kwargs):
+        raise AssertionError("missing file data must not be replaced by git diff")
+
+    monkeypatch.setattr(ci_risk_classifier, "_run_git", git_diff_must_not_run)
+    try:
+        ci_risk_classifier.main([])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("missing changed-file data must fail closed")
+
+
+def test_ambiguous_github_files_api_result_fails_closed(tmp_path: Path) -> None:
+    files_api_result = tmp_path / "pr-files.json"
+    files_api_result.write_text('[{"filename": "docs/a.md"}, {"filename": "docs/a.md"}]\n', encoding="utf-8")
+
+    try:
+        ci_risk_classifier.main(["--github-files-json", str(files_api_result)])
+    except SystemExit as exc:
+        assert exc.code == 2
+    else:
+        raise AssertionError("ambiguous GitHub Files API data must fail closed")
