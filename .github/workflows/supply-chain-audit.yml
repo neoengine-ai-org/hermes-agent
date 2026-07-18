@@ -120,6 +120,31 @@ jobs:
           # same name (e.g. hermes_cli/setup.py — the CLI setup wizard) is unrelated
           # and produced false positives that trained reviewers to ignore the scanner.
           SETUP_HITS=$(git diff --name-only "$BASE"..."$HEAD" | grep -E '^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$' || true)
+          # Periodic fork syncs can legitimately carry an install-hook change
+          # already present in the official NousResearch mainline. Fetch the
+          # authoritative source and exempt only files whose HEAD bytes are
+          # unchanged from the shared upstream ancestor. Fork-local install
+          # hook changes remain blocking.
+          if [ -n "$SETUP_HITS" ]; then
+            TRUSTED_UPSTREAM_BASE=""
+            if git fetch --no-tags https://github.com/NousResearch/hermes-agent.git main; then
+              TRUSTED_UPSTREAM_BASE=$(git merge-base "$HEAD" FETCH_HEAD || true)
+            fi
+            UNTRUSTED_SETUP_HITS=""
+            while IFS= read -r path; do
+              [ -z "$path" ] && continue
+              if [ -n "$TRUSTED_UPSTREAM_BASE" ] && git diff --quiet "$TRUSTED_UPSTREAM_BASE" "$HEAD" -- "$path"; then
+                echo "::notice::Trusted upstream install-hook sync: $path"
+              else
+                if [ -z "$UNTRUSTED_SETUP_HITS" ]; then
+                  UNTRUSTED_SETUP_HITS="$path"
+                else
+                  UNTRUSTED_SETUP_HITS=$(printf '%s\n%s' "$UNTRUSTED_SETUP_HITS" "$path")
+                fi
+              fi
+            done <<< "$SETUP_HITS"
+            SETUP_HITS="$UNTRUSTED_SETUP_HITS"
+          fi
           if [ -n "$SETUP_HITS" ]; then
             FINDINGS="${FINDINGS}
           ### 🚨 CRITICAL: Install-hook file added or modified
