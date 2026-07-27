@@ -8,28 +8,36 @@ permissions:
   contents: read
 
 jobs:
-  attribution:
+  diagnostic:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
-      - name: Print PR commit attribution
+      - name: Capture PR commit attribution
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p diagnostic
           merge_base=$(git merge-base origin/main HEAD)
-          git log "${merge_base}..HEAD" --no-merges --format='sha=%H author=%an email=%ae'
-
-  focused-classifier-tests:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+          git log "${merge_base}..HEAD" --no-merges --format='sha=%H author=%an email=%ae' > diagnostic/attribution.txt
       - name: Install focused test dependency
         run: python3 -m pip install --disable-pip-version-check -q pytest
-      - name: Run classifier regression suites
-        run: >-
-          python3 -m pytest -q --tb=short
-          tests/test_ci_risk_classifier_generic_runtime.py
-          tests/test_ci_risk_classifier.py
-          tests/test_trusted_ci_risk_classifier.py
+      - name: Capture classifier regression output
+        shell: bash
+        run: |
+          set +e
+          python3 -m pytest -q --tb=short \
+            tests/test_ci_risk_classifier_generic_runtime.py \
+            tests/test_ci_risk_classifier.py \
+            tests/test_trusted_ci_risk_classifier.py \
+            > diagnostic/pytest.txt 2>&1
+          status=$?
+          printf '\nexit_status=%s\n' "$status" >> diagnostic/pytest.txt
+          exit 0
+      - name: Upload diagnostic output
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: pr71-diagnostic-output
+          path: diagnostic
+          retention-days: 1
