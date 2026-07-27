@@ -21,8 +21,8 @@ jobs:
           mkdir -p diagnostic
           merge_base=$(git merge-base origin/main HEAD)
           git log "${merge_base}..HEAD" --no-merges --format='sha=%H author=%an email=%ae' > diagnostic/attribution.txt
-      - name: Install focused test dependency
-        run: python3 -m pip install --disable-pip-version-check -q pytest
+      - name: Install focused test dependencies
+        run: python3 -m pip install --disable-pip-version-check -q pytest==9.0.2 pytest-timeout==2.4.0
       - name: Capture classifier regression output
         shell: bash
         run: |
