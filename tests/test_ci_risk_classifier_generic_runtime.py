@@ -53,21 +53,25 @@ def test_unknown_packaged_python_cannot_fall_back_to_docs_only() -> None:
         title="feat: add packaged lifecycle contract",
     )
 
-    assert result.surfaces == {"runtime_backend"}
+    assert set(result.impacted_surfaces) == {"runtime_backend"}
     assert result.risk_class == "R2"
     assert result.model_tier_required == 2
     assert result.runtime_payload_contract_present is False
     assert "runtime_surface_without_runtimePayloadContract" in result.merge_blocking_conditions
-    assert "declared_risk_weaker_than_classifier:R0<R2" in result.merge_blocking_conditions
+    assert "declared_model_tier_weaker_than_classifier" in result.merge_blocking_conditions
+    assert any(
+        blocker.startswith("declared_ci_lanes_weaker_than_classifier:")
+        for blocker in result.merge_blocking_conditions
+    )
     assert result.allowed_to_mark_ready is False
 
 
-def test_test_only_unknown_python_remains_test_only() -> None:
+def test_test_only_unknown_python_does_not_gain_runtime_backend() -> None:
     result = ci_risk_classifier.classify(
         ["tests/test_new_package.py"],
         docs_only_declaration(),
         additions=50,
     )
 
-    assert result.surfaces == {"test_only"}
-    assert "runtime_backend" not in result.surfaces
+    assert "test_only" in result.impacted_surfaces
+    assert "runtime_backend" not in result.impacted_surfaces
