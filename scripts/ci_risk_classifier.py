@@ -3,10 +3,9 @@
 
 The historical classifier implementation is preserved in
 ``ci_risk_classifier_core.py``. This entry point adds one conservative fallback:
-any non-test executable path that the core classifier would otherwise label only
-as ``docs_only`` is treated as ``runtime_backend``. That prevents new packaged
-code outside the currently enumerated directory prefixes from bypassing runtime
-classification and review requirements.
+package-like executable paths that the core classifier would otherwise label only
+as ``docs_only`` are treated as ``runtime_backend``. Repository tooling paths keep
+their established CI/governance classification.
 """
 
 from __future__ import annotations
@@ -31,31 +30,41 @@ _SPEC.loader.exec_module(_core)
 _core.SELF_CHANGE_PATHS.add("scripts/ci_risk_classifier_core.py")
 _original_infer_surfaces = _core.infer_surfaces
 
+# These paths contain repository tooling, tests, workflow definitions, or
+# documentation rather than distributable/runtime packages. Their established
+# classifier semantics already come from companion workflow/classifier rules;
+# treating every unknown executable below them as runtime would over-escalate
+# ordinary CI repairs (for example scripts/ci/*.py).
+_NON_RUNTIME_TOOLING_PREFIXES = (
+    ".github/",
+    "docs/",
+    "examples/",
+    "nix/",
+    "packaging/",
+    "scripts/",
+    "tests/",
+)
+
+
+def _is_package_like_unknown_executable(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("./")
+    if normalized.startswith(_NON_RUNTIME_TOOLING_PREFIXES):
+        return False
+    candidate = Path(normalized)
+    if candidate.suffix.lower() not in _core.EXECUTABLE_SUFFIXES:
+        return False
+    if _core.is_test_like_path(normalized):
+        return False
+    return set(_original_infer_surfaces([normalized], "")) == {"docs_only"}
+
 
 def infer_surfaces(files: Iterable[str], body: str) -> set[str]:
-    """Infer surfaces with a fail-closed fallback for unknown executables."""
+    """Infer surfaces with a fail-closed fallback for unknown packages."""
 
     file_list = list(files)
     surfaces = set(_original_infer_surfaces(file_list, body))
-    generic_executable_runtime = False
 
-    for raw_file in file_list:
-        normalized = raw_file.replace("\\", "/")
-        path = Path(normalized)
-        if path.suffix.lower() not in _core.EXECUTABLE_SUFFIXES:
-            continue
-        if _core.is_test_like_path(normalized):
-            continue
-
-        # Ask the established classifier how it understands this path without
-        # allowing PR-body prose to supply a surface. A lone docs_only result for
-        # executable bytes is the unsafe fallback this guard closes.
-        path_surfaces = set(_original_infer_surfaces([normalized], ""))
-        if path_surfaces == {"docs_only"}:
-            generic_executable_runtime = True
-            break
-
-    if generic_executable_runtime:
+    if any(_is_package_like_unknown_executable(path) for path in file_list):
         surfaces.discard("docs_only")
         surfaces.add("runtime_backend")
 
