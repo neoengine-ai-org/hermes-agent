@@ -28,7 +28,9 @@ jobs:
             exit 0
           fi
 
-          # Check each email against AUTHOR_MAP in release.py
+          # Check each email against AUTHOR_MAP in release.py. Gmail ignores
+          # periods in the local part, so accept an exact mapping or the same
+          # canonical Gmail mailbox. Other domains remain exact-match only.
           MISSING=""
           while IFS= read -r email; do
             # Skip teknium and bot emails
@@ -37,12 +39,43 @@ jobs:
                 continue ;;
             esac
 
-            # Check if email is in AUTHOR_MAP (either as a key or matches noreply pattern)
+            # GitHub noreply emails auto-resolve.
             if echo "$email" | grep -qP '\+.*@users\.noreply\.github\.com'; then
-              continue  # GitHub noreply emails auto-resolve
+              continue
             fi
 
-            if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
+            if ! python3 - "$email" <<'PY'
+          import ast
+          import sys
+          from pathlib import Path
+
+          candidate = sys.argv[1].strip().casefold()
+          module = ast.parse(Path("scripts/release.py").read_text(encoding="utf-8"))
+          author_map = None
+          for node in module.body:
+              if not isinstance(node, ast.Assign):
+                  continue
+              if any(isinstance(target, ast.Name) and target.id == "AUTHOR_MAP" for target in node.targets):
+                  author_map = ast.literal_eval(node.value)
+                  break
+
+          if not isinstance(author_map, dict):
+              raise SystemExit("AUTHOR_MAP not found or is not a literal dictionary")
+
+          def canonical(value: str) -> str:
+              local, separator, domain = value.strip().casefold().partition("@")
+              if not separator:
+                  return value.strip().casefold()
+              if domain in {"gmail.com", "googlemail.com"}:
+                  local = local.split("+", 1)[0].replace(".", "")
+                  domain = "gmail.com"
+              return f"{local}@{domain}"
+
+          exact = {str(key).casefold() for key in author_map}
+          canonical_mapped = {canonical(str(key)) for key in author_map}
+          raise SystemExit(0 if candidate in exact or canonical(candidate) in canonical_mapped else 1)
+          PY
+            then
               AUTHOR=$(git log --author="$email" --format='%an' -1)
               MISSING="${MISSING}\n  ${email} (${AUTHOR})"
             fi
