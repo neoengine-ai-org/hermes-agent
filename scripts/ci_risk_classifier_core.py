@@ -1,0 +1,1257 @@
+#!/usr/bin/env python3
+"""Classify PR risk/complexity and required CI/review lanes.
+
+This script is intentionally deterministic and dependency-free so it can run as
+an early GitHub Actions gate before expensive jobs. It reads changed paths and a
+PR body, emits ci-classification.json / ci-classification.md, and exits non-zero
+when a PR body or lane declaration is weaker than the classifier requires.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterable
+
+RISK_ORDER = ["R0", "R1", "R2", "R3", "R4", "R5"]
+COMPLEXITY_ORDER = ["C0", "C1", "C2", "C3", "C4", "C5"]
+MODEL_TIER_ORDER = [0, 1, 2, 3, 4]
+SCHEMA_VERSION = "ci-classification.v1"
+SELF_CHANGE_PATHS = {
+    "scripts/ci_risk_classifier.py",
+    ".github/workflows/pr-risk-classifier.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "scripts/review_receipt_validator.py",
+    "scripts/dispatch_advisory.py",
+}
+
+RISK_TO_CI = {
+    "R0": {"pr_body_contract", "diff_check"},
+    "R1": {"pr_body_contract", "diff_check", "docs_impact"},
+    "R2": {
+        "pr_body_contract",
+        "diff_check",
+        "docs_impact",
+        "typecheck",
+        "targeted_runtime_tests",
+        "backend_runtime",
+        "build",
+    },
+    "R3": {
+        "pr_body_contract",
+        "diff_check",
+        "docs_impact",
+        "typecheck",
+        "targeted_runtime_tests",
+        "backend_runtime",
+        "build",
+        "governance_required",
+    },
+    "R4": {
+        "pr_body_contract",
+        "diff_check",
+        "docs_impact",
+        "typecheck",
+        "targeted_runtime_tests",
+        "backend_runtime",
+        "build",
+        "governance_required",
+        "security_required",
+        "protected_claim_gate",
+        "human_gate_required",
+        "privacy_data_gate",
+        "rollback_proof",
+        "audit_log_validation",
+    },
+    "R5": {
+        "pr_body_contract",
+        "diff_check",
+        "docs_impact",
+        "typecheck",
+        "targeted_runtime_tests",
+        "backend_runtime",
+        "build",
+        "governance_required",
+        "security_required",
+        "protected_claim_gate",
+        "human_gate_required",
+        "privacy_data_gate",
+        "rollback_proof",
+        "audit_log_validation",
+        "production_readiness_gate",
+        "incident_response_check",
+        "support_readiness_check",
+        "marketing_claims_check",
+        "data_deletion_export_check",
+        "monitoring_observability_check",
+    },
+}
+
+SURFACE_TO_CI = {
+    "docs_only": {"pr_body_contract", "diff_check", "docs_impact"},
+    "receipt_only": {"pr_body_contract", "diff_check", "docs_impact"},
+    "test_only": {"pr_body_contract", "diff_check", "targeted_tests"},
+    "runtime_backend": {"typecheck", "targeted_runtime_tests", "backend_runtime", "build"},
+    "runtime_frontend": {"typecheck", "ui_quality", "targeted_frontend_tests", "build"},
+    "api_route": {"backend_runtime", "route_smoke_tests", "contract_tests", "non_claim_tests"},
+    "reducer": {"backend_runtime", "reducer_tests", "fixture_provenance_finality_tests"},
+    "storage": {"backend_runtime", "storage_conformance_tests", "rollback_tests"},
+    "sql_database": {"migration_lint", "dry_run", "rollback_proof", "db_admission_gate", "protected_human_review"},
+    "roadmap_os": {"validate_roadmap_os", "validate_pr_roadmap_delta", "reduce_roadmap_events", "check_reducer_parity", "generate_roadmap_views_check"},
+    "accepted_event": {"validate_roadmap_os", "authorized_reducer_review"},
+    "candidate_event": {"event_schema_validation", "no_accepted_state_mutation_check"},
+    "prd_packet": {"validate_prd_packets", "runtimePayloadContract_validation", "blocker_exemption_validation"},
+    "conductor_dispatch": {"backend_runtime", "conductor_tests", "executive_gate_tests", "governance_required"},
+    "hermes_sidecar": {"hermes_sidecar_tests", "sidecar_authority_policy_tests", "no_merge_evidence_guard"},
+    "ci_workflow": {"workflow_lint", "pr_impact_classifier_tests", "governance_required"},
+    "classifier_change": {"workflow_lint", "pr_impact_classifier_tests", "governance_required", "review_policy_guard"},
+    "governance_review_policy": {"docs_impact", "governance_required", "review_policy_guard"},
+    "security_permissions": {"security_required", "permissions_tests", "protected_human_review"},
+    "auth_identity": {"auth_tests", "session_isolation_tests", "security_required"},
+    "secrets_tokens": {"secret_scan", "token_storage_tests", "encryption_tests", "protected_human_review"},
+    "live_connector": {"connector_sandbox_tests", "webhook_tests", "token_vault_tests", "consent_audit_tests", "protected_human_review"},
+    "webhook": {"signature_validation_tests", "replay_idempotency_tests", "failure_rollback_tests"},
+    "pii_customer_data": {"privacy_data_gate", "deletion_export_tests", "audit_log_tests", "incident_response_check"},
+    "finance_interpretation": {"finance_sensitive_review", "finality_non_claim_tests", "no_advice_claim_guard"},
+    "tax_accounting": {"protected_human_review", "tax_accounting_non_claim_guard", "finality_tests"},
+    "money_movement": {"human_gate_required", "protected_claim_gate"},
+    "launch_production": {"production_readiness_gate", "monitoring_observability_check", "rollback_check", "incident_response_check"},
+    "support_customer_ops": {"support_readiness_check", "customer_safe_language_check", "escalation_policy_check"},
+    "marketing_claims": {"marketing_claims_check", "regulated_claim_guard"},
+    "mac_app": {"mac_app_check", "typecheck"},
+    "gbrain_gstack": {"gbrain_gstack_contract_tests", "read_only_write_back_gate"},
+    "product_intelligence": {"rubric_tests", "evaluation_score_drift_tests"},
+}
+
+PROTECTED_SURFACES = {
+    "sql_database",
+    "security_permissions",
+    "auth_identity",
+    "secrets_tokens",
+    "live_connector",
+    "webhook",
+    "pii_customer_data",
+    "finance_interpretation",
+    "tax_accounting",
+    "money_movement",
+    "launch_production",
+}
+
+GOVERNANCE_OR_MERGE_AUTHORITY_SURFACES = {
+    "conductor_dispatch",
+    "roadmap_os",
+    "accepted_event",
+    "classifier_change",
+    "governance_review_policy",
+}
+
+CUSTOMER_DATA_OR_FINANCE_SURFACES = {
+    "pii_customer_data",
+    "finance_interpretation",
+    "tax_accounting",
+    "money_movement",
+}
+
+RUNTIME_AUTHORITY_SURFACES = {
+    "conductor_dispatch",
+    "hermes_sidecar",
+    "accepted_event",
+}
+
+RUNTIME_SURFACES = {
+    "runtime_backend",
+    "runtime_frontend",
+    "api_route",
+    "reducer",
+    "storage",
+    "sql_database",
+    "conductor_dispatch",
+    "hermes_sidecar",
+    "ci_workflow",
+    "auth_identity",
+    "secrets_tokens",
+    "live_connector",
+    "webhook",
+}
+
+CLASSIFICATION_HEADER = "Risk, Complexity, Review, and CI Classification"
+RUNTIME_PAYLOAD_CONTRACT_FIELDS = {
+    "user_or_operator_visible_outcome",
+    "runtime_surface_touched",
+    "product_or_platform_capability_advanced",
+    "why_this_is_not_only_docs_or_scaffolding",
+    "tests_that_prove_runtime_behavior",
+    "acceptance_gate",
+    "rollback",
+    "protected_non_claims",
+}
+
+EXECUTABLE_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".sql", ".sh", ".bash", ".rb", ".go", ".rs"}
+DOC_PROSE_SUFFIXES = {".md", ".mdx", ".rst", ".txt"}
+DOC_PLANS_DATA_SUFFIXES = {".json", ".yaml", ".yml"}
+DOC_PLANNING_PREFIXES = ("docs/plans/",)
+
+
+def path_tokens(file: str) -> set[str]:
+    normalized = file.replace("\\", "/")
+    camel_split = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", normalized)
+    return {token for token in re.split(r"[^a-z0-9]+", camel_split.lower()) if token}
+
+
+def is_test_like_path(file: str) -> bool:
+    path = Path(file)
+    parts = {part.lower() for part in path.parts}
+    name = path.name.lower()
+    return (
+        bool(parts & {"test", "tests", "__tests__"})
+        or (bool(parts & {"spec", "specs"}) and (name.endswith("_spec.rb") or name.endswith("_test.rb")))
+        or name.startswith("test_")
+        or name.endswith(
+            (
+                ".test.py",
+                ".spec.py",
+                ".test.ts",
+                ".spec.ts",
+                ".test.tsx",
+                ".spec.tsx",
+                ".test.js",
+                ".spec.js",
+                ".test.jsx",
+                ".spec.jsx",
+            )
+        )
+    )
+
+
+def is_documentation_file(file: str) -> bool:
+    normalized = file.replace("\\", "/")
+    path = Path(normalized)
+    suffix = path.suffix.lower()
+    parts = {part.lower() for part in path.parts}
+    return suffix not in EXECUTABLE_SUFFIXES and (
+        (suffix in DOC_PROSE_SUFFIXES and "docs" in parts)
+        or (normalized.startswith(DOC_PLANNING_PREFIXES) and suffix in (DOC_PROSE_SUFFIXES | DOC_PLANS_DATA_SUFFIXES))
+    )
+
+
+def is_launch_production_path(file: str) -> bool:
+    if is_documentation_file(file):
+        return False
+
+    path = Path(file.replace("\\", "/"))
+    tokens = path_tokens(file)
+    parts_list = [part.lower() for part in path.parts]
+    parts = set(parts_list)
+    suffix = path.suffix.lower()
+    name = path.name.lower()
+    test_like = is_test_like_path(file)
+    if suffix in DOC_PROSE_SUFFIXES:
+        return False
+
+    production_tokens = {"prod", "production"}
+    deploy_name_tokens = {"deploy", "deployment", "deployments"}
+    release_rollout_tokens = {"release", "rollout"}
+    launch_posture_tokens = {
+        "activation",
+        "approval",
+        "approved",
+        "boundary",
+        "config",
+        "configuration",
+        "controller",
+        "dockerfile",
+        "env",
+        "environment",
+        "environments",
+        "gate",
+        "gating",
+        "grade",
+        "manager",
+        "pipeline",
+        "router",
+        "settings",
+        "readiness",
+        "ready",
+        "sequence",
+        "values",
+    }
+    deployment_script_parts = {
+        ".github",
+        "bin",
+        "cron",
+        "deploy",
+        "deployment",
+        "deployments",
+        "infra",
+        "infrastructure",
+        "k8s",
+        "kubernetes",
+        "ops",
+        "release",
+        "rollout",
+        "scripts",
+        "tools",
+        "workflows",
+    }
+    deployment_config_suffixes = {
+        ".env",
+        ".hcl",
+        ".json",
+        ".tf",
+        ".tfvars",
+        ".toml",
+        ".yaml",
+        ".yml",
+    }
+    docker_artifact = (
+        name == "dockerfile"
+        or name in {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+        or (name.startswith(("dockerfile", "docker-compose", "compose.")) and tokens & production_tokens)
+    )
+    deploy_artifact = (
+        suffix in EXECUTABLE_SUFFIXES
+        or suffix in deployment_config_suffixes
+        or docker_artifact
+    )
+    root_path = len(parts_list) == 1
+    workflow_path = len(parts_list) >= 2 and parts_list[0] == ".github" and parts_list[1] == "workflows"
+    top_level_deployment_config = bool(parts_list) and parts_list[0] in {
+        "ansible",
+        "helm",
+        "helm-charts",
+        "infrastructure",
+        "infra",
+        "k8s",
+        "kubernetes",
+        "kube",
+        "manifests",
+        "pulumi",
+        "terraform",
+    }
+    top_level_helm_chart_config = (
+        bool(parts_list)
+        and parts_list[0] in {"charts", "helm", "helm-charts"}
+        and (
+            "templates" in parts
+            or name in {"chart.yaml", "chart.yml"}
+            or parts_list[0] in {"helm", "helm-charts"}
+            or (parts_list[0] == "charts" and len(parts_list) >= 3 and name in {"values.yaml", "values.yml"})
+            or (
+                parts_list[0] == "charts"
+                and len(parts_list) >= 3
+                and suffix in {".yaml", ".yml"}
+                and tokens & production_tokens
+            )
+        )
+    )
+    nested_helm_chart_config = bool(parts & {"helm", "helm-charts"}) and (not parts_list or parts_list[0] not in {"docs", "examples"})
+    deployment_config_context = (
+        top_level_deployment_config
+        or top_level_helm_chart_config
+        or nested_helm_chart_config
+        or bool(parts & {"ansible", "infra", "infrastructure", "k8s", "kubernetes", "kube", "manifests", "pulumi", "terraform"})
+    )
+    deployment_path_context = (
+        workflow_path
+        or root_path
+        or bool(parts & deployment_script_parts)
+        or top_level_deployment_config
+    )
+    presentation_parts = {"component", "components", "frontend", "ui", "ui-tui", "view", "views"}
+    presentation_observer_tokens = {
+        "badge",
+        "banner",
+        "card",
+        "dashboard",
+        "display",
+        "list",
+        "modal",
+        "notes",
+        "panel",
+        "status",
+        "table",
+        "widget",
+    }
+    deploy_control_tokens = {"controller", "cutover", "helper", "helpers", "manager", "pipeline", "router", "sequence"}
+    production_operation_tokens = {"backfill", "cutover", "settings"}
+    fixture_tokens = {"example", "fixture", "fixtures", "mock", "sample", "samples"}
+
+    if test_like:
+        if docker_artifact and not tokens & production_tokens and not deployment_config_context:
+            return False
+        if suffix not in deployment_config_suffixes and not docker_artifact:
+            return False
+    if docker_artifact:
+        return True
+
+    if (
+        parts & presentation_parts
+        and tokens & (deploy_name_tokens | release_rollout_tokens | production_tokens | {"launch"})
+        and tokens & presentation_observer_tokens
+        and not deployment_config_context
+        and not (suffix in deployment_config_suffixes and tokens & (production_tokens | deploy_name_tokens))
+        and not tokens & deploy_control_tokens
+        and not tokens & {"approval", "approved", "gate", "gating", "readiness", "ready"}
+    ):
+        return False
+
+    if suffix in deployment_config_suffixes and deployment_config_context:
+        return True
+    if (
+        suffix in deployment_config_suffixes
+        and tokens & (deploy_name_tokens | release_rollout_tokens)
+        and not tokens & fixture_tokens
+    ):
+        return True
+    if (
+        tokens & deploy_name_tokens
+        and deploy_artifact
+        and not tokens & fixture_tokens
+        and (deployment_path_context or tokens & (production_tokens | release_rollout_tokens | {"launch"} | deploy_control_tokens))
+    ):
+        return True
+    if tokens & release_rollout_tokens and deploy_artifact and not tokens & fixture_tokens and (deployment_path_context or tokens & production_tokens):
+        return True
+    if tokens & production_tokens and deploy_artifact:
+        if suffix in deployment_config_suffixes:
+            if root_path or deployment_config_context or deployment_path_context or parts & {"config", "env", "environment", "environments", "prod", "production"}:
+                return True
+        else:
+            if (
+                deployment_path_context
+                or deployment_config_context
+                or parts & {"prod", "production"}
+                or tokens & (deploy_name_tokens | release_rollout_tokens | {"launch"} | deploy_control_tokens | production_operation_tokens)
+            ):
+                return True
+    if tokens & production_tokens and (
+        tokens & (deploy_name_tokens | release_rollout_tokens | {"launch"} | launch_posture_tokens) or deployment_config_context
+    ):
+        if (
+            not deploy_artifact
+            or deployment_path_context
+            or deployment_config_context
+            or parts & {"prod", "production"}
+            or tokens & (deploy_name_tokens | release_rollout_tokens | {"launch"} | deploy_control_tokens | production_operation_tokens)
+        ):
+            return True
+    if "launch" in tokens and tokens & (production_tokens | launch_posture_tokens):
+        return True
+    return False
+
+
+def _max(values: Iterable[str], order: list[str]) -> str:
+    return max(values, key=order.index)
+
+
+def _bump(value: str, order: list[str], steps: int = 1) -> str:
+    return order[min(order.index(value) + steps, len(order) - 1)]
+
+
+def _run_git(args: list[str]) -> str:
+    return subprocess.check_output(["git", *args], text=True, stderr=subprocess.DEVNULL).strip()
+
+
+def changed_files_from_git(base: str | None, head: str | None) -> list[str]:
+    if base and head:
+        diff_range = f"{base}...{head}"
+    else:
+        diff_range = os.getenv("GITHUB_BASE_REF") or "origin/main...HEAD"
+    out = _run_git(["diff", "--name-only", diff_range])
+    return [line for line in out.splitlines() if line]
+
+
+def additions_from_git(base: str | None, head: str | None) -> int:
+    try:
+        diff_range = f"{base}...{head}" if base and head else (os.getenv("GITHUB_BASE_REF") or "origin/main...HEAD")
+        out = _run_git(["diff", "--numstat", diff_range])
+    except Exception:
+        return 0
+    total = 0
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if parts and parts[0].isdigit():
+            total += int(parts[0])
+    return total
+
+
+def read_body(path: str | None) -> str:
+    if path:
+        return Path(path).read_text(encoding="utf-8")
+    event_path = os.getenv("GITHUB_EVENT_PATH")
+    if event_path and Path(event_path).exists():
+        event = json.loads(Path(event_path).read_text(encoding="utf-8"))
+        return (event.get("pull_request") or {}).get("body") or ""
+    return ""
+
+
+def parse_declared_field(body: str, label: str) -> str | None:
+    match = re.search(rf"^-\s*{re.escape(label)}\s*:\s*(.+?)\s*$", body, re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return None if value.lower() in {"", "n/a", "na", "todo", "tbd"} else value
+
+
+def parse_yes_no(body: str, label: str) -> str | None:
+    value = parse_declared_field(body, label)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered.startswith("yes"):
+        return "yes"
+    if lowered.startswith("no"):
+        return "no"
+    return value
+
+
+def parse_boolish(body: str, label: str) -> str | None:
+    value = parse_declared_field(body, label)
+    if value is None:
+        return None
+    lowered = value.lower()
+    if lowered.startswith(("yes", "true")):
+        return "yes"
+    if lowered.startswith(("no", "false")):
+        return "no"
+    return value
+
+
+def split_lanes(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    return {item.strip().strip("`") for item in re.split(r"[,\n]", value) if item.strip()}
+
+
+def parse_runtime_payload_contract(body: str) -> dict[str, str] | None:
+    """Parse the required Markdown RuntimePayloadContract section."""
+
+    lines = body.splitlines()
+    for index, line in enumerate(lines):
+        if re.match(r"^##\s+RuntimePayloadContract\s*$", line):
+            fields: dict[str, str] = {}
+            for contract_line in lines[index + 1 :]:
+                if re.match(r"^##\s+", contract_line):
+                    break
+                match = re.match(r"^\s*-\s*([A-Za-z0-9_]+)\s*:\s*(.*?)\s*$", contract_line)
+                if match:
+                    fields[match.group(1)] = match.group(2).strip()
+            return fields
+    return None
+
+
+def missing_runtime_payload_contract_fields(fields: dict[str, str] | None) -> list[str]:
+    if fields is None:
+        return sorted(RUNTIME_PAYLOAD_CONTRACT_FIELDS)
+    return sorted(field for field in RUNTIME_PAYLOAD_CONTRACT_FIELDS if not fields.get(field))
+
+
+def body_text_for_surface_inference(body: str) -> str:
+    """Return PR body text that can safely contribute semantic surfaces."""
+
+    lines: list[str] = []
+    for line in body.splitlines():
+        if re.match(r"^#+\s+(?:protected\s+)?non-claims\s*$", line, re.IGNORECASE):
+            continue
+        if re.match(r"^\s*-\s*protected_non_claims\s*:", line, re.IGNORECASE):
+            continue
+        negated_claim = re.match(r"^\s*-\s*this pr does not\b(.*)$", line, re.IGNORECASE)
+        if negated_claim:
+            affirmative_tail = re.search(
+                r"(?:\b(?:but|however|except)\b|[,;]\s*(?:and\s+)?|\band\s+)"
+                r"(.*\b(?:add|adds|adding|introduce|introduces|enable|enables|implement|implements|route|routes|routing|touch|touches|change|changes|update|updates|authorize|authorizes|claim|claims)\b.*)$",
+                negated_claim.group(1),
+                re.IGNORECASE,
+            )
+            if affirmative_tail:
+                lines.append(affirmative_tail.group(1))
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def infer_surfaces(files: list[str], body: str) -> set[str]:
+    surfaces: set[str] = set()
+    if not files:
+        return {"receipt_only"}
+
+    docs_like = True
+    tests_like = True
+    receipt_like = True
+    for file in files:
+        p = Path(file)
+        suffix = p.suffix.lower()
+        parts = {part.lower() for part in p.parts}
+        file_test_like = is_test_like_path(file)
+        docs_like = docs_like and (suffix in {".md", ".rst", ".txt"} or "docs" in parts or file == ".github/PULL_REQUEST_TEMPLATE.md")
+        tests_like = tests_like and file_test_like
+        receipt_like = receipt_like and ("receipt" in p.name.lower() or "receipts" in parts)
+
+        if file.startswith(".github/workflows/"):
+            surfaces.add("ci_workflow")
+        if file in SELF_CHANGE_PATHS:
+            surfaces.add("ci_workflow")
+            surfaces.add("classifier_change")
+        if any(term in file.lower() for term in ("doctrine", "governance", "merge", "review-routing", "review_policy", "review-policy")):
+            surfaces.add("governance_review_policy")
+        if file.startswith("gateway/") or "dispatch" in file or "conductor" in file:
+            surfaces.add("conductor_dispatch")
+        if not file_test_like and file.startswith(("agent/", "tools/", "hermes_cli/", "cron/", "tui_gateway/", "plugins/", "gateway/")):
+            surfaces.add("runtime_backend")
+        if not file_test_like and (file.startswith(("ui-tui/", "website/src/", "website/web/")) or suffix in {".tsx", ".jsx", ".css"}):
+            surfaces.add("runtime_frontend")
+        if "route" in file or "api" in parts:
+            surfaces.add("api_route")
+        if "reducer" in file:
+            surfaces.add("reducer")
+        if "storage" in file or "database" in file:
+            surfaces.add("storage")
+        if suffix == ".sql" or "migrations" in parts:
+            surfaces.add("sql_database")
+        if "roadmap" in file.lower():
+            surfaces.add("roadmap_os")
+        if "accepted" in file.lower() and "event" in file.lower():
+            surfaces.add("accepted_event")
+        if "candidate" in file.lower() and "event" in file.lower():
+            surfaces.add("candidate_event")
+        if "prd" in file.lower() or "packet" in file.lower():
+            surfaces.add("prd_packet")
+        if "hermes" in file.lower() and ("sidecar" in file.lower() or "watchdog" in file.lower()):
+            surfaces.add("hermes_sidecar")
+        if any(term in file.lower() for term in ("auth", "permission", "oauth", "token", "secret")):
+            surfaces.add("security_permissions")
+        if "oauth" in file.lower() or "identity" in file.lower() or "session" in file.lower():
+            surfaces.add("auth_identity")
+        if "token" in file.lower() or "secret" in file.lower() or "vault" in file.lower():
+            surfaces.add("secrets_tokens")
+        if any(term in file.lower() for term in ("connector", "plaid", "bank")):
+            surfaces.add("live_connector")
+        if "webhook" in file.lower():
+            surfaces.add("webhook")
+        if any(term in file.lower() for term in ("pii", "customer_data", "privacy", "delete", "export")):
+            surfaces.add("pii_customer_data")
+        if any(term in file.lower() for term in ("finance", "ledger", "finality", "portfolio", "heloc", "loan")):
+            surfaces.add("finance_interpretation")
+        if any(term in file.lower() for term in ("tax", "accounting")):
+            surfaces.add("tax_accounting")
+        if "money_movement" in file.lower() or "payment" in file.lower():
+            surfaces.add("money_movement")
+        if is_launch_production_path(file):
+            surfaces.add("launch_production")
+        if "support" in file.lower():
+            surfaces.add("support_customer_ops")
+        if "marketing" in file.lower() or "landing" in file.lower():
+            surfaces.add("marketing_claims")
+        if "mac" in file.lower() or file.endswith(".app"):
+            surfaces.add("mac_app")
+        if any(term in file.lower() for term in ("gbrain", "gstack")):
+            surfaces.add("gbrain_gstack")
+
+    if tests_like:
+        surfaces.add("test_only")
+    if docs_like:
+        surfaces.add("docs_only")
+    if receipt_like:
+        surfaces.add("receipt_only")
+
+    declared_surfaces = parse_declared_field(body, "Impacted surfaces")
+    if declared_surfaces:
+        for surface in re.split(r"[,/]", declared_surfaces):
+            normalized = surface.strip().replace(" ", "_")
+            if normalized in SURFACE_TO_CI:
+                surfaces.add(normalized)
+    # Only prose-derived surfaces use filtered text. File paths and explicit
+    # Impacted surfaces declarations above remain authoritative.
+    body_lower = body_text_for_surface_inference(body).lower()
+    for surface in SURFACE_TO_CI:
+        if surface == "launch_production":
+            continue
+        if surface.replace("_", " ") in body_lower or surface in body_lower:
+            surfaces.add(surface)
+    return surfaces or {"docs_only"}
+
+
+def classifier_self_change(files: list[str]) -> bool:
+    return any(file in SELF_CHANGE_PATHS for file in files)
+
+
+def infer_risk(surfaces: set[str]) -> str:
+    if "money_movement" in surfaces or "launch_production" in surfaces:
+        return "R5"
+    if surfaces & PROTECTED_SURFACES:
+        return "R4"
+    if surfaces & {"conductor_dispatch", "hermes_sidecar", "ci_workflow", "roadmap_os", "accepted_event", "support_customer_ops", "marketing_claims"}:
+        return "R3"
+    if surfaces & RUNTIME_SURFACES or "prd_packet" in surfaces:
+        return "R2"
+    if surfaces & {"test_only", "candidate_event"}:
+        return "R1"
+    return "R0"
+
+
+def infer_complexity(files: list[str], additions: int, surfaces: set[str]) -> str:
+    file_count = len(files)
+    if surfaces & {"money_movement", "launch_production"}:
+        return "C5"
+    if file_count <= 2 and additions <= 100 and not (surfaces & RUNTIME_SURFACES):
+        complexity = "C0"
+    elif file_count <= 5 and additions <= 250:
+        complexity = "C1"
+    elif file_count <= 10 and additions <= 750:
+        complexity = "C2"
+    elif file_count <= 20 and additions <= 1500:
+        complexity = "C3"
+    else:
+        complexity = "C4"
+
+    # C5 is reserved for exceptional protected launch/production/security/data/
+    # token/SQL/financial authority. Ordinary upgrade triggers may make a PR
+    # large, but should not manufacture protected-review semantics by themselves.
+    def bump_non_protected(value: str) -> str:
+        return COMPLEXITY_ORDER[min(COMPLEXITY_ORDER.index(value) + 1, COMPLEXITY_ORDER.index("C4"))]
+
+    if "ci_workflow" in surfaces:
+        complexity = bump_non_protected(complexity)
+    if len({s for s in surfaces if s not in {"docs_only", "test_only", "receipt_only"}}) > 1:
+        complexity = bump_non_protected(complexity)
+    return complexity
+
+
+def required_reviews(risk: str, complexity: str, surfaces: set[str]) -> set[str]:
+    reviews: set[str] = set()
+    if risk in {"R2", "R3", "R4", "R5"} or complexity in {"C3", "C4", "C5"}:
+        reviews.add("secondary_review_required")
+    if risk in {"R3", "R4", "R5"} or complexity in {"C3", "C4", "C5"} or surfaces & RUNTIME_SURFACES:
+        reviews.add("adversarial_review_required")
+    if risk in {"R4", "R5"}:
+        reviews.add("opposite_provider_adversarial_required")
+    if risk in {"R4", "R5"} or surfaces & PROTECTED_SURFACES:
+        reviews.add("protected_human_review_required")
+    if risk == "R5" or "launch_production" in surfaces:
+        reviews.add("founder_review_required")
+    if surfaces & {"security_permissions", "auth_identity", "secrets_tokens", "live_connector", "webhook", "pii_customer_data"}:
+        reviews.add("security_review_required")
+    if surfaces & {"finance_interpretation", "tax_accounting", "money_movement"}:
+        reviews.add("finance_sensitive_review_required")
+    if not reviews:
+        reviews.add("no_secondary_review_required")
+    return reviews
+
+
+def token_class(risk: str, complexity: str) -> str:
+    if risk == "R5" or complexity == "C5":
+        return "XL"
+    if risk == "R4" or complexity in {"C3", "C4"}:
+        return "L"
+    if risk in {"R2", "R3"} or complexity == "C2":
+        return "M"
+    return "S"
+
+
+def parse_declared_model_tier(body: str) -> int | None:
+    value = parse_declared_field(body, "model_tier_required") or parse_declared_field(body, "Model tier required")
+    if value is None:
+        return None
+    match = re.search(r"\b([0-4])\b", value)
+    return int(match.group(1)) if match else None
+
+
+def infer_model_tier(
+    risk: str,
+    complexity: str,
+    surfaces: set[str],
+    protected_surface: bool,
+    runtime_authority_change: bool,
+    customer_data_or_finance_impact: bool,
+    governance_or_merge_authority_change: bool,
+) -> int:
+    """Route cc-review by blast radius and engineering complexity."""
+    if (
+        risk in {"R4", "R5"}
+        or complexity in {"C4", "C5"}
+        or protected_surface
+        or runtime_authority_change
+        or customer_data_or_finance_impact
+        or governance_or_merge_authority_change
+    ):
+        return 4
+    if risk == "R3" or complexity == "C3":
+        return 3
+    if risk == "R2" or complexity == "C2" or surfaces & RUNTIME_SURFACES:
+        return 2
+    if risk == "R1" or complexity == "C1" or surfaces & {"test_only", "candidate_event"}:
+        return 1
+    return 0
+
+
+def reviewer_for_tier(tier: int) -> str:
+    return {
+        0: "ci_only",
+        1: "cheap_semantic_review",
+        2: "mid_tier_engineering_review",
+        3: "codex_engineering_review",
+        4: "opposite_frontier_cc_review",
+    }[tier]
+
+
+def escalation_reason_for_tier(
+    tier: int,
+    risk: str,
+    complexity: str,
+    protected_surface: bool,
+    runtime_authority_change: bool,
+    customer_data_or_finance_impact: bool,
+    governance_or_merge_authority_change: bool,
+) -> str:
+    if tier == 4:
+        reasons = []
+        if risk in {"R4", "R5"}:
+            reasons.append(f"risk={risk}")
+        if protected_surface:
+            reasons.append("protected_surface")
+        if runtime_authority_change:
+            reasons.append("runtime_authority_change")
+        if customer_data_or_finance_impact:
+            reasons.append("customer_data_or_finance_impact")
+        if governance_or_merge_authority_change:
+            reasons.append("governance_or_merge_authority_change")
+        return ", ".join(reasons)
+    if tier == 3:
+        return f"bounded_complex_engineering:risk={risk},complexity={complexity}"
+    if tier == 2:
+        return "standard_bounded_engineering"
+    if tier == 1:
+        return "cheap_semantic_review"
+    return "mechanical_no_semantic_risk"
+
+
+@dataclass
+class Classification:
+    pr_number: str = "unknown"
+    repo: str = "unknown"
+    title: str = "unknown"
+    risk_class: str = "R0"
+    complexity_class: str = "C0"
+    impacted_surfaces: list[str] = field(default_factory=list)
+    protected_flags: list[str] = field(default_factory=list)
+    protected_surface: bool = False
+    runtime_authority_change: bool = False
+    customer_data_or_finance_impact: bool = False
+    governance_or_merge_authority_change: bool = False
+    model_tier_required: int = 0
+    model_reviewer: str = "ci_only"
+    cc_review_required: bool = False
+    opposite_frontier_required: bool = False
+    escalation_reason: str = "mechanical_no_semantic_risk"
+    runtime_payload_contract_present: bool = False
+    blocker_exemption_present: bool = False
+    required_ci_lanes: list[str] = field(default_factory=list)
+    optional_ci_lanes: list[str] = field(default_factory=list)
+    skipped_ci_lanes: list[str] = field(default_factory=list)
+    required_reviews: list[str] = field(default_factory=list)
+    secondary_review_required: bool = False
+    adversarial_review_required: bool = False
+    opposite_provider_required: bool = False
+    human_gate_required: bool = False
+    founder_review_required: bool = False
+    reason: str = ""
+    token_class: str = "S"
+    merge_blocking_conditions: list[str] = field(default_factory=list)
+    body_and_classification_ready: bool = True
+    review_ready: bool = True
+    merge_ready: bool = True
+    allowed_to_mark_ready: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return self.__dict__.copy()
+
+
+def classify(files: list[str], body: str, additions: int = 0, pr_number: str = "unknown", repo: str = "unknown", title: str = "unknown") -> Classification:
+    surfaces = infer_surfaces(files, body)
+    inferred_risk = infer_risk(surfaces)
+    inferred_complexity = infer_complexity(files, additions, surfaces)
+
+    declared_risk = parse_declared_field(body, "Risk class")
+    declared_complexity = parse_declared_field(body, "Complexity class")
+    risk = _max([inferred_risk, declared_risk if declared_risk in RISK_ORDER else inferred_risk], RISK_ORDER)
+    complexity = _max([inferred_complexity, declared_complexity if declared_complexity in COMPLEXITY_ORDER else inferred_complexity], COMPLEXITY_ORDER)
+
+    lanes = set(RISK_TO_CI[risk])
+    for surface in surfaces:
+        lanes |= SURFACE_TO_CI.get(surface, set())
+    lanes.add("pr_body_contract")
+    lanes.add("diff_check")
+
+    runtime_contract_fields = parse_runtime_payload_contract(body)
+    missing_contract_fields = missing_runtime_payload_contract_fields(runtime_contract_fields)
+    runtime_contract_present = (
+        parse_yes_no(body, "RuntimePayloadContract present") == "yes"
+        and runtime_contract_fields is not None
+        and not missing_contract_fields
+    )
+    blocker_exemption = parse_declared_field(body, "Blocker exemption, if any") is not None
+
+    protected_surface = bool(surfaces & PROTECTED_SURFACES)
+    runtime_authority_change = bool(surfaces & RUNTIME_AUTHORITY_SURFACES)
+    customer_data_or_finance_impact = bool(surfaces & CUSTOMER_DATA_OR_FINANCE_SURFACES)
+    governance_or_merge_authority_change = bool(surfaces & GOVERNANCE_OR_MERGE_AUTHORITY_SURFACES)
+    model_tier_required = infer_model_tier(
+        risk,
+        complexity,
+        surfaces,
+        protected_surface,
+        runtime_authority_change,
+        customer_data_or_finance_impact,
+        governance_or_merge_authority_change,
+    )
+    cc_review_required = model_tier_required >= 3
+    opposite_frontier_required = model_tier_required == 4
+    escalation_reason = escalation_reason_for_tier(
+        model_tier_required,
+        risk,
+        complexity,
+        protected_surface,
+        runtime_authority_change,
+        customer_data_or_finance_impact,
+        governance_or_merge_authority_change,
+    )
+
+    reviews = required_reviews(risk, complexity, surfaces)
+    if model_tier_required == 3:
+        reviews.add("codex_engineering_review_required")
+        reviews.discard("opposite_provider_adversarial_required")
+    if model_tier_required == 4:
+        reviews.add("opposite_frontier_cc_review_required")
+        reviews.add("opposite_provider_adversarial_required")
+
+    blocking: list[str] = []
+    if CLASSIFICATION_HEADER.lower() not in body.lower():
+        blocking.append("missing_required_pr_body_classification_section")
+    if declared_risk not in RISK_ORDER:
+        blocking.append("missing_or_invalid_declared_risk_class")
+    if declared_complexity not in COMPLEXITY_ORDER:
+        blocking.append("missing_or_invalid_declared_complexity_class")
+    declared_protected_surface = parse_boolish(body, "protected_surface")
+    declared_runtime_authority_change = parse_boolish(body, "runtime_authority_change")
+    declared_customer_data_or_finance_impact = parse_boolish(body, "customer_data_or_finance_impact")
+    declared_governance_or_merge_authority_change = parse_boolish(body, "governance_or_merge_authority_change")
+    declared_model_tier = parse_declared_model_tier(body)
+    declared_cc_review_required = parse_boolish(body, "cc_review_required")
+    declared_opposite_frontier_required = parse_boolish(body, "opposite_frontier_required")
+    declared_escalation_reason = parse_declared_field(body, "escalation_reason")
+    if declared_protected_surface not in {"yes", "no"}:
+        blocking.append("missing_or_invalid_declared_protected_surface")
+    elif protected_surface and declared_protected_surface != "yes":
+        blocking.append("declared_protected_surface_weaker_than_classifier")
+    if declared_runtime_authority_change not in {"yes", "no"}:
+        blocking.append("missing_or_invalid_declared_runtime_authority_change")
+    elif runtime_authority_change and declared_runtime_authority_change != "yes":
+        blocking.append("declared_runtime_authority_change_weaker_than_classifier")
+    if declared_customer_data_or_finance_impact not in {"yes", "no"}:
+        blocking.append("missing_or_invalid_declared_customer_data_or_finance_impact")
+    elif customer_data_or_finance_impact and declared_customer_data_or_finance_impact != "yes":
+        blocking.append("declared_customer_data_or_finance_impact_weaker_than_classifier")
+    if declared_governance_or_merge_authority_change not in {"yes", "no"}:
+        blocking.append("missing_or_invalid_declared_governance_or_merge_authority_change")
+    elif governance_or_merge_authority_change and declared_governance_or_merge_authority_change != "yes":
+        blocking.append("declared_governance_or_merge_authority_change_weaker_than_classifier")
+    if declared_model_tier not in MODEL_TIER_ORDER:
+        blocking.append("missing_or_invalid_declared_model_tier_required")
+    elif declared_model_tier < model_tier_required:
+        blocking.append("declared_model_tier_weaker_than_classifier")
+    if declared_cc_review_required not in {"yes", "no"}:
+        blocking.append("missing_or_invalid_declared_cc_review_required")
+    elif cc_review_required and declared_cc_review_required != "yes":
+        blocking.append("declared_cc_review_required_weaker_than_classifier")
+    if declared_opposite_frontier_required not in {"yes", "no"}:
+        blocking.append("missing_or_invalid_declared_opposite_frontier_required")
+    elif opposite_frontier_required and declared_opposite_frontier_required != "yes":
+        blocking.append("declared_opposite_frontier_required_weaker_than_classifier")
+    if declared_escalation_reason is None:
+        blocking.append("missing_declared_escalation_reason")
+    elif model_tier_required >= 3 and declared_escalation_reason.strip().lower() in {"none", "n/a", "na", "mechanical", "mechanical_no_semantic_risk"}:
+        blocking.append("declared_escalation_reason_weaker_than_classifier")
+    if surfaces & RUNTIME_SURFACES and not runtime_contract_present:
+        blocking.append("runtime_surface_without_runtimePayloadContract")
+        if runtime_contract_fields is not None and missing_contract_fields:
+            blocking.append("runtimePayloadContract_missing_required_fields:" + ",".join(missing_contract_fields))
+    if reviews - {"no_secondary_review_required"} and parse_declared_field(body, "Expected state change") is None:
+        blocking.append("missing_expected_state_change")
+    if surfaces & PROTECTED_SURFACES and not (runtime_contract_fields or {}).get("protected_non_claims") and "Protected non-claims" not in body:
+        blocking.append("protected_surface_without_protected_non_claims")
+
+    declared_lanes_value = parse_declared_field(body, "Required CI lanes")
+    declared_lanes = split_lanes(declared_lanes_value)
+    if not declared_lanes:
+        blocking.append("missing_required_ci_lanes")
+    else:
+        missing_lanes = sorted(lanes - declared_lanes)
+        if missing_lanes:
+            blocking.append("declared_ci_lanes_weaker_than_classifier:" + ",".join(missing_lanes))
+
+    body_blocking = [
+        blocker
+        for blocker in blocking
+        if blocker.startswith(("missing_", "declared_", "runtime", "protected_surface_without_protected_non_claims"))
+    ]
+    body_and_classification_ready = not body_blocking
+    review_ready = body_and_classification_ready and not any(
+        blocker.startswith("head_classifier_weakened_posture:") for blocker in blocking
+    )
+    merge_ready = not blocking
+
+    return Classification(
+        pr_number=pr_number,
+        repo=repo,
+        title=title,
+        risk_class=risk,
+        complexity_class=complexity,
+        impacted_surfaces=sorted(surfaces),
+        protected_flags=sorted(surfaces & PROTECTED_SURFACES),
+        protected_surface=protected_surface,
+        runtime_authority_change=runtime_authority_change,
+        customer_data_or_finance_impact=customer_data_or_finance_impact,
+        governance_or_merge_authority_change=governance_or_merge_authority_change,
+        model_tier_required=model_tier_required,
+        model_reviewer=reviewer_for_tier(model_tier_required),
+        cc_review_required=cc_review_required,
+        opposite_frontier_required=opposite_frontier_required,
+        escalation_reason=escalation_reason,
+        runtime_payload_contract_present=runtime_contract_present,
+        blocker_exemption_present=blocker_exemption,
+        required_ci_lanes=sorted(lanes),
+        optional_ci_lanes=[],
+        skipped_ci_lanes=sorted({lane for r, risk_lanes in RISK_TO_CI.items() if RISK_ORDER.index(r) > RISK_ORDER.index(risk) for lane in risk_lanes} - lanes),
+        required_reviews=sorted(reviews),
+        secondary_review_required="secondary_review_required" in reviews,
+        adversarial_review_required="adversarial_review_required" in reviews,
+        opposite_provider_required="opposite_provider_adversarial_required" in reviews,
+        human_gate_required=bool(reviews & {"protected_human_review_required", "security_review_required", "finance_sensitive_review_required"}),
+        founder_review_required="founder_review_required" in reviews,
+        reason=f"Inferred from {len(files)} changed file(s), {additions} addition(s), surfaces: {', '.join(sorted(surfaces))}.",
+        token_class=token_class(risk, complexity),
+        merge_blocking_conditions=blocking,
+        body_and_classification_ready=body_and_classification_ready,
+        review_ready=review_ready,
+        merge_ready=merge_ready,
+        allowed_to_mark_ready=merge_ready,
+    )
+
+
+def markdown_report(data: dict[str, object]) -> str:
+    lines = ["# CI Classification", ""]
+    for key, value in data.items():
+        if isinstance(value, list):
+            rendered = ", ".join(str(v) for v in value) if value else "none"
+        else:
+            rendered = str(value).lower() if isinstance(value, bool) else str(value)
+        lines.append(f"- {key}: {rendered}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def downstream_matrix(data: dict[str, object]) -> dict[str, object]:
+    """Build an optional dry-run matrix artifact without enforcing downstream CI."""
+    required_value = data.get("required_ci_lanes", [])
+    optional_value = data.get("optional_ci_lanes", [])
+    required_lanes = [str(lane) for lane in required_value] if isinstance(required_value, list) else []
+    optional_lanes = [str(lane) for lane in optional_value] if isinstance(optional_value, list) else []
+    return {
+        "schema_version": "ci-downstream-matrix-dry-run.v1",
+        "repo": data.get("repo", "unknown"),
+        "pr_number": data.get("pr_number", "unknown"),
+        "enforced": False,
+        "non_claims": [
+            "dry_run_only",
+            "not_downstream_ci_matrix_enforced",
+            "not_cross_repo_propagated",
+            "not_support_or_marketing_classifier_implemented",
+        ],
+        "readiness": {
+            "body_and_classification_ready": bool(data.get("body_and_classification_ready", False)),
+            "review_ready": bool(data.get("review_ready", False)),
+            "merge_ready": bool(data.get("merge_ready", False)),
+        },
+        "include": [
+            {"lane": lane, "required": True, "dry_run_only": True} for lane in required_lanes
+        ] + [
+            {"lane": lane, "required": False, "dry_run_only": True} for lane in optional_lanes
+        ],
+    }
+
+
+def _list_value(data: dict[str, object], key: str) -> set[str]:
+    value = data.get(key, [])
+    if isinstance(value, list):
+        return {str(item) for item in value}
+    return set()
+
+
+def _bool_value(data: dict[str, object], key: str) -> bool:
+    return bool(data.get(key, False))
+
+
+def _int_value(data: dict[str, object], key: str, default: int = 0) -> int:
+    value = data.get(key, default)
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def detect_head_classifier_weakenings(base: dict[str, object], head: dict[str, object] | None) -> list[str]:
+    if not head:
+        return []
+
+    weakenings: list[str] = []
+    base_risk = str(base.get("risk_class", "R0"))
+    head_risk = str(head.get("risk_class", "R0"))
+    if base_risk in RISK_ORDER and head_risk in RISK_ORDER and RISK_ORDER.index(head_risk) < RISK_ORDER.index(base_risk):
+        weakenings.append("lower_risk_class")
+
+    base_complexity = str(base.get("complexity_class", "C0"))
+    head_complexity = str(head.get("complexity_class", "C0"))
+    if base_complexity in COMPLEXITY_ORDER and head_complexity in COMPLEXITY_ORDER and COMPLEXITY_ORDER.index(head_complexity) < COMPLEXITY_ORDER.index(base_complexity):
+        weakenings.append("lower_complexity_class")
+
+    base_model_tier = _int_value(base, "model_tier_required")
+    head_model_tier = _int_value(head, "model_tier_required")
+    if head_model_tier < base_model_tier:
+        weakenings.append("lower_model_tier_required")
+
+    for key, label in (
+        ("required_ci_lanes", "fewer_required_ci_lanes"),
+        ("required_reviews", "fewer_required_reviews"),
+        ("protected_flags", "fewer_protected_flags"),
+        ("merge_blocking_conditions", "fewer_merge_blocking_conditions"),
+    ):
+        if not _list_value(base, key).issubset(_list_value(head, key)):
+            weakenings.append(label)
+
+    for key, label in (
+        ("secondary_review_required", "missing_secondary_review_required"),
+        ("adversarial_review_required", "missing_adversarial_review_required"),
+        ("opposite_provider_required", "missing_opposite_provider_required"),
+        ("human_gate_required", "missing_human_gate_required"),
+        ("founder_review_required", "missing_founder_review_required"),
+        ("protected_surface", "missing_protected_surface"),
+        ("runtime_authority_change", "missing_runtime_authority_change"),
+        ("customer_data_or_finance_impact", "missing_customer_data_or_finance_impact"),
+        ("governance_or_merge_authority_change", "missing_governance_or_merge_authority_change"),
+        ("cc_review_required", "missing_cc_review_required"),
+        ("opposite_frontier_required", "missing_opposite_frontier_required"),
+    ):
+        if _bool_value(base, key) and not _bool_value(head, key):
+            weakenings.append(label)
+
+    if base.get("allowed_to_mark_ready") is False and head.get("allowed_to_mark_ready") is True:
+        weakenings.append("allowed_to_mark_ready_weaker_than_base")
+
+    return sorted(set(weakenings))
+
+
+def with_trusted_execution_metadata(
+    base_classifier_result: dict[str, object],
+    *,
+    files: list[str],
+    repo: str,
+    pr_number: str,
+    base_sha: str,
+    head_sha: str,
+    classifier_commit: str,
+    head_classifier_result: dict[str, object] | None = None,
+) -> dict[str, object]:
+    result = dict(base_classifier_result)
+    weakenings = detect_head_classifier_weakenings(base_classifier_result, head_classifier_result)
+    existing_blocking = result.get("merge_blocking_conditions", [])
+    blocking = list(existing_blocking) if isinstance(existing_blocking, list) else []
+    blocking.extend(f"head_classifier_weakened_posture:{weakening}" for weakening in weakenings)
+    result["merge_blocking_conditions"] = sorted(set(str(item) for item in blocking))
+    body_blocking = [
+        blocker
+        for blocker in result["merge_blocking_conditions"]
+        if str(blocker).startswith(("missing_", "declared_", "runtime", "protected_surface_without_protected_non_claims"))
+    ]
+    head_weakened = any(
+        str(blocker).startswith("head_classifier_weakened_posture:")
+        for blocker in result["merge_blocking_conditions"]
+    )
+    result["body_and_classification_ready"] = not body_blocking
+    result["review_ready"] = result["body_and_classification_ready"] and not head_weakened
+    result["merge_ready"] = not result["merge_blocking_conditions"]
+    result["allowed_to_mark_ready"] = result["merge_ready"]
+    result["schema_version"] = SCHEMA_VERSION
+    result["classifier_execution"] = {
+        "trusted_source": "base",
+        "repo": repo,
+        "pr_number": pr_number,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "classifier_commit": classifier_commit,
+        "classifier_self_change": classifier_self_change(files),
+        "base_classifier_result": base_classifier_result,
+        "head_classifier_result": head_classifier_result or {},
+        "weakened_by_head_classifier": bool(weakenings),
+        "head_classifier_weakenings": weakenings,
+    }
+    return result
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--base")
+    parser.add_argument("--head")
+    parser.add_argument("--changed-file", action="append", default=[])
+    parser.add_argument("--pr-body")
+    parser.add_argument("--additions", type=int)
+    parser.add_argument("--output-dir", default=".")
+    parser.add_argument("--pr-number", default=os.getenv("PR_NUMBER", "unknown"))
+    parser.add_argument("--repo", default=os.getenv("GITHUB_REPOSITORY", "unknown"))
+    parser.add_argument("--title", default=os.getenv("PR_TITLE", "unknown"))
+    parser.add_argument("--base-sha", default=os.getenv("GITHUB_BASE_SHA", "unknown"))
+    parser.add_argument("--head-sha", default=os.getenv("GITHUB_HEAD_SHA", "unknown"))
+    parser.add_argument("--classifier-commit", default=os.getenv("CLASSIFIER_COMMIT", "unknown"))
+    parser.add_argument("--compare-head-classification")
+    parser.add_argument("--base-classification", help="Existing trusted base classification JSON to wrap with trusted execution metadata")
+    args = parser.parse_args(argv)
+
+    files = args.changed_file or changed_files_from_git(args.base, args.head)
+    if args.base_classification:
+        base_classification = json.loads(Path(args.base_classification).read_text(encoding="utf-8"))
+    else:
+        body = read_body(args.pr_body)
+        additions = args.additions if args.additions is not None else additions_from_git(args.base, args.head)
+        base_classification = classify(files, body, additions, args.pr_number, args.repo, args.title).as_dict()
+    head_classification = None
+    if args.compare_head_classification:
+        compare_path = Path(args.compare_head_classification)
+        if compare_path.exists():
+            head_classification = json.loads(compare_path.read_text(encoding="utf-8"))
+    classification = with_trusted_execution_metadata(
+        base_classification,
+        files=files,
+        repo=args.repo,
+        pr_number=args.pr_number,
+        base_sha=args.base_sha,
+        head_sha=args.head_sha,
+        classifier_commit=args.classifier_commit,
+        head_classifier_result=head_classification,
+    )
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "ci-classification.json").write_text(json.dumps(classification, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    (out_dir / "ci-classification.md").write_text(markdown_report(classification), encoding="utf-8")
+    (out_dir / "downstream-matrix.json").write_text(json.dumps(downstream_matrix(classification), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(json.dumps(classification, indent=2, sort_keys=True))
+    return 1 if classification["merge_blocking_conditions"] else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
