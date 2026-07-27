@@ -75,3 +75,22 @@ def test_test_only_unknown_python_does_not_gain_runtime_backend() -> None:
 
     assert "test_only" in result.impacted_surfaces
     assert "runtime_backend" not in result.impacted_surfaces
+
+
+def test_dot_prefixed_workflow_path_keeps_tooling_classification() -> None:
+    surfaces = ci_risk_classifier.infer_surfaces(
+        [".github/scripts/new_policy_check.py"],
+        "",
+    )
+
+    assert "ci_workflow" in surfaces
+    assert "runtime_backend" not in surfaces
+
+
+def test_exact_dot_slash_prefix_is_removed_without_erasing_dot_directory() -> None:
+    assert ci_risk_classifier._is_package_like_unknown_executable(
+        "./lifecycle_contract/__init__.py"
+    )
+    assert not ci_risk_classifier._is_package_like_unknown_executable(
+        ".github/scripts/new_policy_check.py"
+    )
