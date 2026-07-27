@@ -77,13 +77,16 @@ def test_test_only_unknown_python_does_not_gain_runtime_backend() -> None:
     assert "runtime_backend" not in result.impacted_surfaces
 
 
-def test_dot_prefixed_workflow_path_keeps_tooling_classification() -> None:
+def test_dot_prefixed_github_tooling_does_not_gain_runtime_backend() -> None:
     surfaces = ci_risk_classifier.infer_surfaces(
         [".github/scripts/new_policy_check.py"],
         "",
     )
 
-    assert "ci_workflow" in surfaces
+    # The core currently treats unknown .github/scripts Python as docs-only.
+    # The wrapper's invariant is that preserving the leading dot prevents the
+    # generic package fallback from falsely escalating it to runtime_backend.
+    assert surfaces == {"docs_only"}
     assert "runtime_backend" not in surfaces
 
 
