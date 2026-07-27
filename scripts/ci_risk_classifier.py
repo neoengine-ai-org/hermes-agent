@@ -13,7 +13,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, cast
 
 _CORE_PATH = Path(__file__).with_name("ci_risk_classifier_core.py")
 _CORE_MODULE_NAME = "_hermes_ci_risk_classifier_core"
@@ -21,7 +21,7 @@ _SPEC = importlib.util.spec_from_file_location(_CORE_MODULE_NAME, _CORE_PATH)
 if _SPEC is None or _SPEC.loader is None:  # pragma: no cover - import bootstrap guard
     raise RuntimeError(f"unable to load classifier core from {_CORE_PATH}")
 
-_core = importlib.util.module_from_spec(_SPEC)
+_core = cast(Any, importlib.util.module_from_spec(_SPEC))
 sys.modules[_CORE_MODULE_NAME] = _core
 _SPEC.loader.exec_module(_core)
 
@@ -47,7 +47,7 @@ _NON_RUNTIME_TOOLING_PREFIXES = (
 
 
 def _is_package_like_unknown_executable(path: str) -> bool:
-    normalized = path.replace("\\", "/").lstrip("./")
+    normalized = path.replace("\\", "/").removeprefix("./")
     if normalized.startswith(_NON_RUNTIME_TOOLING_PREFIXES):
         return False
     candidate = Path(normalized)
@@ -71,7 +71,7 @@ def infer_surfaces(files: Iterable[str], body: str) -> set[str]:
     return surfaces
 
 
-_core.infer_surfaces = infer_surfaces
+setattr(_core, "infer_surfaces", infer_surfaces)
 
 # Preserve the public module API used by the workflow and existing test suite.
 for _name in dir(_core):
