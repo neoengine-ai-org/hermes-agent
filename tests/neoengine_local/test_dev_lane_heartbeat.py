@@ -217,6 +217,40 @@ def test_event_wake_beats_timer_wake(tmp_path: Path) -> None:
     assert pickup["work_item_id"] == "work-1"
 
 
+def test_missing_next_eligible_wake_at_does_not_crash_pickup(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="neoengine-ai-org/neowealth", authorized_scopes=["repo/**"])
+    store.emit_heartbeat(
+        lane_id="lane-a",
+        agent_session_id="session-a",
+        repo_scope="neoengine-ai-org/neowealth",
+        current_state="idle-no-work",
+        claimed_work_item_id=None,
+        last_successful_activity_at="2026-06-24T00:00:00Z",
+        next_eligible_wake_at="2026-06-24T01:00:00Z",
+        evidence_pointer="receipts/idle.md",
+    )
+    hb = store.latest_heartbeat("lane-a")
+    assert hb is not None
+    hb["next_eligible_wake_at"] = None
+    store.write_json("heartbeats/lane-a.json", hb)
+    store.add_work_item(
+        {
+            "work_item_id": "work-1",
+            "repo_scope": "neoengine-ai-org/neowealth",
+            "authorized_scopes": ["repo/app/page.tsx"],
+            "status": "queued",
+            "events": [],
+            "created_at": "2026-06-24T00:05:00Z",
+        }
+    )
+
+    pickup = store.pick_next_work("lane-a", "session-a", now="2026-06-24T00:10:00Z")
+
+    assert pickup["action"] == "claimed"
+    assert pickup["wake_reason"] == "timer:fallback"
+
+
 def test_blocked_work_is_not_repeatedly_repicked_without_new_event(tmp_path: Path) -> None:
     store = DevLaneStore(tmp_path)
     store.register_lane("lane-a", repo_scope="neoengine-ai-org/neowealth", authorized_scopes=["repo/**"])
