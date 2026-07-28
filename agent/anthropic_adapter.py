@@ -16,6 +16,7 @@ import logging
 import os
 import platform
 import subprocess
+import stat
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1087,6 +1088,153 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     return None
 
 
+def _read_claude_code_oauth_token_env_file() -> Optional[str]:
+    """Read a private Claude Code setup-token file without path races.
+
+    The fallback is accepted only when the opened object is the current user's
+    owner-private regular file. Validation and reading are bound to the same
+    descriptor so a path replacement cannot swap credential bytes after the
+    trust checks. The token value is never logged.
+    """
+    directory = Path.home() / ".codex"
+    path = directory / "cc-auth.env"
+    common_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    directory_flags = common_flags | nonblock | getattr(os, "O_DIRECTORY", 0)
+    file_flags = common_flags | nonblock
+    pre_open_directory_stat = None
+    pre_open_stat = None
+
+    def reject(reason: str) -> Optional[str]:
+        logger.debug("Ignoring Claude Code OAuth token file: %s", reason)
+        return None
+
+    if nofollow:
+        directory_flags |= nofollow
+        file_flags |= nofollow
+    else:
+        try:
+            pre_open_directory_stat = directory.lstat()
+            pre_open_stat = path.lstat()
+        except OSError:
+            return reject("path metadata unavailable")
+        if stat.S_ISLNK(pre_open_directory_stat.st_mode):
+            return reject("credential directory is a symlink")
+        if stat.S_ISLNK(pre_open_stat.st_mode):
+            return reject("credential file is a symlink")
+
+    directory_fd: Optional[int] = None
+    fd: Optional[int] = None
+    try:
+        directory_fd = os.open(directory, directory_flags)
+        opened_directory_stat = os.fstat(directory_fd)
+        if pre_open_directory_stat is not None and (
+            pre_open_directory_stat.st_dev,
+            pre_open_directory_stat.st_ino,
+        ) != (
+            opened_directory_stat.st_dev,
+            opened_directory_stat.st_ino,
+        ):
+            return reject("credential directory changed during open")
+        if not stat.S_ISDIR(opened_directory_stat.st_mode):
+            return reject("credential parent is not a directory")
+
+        getuid = getattr(os, "getuid", None)
+        if (
+            not callable(getuid)
+            or getattr(opened_directory_stat, "st_uid", None) != getuid()
+        ):
+            return reject("credential directory is not owned by the current user")
+        if opened_directory_stat.st_mode & 0o002:
+            return reject("credential directory is world-writable")
+
+        fd = os.open(path.name, file_flags, dir_fd=directory_fd)
+        opened_stat = os.fstat(fd)
+
+        if pre_open_stat is not None and (
+            pre_open_stat.st_dev,
+            pre_open_stat.st_ino,
+        ) != (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+        ):
+            return reject("credential file changed during open")
+        if not stat.S_ISREG(opened_stat.st_mode):
+            return reject("credential path is not a regular file")
+
+        if getattr(opened_stat, "st_uid", None) != getuid():
+            return reject("credential file is not owned by the current user")
+        if opened_stat.st_mode & 0o077:
+            return reject("credential file is readable or writable by another user")
+        if opened_stat.st_nlink != 1:
+            return reject("credential file has multiple links")
+
+        chunks = []
+        remaining = 65537
+        while remaining:
+            chunk = os.read(fd, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        content_bytes = b"".join(chunks)
+        if len(content_bytes) > 65536:
+            return reject("credential file exceeds 65536 bytes")
+        content = content_bytes.decode("utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError):
+        return reject("credential file could not be opened or decoded")
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            try:
+                os.close(directory_fd)
+            except OSError:
+                pass
+
+    token: Optional[str] = None
+    assignment_found = False
+    for line in content.splitlines():
+        assignment = line.strip()
+        if assignment.startswith("export") and len(assignment) > len("export"):
+            separator = assignment[len("export")]
+            if separator in " \t":
+                assignment = assignment[len("export"):].lstrip(" \t")
+        if not assignment.startswith("CLAUDE_CODE_OAUTH_TOKEN="):
+            continue
+        assignment_found = True
+        value = assignment.split("=", 1)[1].strip()
+
+        if value.startswith(("'", '"')):
+            quote = value[0]
+            closing_quote = value.find(quote, 1)
+            if closing_quote < 0:
+                return reject("credential assignment has an unmatched quote")
+            trailing = value[closing_quote + 1:].strip()
+            if trailing and not trailing.startswith("#"):
+                return reject("credential assignment has invalid trailing content")
+            token = value[1:closing_quote] or None
+            continue
+
+        for index, character in enumerate(value):
+            if character == "#" and index > 0 and value[index - 1].isspace():
+                value = value[:index].rstrip()
+                break
+        token = value or None
+
+    if assignment_found:
+        if token:
+            return token
+        return reject("credential assignment is empty")
+    return reject("credential assignment is absent")
+
+
 def resolve_anthropic_token() -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
@@ -1109,8 +1257,12 @@ def resolve_anthropic_token() -> Optional[str]:
             return preferred
         return token
 
-    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens),
+    # with a secure ~/.codex/cc-auth.env fallback for launchd/cron runtimes
+    # that intentionally run with a stripped environment.
+    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip() or (
+        _read_claude_code_oauth_token_env_file() or ""
+    )
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
