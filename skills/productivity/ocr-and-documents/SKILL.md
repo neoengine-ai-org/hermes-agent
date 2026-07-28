@@ -8,13 +8,12 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [PDF, Documents, Research, Arxiv, Text-Extraction, OCR]
-    related_skills: [powerpoint]
 ---
 
 # PDF & Document Extraction
 
 For DOCX: use `python-docx` (parses actual document structure, far better than OCR).
-For PPTX: see the `powerpoint` skill (uses `python-pptx` with full slide/notes support).
+PowerPoint generation is not included in this managed distribution.
 This skill covers **PDFs and scanned documents**.
 
 ## Step 1: Remote URL Available?
@@ -169,4 +168,4 @@ No extra dependencies needed — pymupdf covers split, merge, search, and text e
 - Both helper scripts accept `--help` for full usage
 - marker-pdf downloads ~2.5GB of models to `~/.cache/huggingface/` on first use
 - For Word docs: `pip install python-docx` (better than OCR — parses actual structure)
-- For PowerPoint: see the `powerpoint` skill (uses python-pptx)
+- PowerPoint generation is intentionally unavailable in this managed distribution
