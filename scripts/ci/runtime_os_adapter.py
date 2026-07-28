@@ -84,7 +84,8 @@ def discover_tests() -> list[str]:
 
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
-    executable_suffixes = set(load_classifier().EXECUTABLE_SUFFIXES)
+    classifier = load_classifier()
+    executable_suffixes = set(classifier.EXECUTABLE_SUFFIXES)
     selected: set[str] = set()
     unknown_executable = False
     for raw in files:
@@ -98,9 +99,12 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
         ):
             selected.add(path)
             continue
-        if candidate.suffix not in executable_suffixes and candidate.name not in EXECUTABLE_NAMES:
+        suffix = candidate.suffix.lower()
+        if suffix not in executable_suffixes and candidate.name not in EXECUTABLE_NAMES:
+            if not classifier.is_documentation_file(path):
+                unknown_executable = True
             continue
-        if candidate.suffix == ".py" and not path.startswith("tests/"):
+        if suffix == ".py" and not path.startswith("tests/"):
             stem = candidate.stem.removeprefix("test_")
             matches = [test for test in all_tests if Path(test).stem == f"test_{stem}"]
             if matches:

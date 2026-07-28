@@ -101,6 +101,10 @@ def test_unknown_non_python_executable_forces_full_proof() -> None:
     assert adapter.select_tests(["runtime/novel.rs"]) == ([], True)
     assert adapter.select_tests(["runtime/novel.tsx"]) == ([], True)
     assert adapter.select_tests(["Dockerfile"]) == ([], True)
+    assert adapter.select_tests(["locales/en.yaml"]) == ([], True)
+    assert adapter.select_tests(["gateway/assets/status_phrases.yaml"]) == ([], True)
+    assert adapter.select_tests(["scripts/Deploy.SH"]) == ([], True)
+    assert adapter.select_tests(["db/Migration.SQL"]) == ([], True)
 
 
 def test_nix_and_composite_actions_force_full_proof() -> None:
