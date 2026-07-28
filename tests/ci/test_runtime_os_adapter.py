@@ -63,6 +63,10 @@ def test_adapter_self_change_is_not_r0() -> None:
         ["scripts/ci/runtime_os_adapter.py"], ""
     )
     assert classification.risk_class == "R3"
+    review = adapter.build_review_classification(classification)
+    assert review["required_reviews"] == ["adversarial_review_required"]
+    assert review["adversarial_review_required"] is True
+    assert review["opposite_frontier_required"] is False
 
 
 def test_docs_only_change_does_not_manufacture_empty_test_job() -> None:
@@ -83,3 +87,14 @@ def test_module_mapping_is_anchored_not_substring_based() -> None:
     selected, unknown = adapter.select_tests(["hermes/e.py"])
     assert selected == []
     assert unknown is True
+
+
+def test_non_test_python_helper_forces_full_proof() -> None:
+    selected, unknown = adapter.select_tests(["tests/conftest.py"])
+    assert selected == []
+    assert unknown is True
+
+
+def test_unknown_non_python_executable_forces_full_proof() -> None:
+    assert adapter.select_tests(["scripts/novel-check.sh"]) == ([], True)
+    assert adapter.select_tests(["Dockerfile"]) == ([], True)

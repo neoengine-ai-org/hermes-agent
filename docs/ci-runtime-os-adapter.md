@@ -14,14 +14,16 @@ checkout or execution. Policy, classifier, and receipt validation run from the
 trusted base; the workflow does not use a private cross-repository checkout or
 token.
 
-Affected tests are selected narrowly. Changes to the classifier, test runner,
+Affected tests are selected narrowly. Test helpers and unknown executable files
+fail closed rather than producing an empty collection. Changes to the classifier, test runner,
 packaging or dependency graph, shared CI runtime, workflow, or an unknown
 executable path fail closed to all six isolated test slices plus e2e. Protected
 `main`, nightly, and manual runs also execute the full proof. Each selected test
 file still runs in its own Python interpreter through `scripts/run_tests.sh`.
 The selector reads duration data written by the established test workflow's
 protected-`main` cache; this adapter never publishes PR duration telemetry. uv
-caching is enabled only for protected `main` pushes.
+caching is enabled only for protected `main` pushes. Canonically excluded
+integration tests run in the separate e2e job on full-proof boundaries.
 
 Review routing follows the canonical model: R0-R2 use no CI model; R3 requires
 one head-bound post-green adversarial receipt (including a validator-approved

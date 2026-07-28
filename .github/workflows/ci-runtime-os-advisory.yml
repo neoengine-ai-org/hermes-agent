@@ -2,7 +2,7 @@ name: CI Runtime OS advisory
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches: [main]
   schedule:
@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: runtime-os-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
   RUNTIME_OS_POLICY_VERSION: "2.1.0"
@@ -53,11 +53,12 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
 
       - name: Read protected-main duration telemetry
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: test_durations.json
+          path: candidate/test_durations.json
           key: runtime-os-duration-readonly
           restore-keys: |
             test-durations-
@@ -69,16 +70,26 @@ jobs:
           EVENT_REF: ${{ github.ref }}
           PR_BODY: ${{ github.event.pull_request.body || '' }}
           PR_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 'unknown' }}
+          REPOSITORY: ${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          RUNTIME_OS_CANDIDATE_ROOT: ${{ github.workspace }}
+          RUNTIME_OS_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
         run: |
           set -euo pipefail
           test "$RUNTIME_OS_POLICY_VERSION" = "2.1.0"
           test "$RUNTIME_OS_SOURCE_COMMIT" = "871e416afc55db187d2b6f29c9ff7cac96472223"
-          if [ -n "${BASE_SHA:-}" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            git diff --name-only "$BASE_SHA" HEAD > changed-files.txt
-          else
-            git ls-files > changed-files.txt
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "${BASE_SHA:-}" ]; then
+            git -C candidate fetch --no-tags origin "$BASE_SHA"
+          elif [ "$EVENT_NAME" != pull_request ]; then
+            git -C candidate ls-files > changed-files.txt
+          fi
+          if [ "$EVENT_NAME" = pull_request ] \
+            && [ -n "${BASE_SHA:-}" ] \
+            && git -C candidate cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git -C candidate diff --name-only "$BASE_SHA" HEAD > changed-files.txt
+          elif [ "$EVENT_NAME" = pull_request ]; then
+            echo "::error::base commit unavailable; refusing ambiguous change selection"
+            exit 2
           fi
           python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
           printf '%s' "$PR_BODY" > pr-body.md
@@ -87,7 +98,9 @@ jobs:
             --event-name "$EVENT_NAME" \
             --ref "$EVENT_REF" \
             --body-file pr-body.md \
-            --additions "$PR_ADDITIONS"
+            --additions "$PR_ADDITIONS" \
+            --pr-number "$PR_NUMBER" \
+            --repo "$REPOSITORY"
 
   test:
     name: Runtime OS slice ${{ matrix.index }}/6
@@ -139,8 +152,10 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+          HERMES_TEST_WORKERS: "4"
         run: |
           source .venv/bin/activate
+          python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
           scripts/run_tests.sh --files "$SELECTED_FILES"
 
   e2e:
@@ -183,6 +198,7 @@ jobs:
         run: |
           source .venv/bin/activate
           python -m pytest -m integration tests/test_wheel_locales_e2e.py -v
+          python -m pytest tests/integration/ -v --tb=short
           python -m pytest tests/e2e/ -v --tb=short
 
   hermes-required:
@@ -223,9 +239,13 @@ jobs:
           REVIEW_CLASSIFICATION: ${{ needs.preflight.outputs.review_classification }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           test "$HERMES_RESULT" = success
+          if [ "$EVENT_NAME" != pull_request_target ]; then
+            exit 0
+          fi
           case "$RISK" in
             R0|R1|R2) exit 0 ;;
             R3|R4|R5) ;;

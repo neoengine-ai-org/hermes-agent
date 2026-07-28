@@ -21,6 +21,8 @@ EXPECTED_POLICY_DIGEST = "14bf24d96f4705b9356394bfc1922d11280ef8f2aa3b5981611384
 EXPECTED_CONTEXTS = ["Hermes CI required", "Review evidence required", "Merge admission"]
 FULL_EVENT_NAMES = {"push", "schedule", "workflow_dispatch"}
 TEST_SUFFIXES = {".py"}
+EXECUTABLE_NAMES = {"Dockerfile", "Makefile"}
+EXECUTABLE_SUFFIXES = {".bash", ".js", ".mjs", ".py", ".sh", ".ts", ".zsh"}
 
 
 def load_policy() -> dict[str, Any]:
@@ -88,17 +90,23 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
     for raw in files:
         path = raw.replace("\\", "/").removeprefix("./")
         candidate = CANDIDATE_ROOT / path
-        if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.exists():
+        if (
+            path.startswith("tests/")
+            and candidate.suffix in TEST_SUFFIXES
+            and candidate.name.startswith("test_")
+            and candidate.exists()
+        ):
             selected.add(path)
             continue
-        if candidate.suffix != ".py" or path.startswith(("docs/", "website/")):
+        if candidate.suffix not in EXECUTABLE_SUFFIXES and candidate.name not in EXECUTABLE_NAMES:
             continue
-        stem = candidate.stem.removeprefix("test_")
-        matches = [test for test in all_tests if Path(test).stem == f"test_{stem}"]
-        if matches:
-            selected.update(matches)
-        else:
-            unknown_executable = True
+        if candidate.suffix == ".py" and not path.startswith("tests/"):
+            stem = candidate.stem.removeprefix("test_")
+            matches = [test for test in all_tests if Path(test).stem == f"test_{stem}"]
+            if matches:
+                selected.update(matches)
+                continue
+        unknown_executable = True
     return sorted(selected), unknown_executable
 
 
@@ -112,11 +120,17 @@ def slice_matrix(files: list[str], count: int = 6) -> dict[str, list[dict[str, o
     bucket_count = min(count, len(files))
     buckets: list[list[str]] = [[] for _ in range(bucket_count)]
     totals = [0.0] * bucket_count
-    weighted = sorted(files, key=lambda path: (-float(durations.get(path, 1.0)), path))
+    def duration(path: str) -> float:
+        try:
+            return max(0.0, float(durations.get(path, 1.0)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    weighted = sorted(files, key=lambda path: (-duration(path), path))
     for path in weighted:
         index = min(range(bucket_count), key=lambda item: (totals[item], item))
         buckets[index].append(path)
-        totals[index] += float(durations.get(path, 1.0))
+        totals[index] += duration(path)
     return {
         "include": [
             {"index": index + 1, "files": ":".join(bucket)}
@@ -133,19 +147,18 @@ def write_output(name: str, value: str) -> None:
             handle.write(f"{name}={value}\n")
 
 
-def plan(args: argparse.Namespace) -> int:
-    policy = load_policy()
-    files = json.loads(args.changed_files_json)
-    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
-        raise ValueError("changed files must be a JSON string array")
-    body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
-    classification = load_classifier().classify(files, body, additions=args.additions)
+def build_review_classification(classification: Any) -> dict[str, object]:
+    """Apply the cutover's minimal review model without author self-attestation."""
     review_classification = classification.as_dict()
     if classification.risk_class in {"R0", "R1", "R2"}:
         review_classification.update(
             required_reviews=[],
             secondary_review_required=False,
             adversarial_review_required=False,
+            opposite_provider_required=False,
+            opposite_frontier_required=False,
+            human_gate_required=False,
+            founder_review_required=False,
             model_tier_required=0,
         )
     elif classification.risk_class == "R3":
@@ -154,10 +167,28 @@ def plan(args: argparse.Namespace) -> int:
             secondary_review_required=False,
             adversarial_review_required=True,
             opposite_provider_required=False,
+            opposite_frontier_required=False,
             human_gate_required=False,
             founder_review_required=False,
             model_tier_required=0,
         )
+    return review_classification
+
+
+def plan(args: argparse.Namespace) -> int:
+    policy = load_policy()
+    files = json.loads(args.changed_files_json)
+    if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
+        raise ValueError("changed files must be a JSON string array")
+    body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
+    classification = load_classifier().classify(
+        files,
+        body,
+        additions=args.additions,
+        pr_number=args.pr_number,
+        repo=args.repo,
+    )
+    review_classification = build_review_classification(classification)
     run_full, reason = full_proof(files, args.event_name, policy)
     selected, unknown = select_tests(files)
     if unknown:
@@ -204,6 +235,8 @@ def main() -> int:
     parser.add_argument("--ref", default="")
     parser.add_argument("--body-file")
     parser.add_argument("--additions", type=int, default=0)
+    parser.add_argument("--pr-number", default="unknown")
+    parser.add_argument("--repo", default="unknown")
     return plan(parser.parse_args())
 
 
