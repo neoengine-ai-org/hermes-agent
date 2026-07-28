@@ -104,6 +104,27 @@ repeat the Tier-4 review and replace the receipt with the new exact head SHA.
 A stale receipt is a blocker. Prior evidence may be useful background, but it is
 not a reusable receipt for the new head.
 
+### Mechanical freshness (diff fingerprint)
+
+One narrow exception exists for model-review receipt types (`codex_engineering`,
+`secondary`, `adversarial`, `opposite_provider_adversarial`, `opposite_frontier`):
+a receipt whose SHAs went stale purely because the head moved — e.g. GitHub
+"Update branch" merging base into the PR — stays valid IFF its optional
+`diff_fingerprint` field exactly matches the fingerprint the classifier computes
+on the current head (`scripts/receipt_diff_fingerprint.py`). The fingerprint
+binds the **full content** (git blob object IDs) of every file the PR touches,
+at the current head — not the diff text. So any change to a PR-touched file's
+merged content mismatches and forces a fresh review: a binary edit (bound to the
+full 40-hex blob, not an abbreviated diff prefix) and a base merge that edits any
+section of a PR-touched file (bound to the head blob, which a three-dot diff
+would miss) both re-trigger. A change to a file the PR does not touch does not
+move the fingerprint — that content is governed by its own review.
+
+This never applies to `founder`, `human_protected`, `tier4_authority_waiver`,
+`tier4_break_glass`, `security`, or `finance_sensitive` receipts: protected
+approvals always require exact head-SHA freshness. A missing or malformed
+fingerprint on either side keeps the strict stale-receipt behavior.
+
 ## Local validation commands
 
 Before claiming readiness, rerun the local classifier and policy checks for the

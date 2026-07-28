@@ -6,7 +6,7 @@ on:
       slice_count:
         description: Number of parallel test slices
         type: number
-        default: 8
+        default: 6
 
 permissions:
   contents: read

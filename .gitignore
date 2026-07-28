@@ -46,6 +46,8 @@ node_modules/
 browser-use/
 agent-browser/
 # Private keys
+# Local headless Claude Code setup token; never commit credential material.
+.codex/cc-auth.env
 *.ppk
 *.pem
 privvy*

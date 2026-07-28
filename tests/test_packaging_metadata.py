@@ -468,3 +468,9 @@ def test_security_pins_present_in_mirrored_lazy_features():
         "pyproject extras — the lazy install path would not enforce the "
         "CVE-patched floor:\n  " + "\n  ".join(problems)
     )
+def test_lifecycle_contract_is_in_setuptools_package_discovery():
+    """The top-level lifecycle contract must ship in source and wheel distributions."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    package_patterns = data["tool"]["setuptools"]["packages"]["find"]["include"]
+
+    assert "lifecycle_contract" in package_patterns
