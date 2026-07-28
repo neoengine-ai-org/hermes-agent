@@ -1,0 +1,69 @@
+name: PR 75 Focused Suspects (temporary)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    name: Run quarantine-sensitive slice-1 tests
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'diag/hermes75-slice1-20260728'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run four quarantine-sensitive tests
+        id: focused
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set +e
+          source .venv/bin/activate
+          python -m pytest \
+            tests/agent/test_curator_classification.py \
+            tests/hermes_cli/test_web_server.py \
+            tests/skills/test_google_oauth_setup.py \
+            tests/tools/test_kanban_codex_lane_skill.py \
+            -q --tb=short > focused.log 2>&1
+          status=$?
+          set -e
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          tail -n 180 focused.log > focused-summary.txt
+          cat focused-summary.txt
+
+      - name: Upload focused summary
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr75-focused-suspects-summary
+          path: focused-summary.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Preserve focused outcome
+        if: always()
+        env:
+          STATUS: ${{ steps.focused.outputs.status }}
+        run: test "${STATUS:-1}" = "0"
