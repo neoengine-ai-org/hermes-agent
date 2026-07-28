@@ -253,3 +253,268 @@ def test_resolve_anthropic_token_rejects_non_regular_env_file(tmp_path, monkeypa
     monkeypatch.setattr(anthropic_adapter, "read_claude_code_credentials", lambda: None)
 
     assert anthropic_adapter.resolve_anthropic_token() is None
+
+
+def test_claude_code_env_file_rejects_symlink(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+
+    target = tmp_path / "target.env"
+    target.write_text("CLAUDE_CODE_OAUTH_TOKEN=symlink-token\n")
+    target.chmod(0o600)
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    try:
+        auth_file.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_rejects_wrong_owner(tmp_path, monkeypatch):
+    import os
+    from agent import anthropic_adapter
+
+    if not hasattr(os, "getuid"):
+        pytest.skip("owner UID is unavailable on this platform")
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=wrong-owner-token\n")
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    actual_uid = os.getuid()
+    monkeypatch.setattr(anthropic_adapter.os, "getuid", lambda: actual_uid + 1)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_rejects_opened_descriptor_after_path_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    import os
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=opened-token\n")
+    auth_file.chmod(0o600)
+
+    replacement = tmp_path / "replacement.env"
+    replacement.write_text("CLAUDE_CODE_OAUTH_TOKEN=replacement-token\n")
+    replacement.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    real_open = os.open
+
+    def open_then_replace(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if str(path).endswith("cc-auth.env"):
+            os.replace(replacement, auth_file)
+        return fd
+
+    monkeypatch.setattr(anthropic_adapter.os, "open", open_then_replace)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_rejects_fifo_without_blocking(tmp_path, monkeypatch):
+    import os
+    from agent import anthropic_adapter
+
+    if not hasattr(os, "mkfifo") or not hasattr(os, "O_NONBLOCK"):
+        pytest.skip("nonblocking FIFO support is unavailable")
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    os.mkfifo(auth_file, 0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_rejects_writable_parent_directory(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir(mode=0o777)
+    auth_file.parent.chmod(0o777)
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=parent-writable-token\n")
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_rejects_hardlinked_file(tmp_path, monkeypatch):
+    import os
+    from agent import anthropic_adapter
+
+    victim = tmp_path / "victim.env"
+    victim.write_text("CLAUDE_CODE_OAUTH_TOKEN=hardlink-token\n")
+    victim.chmod(0o600)
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.parent.chmod(0o775)
+    os.link(victim, auth_file)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_accepts_export_assignment(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text('  export CLAUDE_CODE_OAUTH_TOKEN="export-token"  \n')
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert (
+        anthropic_adapter._read_claude_code_oauth_token_env_file()
+        == "export-token"
+    )
+
+
+def test_claude_code_env_file_accepts_group_writable_owner_directory(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.parent.chmod(0o775)
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=umask-002-token\n")
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert (
+        anthropic_adapter._read_claude_code_oauth_token_env_file()
+        == "umask-002-token"
+    )
+
+
+@pytest.mark.parametrize(
+    ("assignment", "expected"),
+    [
+        ("CLAUDE_CODE_OAUTH_TOKEN=abc123 # note\n", "abc123"),
+        ('CLAUDE_CODE_OAUTH_TOKEN="abc123" # note\n', "abc123"),
+        ("\texport\tCLAUDE_CODE_OAUTH_TOKEN=abc123\n", "abc123"),
+    ],
+)
+def test_claude_code_env_file_parses_comments_and_export_whitespace(
+    tmp_path,
+    monkeypatch,
+    assignment,
+    expected,
+):
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text(assignment)
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() == expected
+
+
+def test_claude_code_env_file_uses_last_assignment(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text(
+        "CLAUDE_CODE_OAUTH_TOKEN=\n"
+        "CLAUDE_CODE_OAUTH_TOKEN=last-token\n"
+    )
+    auth_file.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    assert (
+        anthropic_adapter._read_claude_code_oauth_token_env_file()
+        == "last-token"
+    )
+
+
+def test_claude_code_env_file_logs_rejection_reason_without_token(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    token = "never-log-this-token"
+    auth_file.write_text(f"CLAUDE_CODE_OAUTH_TOKEN={token}\n")
+    auth_file.chmod(0o644)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+
+    with caplog.at_level("DEBUG", logger=anthropic_adapter.__name__):
+        assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+    assert "readable or writable by another user" in caplog.text
+    assert token not in caplog.text
+
+
+def test_claude_code_env_file_fallback_rejects_symlink(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+
+    target = tmp_path / "target.env"
+    target.write_text("CLAUDE_CODE_OAUTH_TOKEN=fallback-symlink-token\n")
+    target.chmod(0o600)
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.symlink_to(target)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.delattr(anthropic_adapter.os, "O_NOFOLLOW", raising=False)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
+
+
+def test_claude_code_env_file_fallback_rejects_path_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    import os
+    from agent import anthropic_adapter
+
+    auth_file = tmp_path / ".codex" / "cc-auth.env"
+    auth_file.parent.mkdir()
+    auth_file.write_text("CLAUDE_CODE_OAUTH_TOKEN=original-token\n")
+    auth_file.chmod(0o600)
+    replacement = tmp_path / "replacement.env"
+    replacement.write_text("CLAUDE_CODE_OAUTH_TOKEN=replacement-token\n")
+    replacement.chmod(0o600)
+
+    monkeypatch.setattr(anthropic_adapter.Path, "home", lambda: tmp_path)
+    monkeypatch.delattr(anthropic_adapter.os, "O_NOFOLLOW", raising=False)
+    real_open = os.open
+
+    def replace_then_open(path, flags, *args, **kwargs):
+        if str(path).endswith("cc-auth.env"):
+            os.replace(replacement, auth_file)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(anthropic_adapter.os, "open", replace_then_open)
+
+    assert anthropic_adapter._read_claude_code_oauth_token_env_file() is None
