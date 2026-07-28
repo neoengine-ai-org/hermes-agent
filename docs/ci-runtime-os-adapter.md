@@ -1,8 +1,8 @@
 # Hermes CI Runtime OS adapter
 
-Hermes vendors the immutable NeoEngine CI Runtime OS policy release `2.1.0`
-from source commit `871e416afc55db187d2b6f29c9ff7cac96472223`. The release JSON is
-content-addressed by `ci/runtime-os/policy-release.lock.json`; the dependency-free
+Hermes vendors the immutable NeoEngine CI Runtime OS policy bundle `2.1.0`
+from source commit `871e416afc55db187d2b6f29c9ff7cac96472223`. The bundle JSON is
+content-addressed by `ci/runtime-os/policy-bundle.lock.json`; the dependency-free
 preflight verifies its identity before installing the test environment.
 
 The adapter is advisory. Its trusted-base `pull_request_target` dispatcher

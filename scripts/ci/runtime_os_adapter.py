@@ -14,7 +14,7 @@ from typing import Any
 
 TRUST_ROOT = Path(__file__).resolve().parents[2]
 CANDIDATE_ROOT = Path(os.environ.get("RUNTIME_OS_CANDIDATE_ROOT", TRUST_ROOT)).resolve()
-LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-release.lock.json"
+LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-bundle.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"
 EXPECTED_SOURCE_COMMIT = "871e416afc55db187d2b6f29c9ff7cac96472223"
 EXPECTED_POLICY_DIGEST = "db3590132eb5d1c12d111ab546b2b66eb50eaa39a237a6985ffc7a1b4f932a84"
@@ -126,6 +126,7 @@ def slice_matrix(files: list[str], count: int = 6) -> dict[str, list[dict[str, o
     bucket_count = min(count, len(files))
     buckets: list[list[str]] = [[] for _ in range(bucket_count)]
     totals = [0.0] * bucket_count
+
     def duration(path: str) -> float:
         try:
             return max(0.0, float(durations.get(path, 1.0)))
