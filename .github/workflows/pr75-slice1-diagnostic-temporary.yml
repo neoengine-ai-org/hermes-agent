@@ -1,0 +1,100 @@
+name: PR 75 Slice 1 Diagnostic (temporary)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr75-slice1-diagnostic-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  diagnose:
+    name: Capture slice 1 failure summary
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'diag/hermes75-slice1-20260728'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations
+
+      - name: Install ripgrep
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL -o "$RG_TARBALL" "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          uv venv .venv --python 3.11
+          source .venv/bin/activate
+          uv pip install -e ".[all,dev]"
+
+      - name: Run exact slice and capture compact failure
+        id: slice
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          set +e
+          source .venv/bin/activate
+          python scripts/run_tests_parallel.py --slice 1/6 > slice1.log 2>&1
+          status=$?
+          set -e
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          python3 - <<'PY'
+          from pathlib import Path
+          lines = Path('slice1.log').read_text(errors='replace').splitlines()
+          out = []
+          for index, line in enumerate(lines):
+              if 'Failed:' in line or line.lstrip().startswith('FAILED ') or ' short test summary info ' in line:
+                  start = max(0, index - 3)
+                  end = min(len(lines), index + 45)
+                  block = lines[start:end]
+                  if block not in out:
+                      out.extend(block)
+                      out.append('')
+          if not out:
+              out = lines[-160:]
+          Path('slice1-failure-summary.txt').write_text('\n'.join(out) + '\n')
+          PY
+          cat slice1-failure-summary.txt
+
+      - name: Upload compact diagnostic
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr75-slice1-failure-summary
+          path: slice1-failure-summary.txt
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Preserve diagnostic outcome
+        if: always()
+        env:
+          STATUS: ${{ steps.slice.outputs.status }}
+        run: test "${STATUS:-1}" = "0"
