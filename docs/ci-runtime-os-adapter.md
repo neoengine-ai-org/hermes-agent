@@ -14,6 +14,11 @@ checkout or execution. Policy, classifier, and receipt validation run from the
 trusted base; the workflow does not use a private cross-repository checkout or
 token.
 
+Bootstrap note: this stacked PR cannot execute its own trusted-base dispatcher
+because policy 2.1.0 is intentionally absent from #70. The dispatcher becomes
+self-hosting after this adapter lands; until then the existing #70 CI topology
+and local policy-contract proof are authoritative.
+
 Affected tests are selected narrowly. Test helpers and unknown executable files
 fail closed rather than producing an empty collection. Changes to the classifier, test runner,
 packaging or dependency graph, shared CI runtime, workflow, or an unknown

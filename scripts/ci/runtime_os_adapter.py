@@ -17,12 +17,11 @@ CANDIDATE_ROOT = Path(os.environ.get("RUNTIME_OS_CANDIDATE_ROOT", TRUST_ROOT)).r
 LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-release.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"
 EXPECTED_SOURCE_COMMIT = "871e416afc55db187d2b6f29c9ff7cac96472223"
-EXPECTED_POLICY_DIGEST = "14bf24d96f4705b9356394bfc1922d11280ef8f2aa3b5981611384a1a244852d"
+EXPECTED_POLICY_DIGEST = "db3590132eb5d1c12d111ab546b2b66eb50eaa39a237a6985ffc7a1b4f932a84"
 EXPECTED_CONTEXTS = ["Hermes CI required", "Review evidence required", "Merge admission"]
 FULL_EVENT_NAMES = {"push", "schedule", "workflow_dispatch"}
 TEST_SUFFIXES = {".py"}
 EXECUTABLE_NAMES = {"Dockerfile", "Makefile"}
-EXECUTABLE_SUFFIXES = {".bash", ".js", ".mjs", ".py", ".sh", ".ts", ".zsh"}
 
 
 def load_policy() -> dict[str, Any]:
@@ -85,6 +84,7 @@ def discover_tests() -> list[str]:
 
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
+    executable_suffixes = set(load_classifier().EXECUTABLE_SUFFIXES)
     selected: set[str] = set()
     unknown_executable = False
     for raw in files:
@@ -98,7 +98,7 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
         ):
             selected.add(path)
             continue
-        if candidate.suffix not in EXECUTABLE_SUFFIXES and candidate.name not in EXECUTABLE_NAMES:
+        if candidate.suffix not in executable_suffixes and candidate.name not in EXECUTABLE_NAMES:
             continue
         if candidate.suffix == ".py" and not path.startswith("tests/"):
             stem = candidate.stem.removeprefix("test_")
@@ -111,7 +111,9 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
 
 
 def slice_matrix(files: list[str], count: int = 6) -> dict[str, list[dict[str, object]]]:
-    durations_path = CANDIDATE_ROOT / "test_durations.json"
+    durations_path = Path(
+        os.environ.get("RUNTIME_OS_DURATIONS_PATH", CANDIDATE_ROOT / "test_durations.json")
+    )
     durations = (
         json.loads(durations_path.read_text(encoding="utf-8"))
         if durations_path.exists()

@@ -18,7 +18,7 @@ def test_runtime_os_workflow_preserves_pins_and_per_file_isolation() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in text
     assert "RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599" in text
-    assert 'scripts/run_tests.sh --files "$SELECTED_FILES"' in text
+    assert 'scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"' in text
     assert "SELECTED_FILES: ${{ matrix.files }}" in text
     assert "--files '${{ matrix.files }}'" not in text
     assert "persist-credentials: false" in text

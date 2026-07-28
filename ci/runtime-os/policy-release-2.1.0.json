@@ -18,6 +18,10 @@
   "slice_count": 6,
   "full_proof_triggers": [
     ".github/workflows/",
+    ".github/actions/",
+    "flake.lock",
+    "flake.nix",
+    "nix/",
     "packaging/",
     "pyproject.toml",
     "uv.lock",

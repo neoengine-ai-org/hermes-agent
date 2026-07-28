@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ def test_policy_lock_verifies_canonical_identity() -> None:
     assert policy["source_commit"] == "871e416afc55db187d2b6f29c9ff7cac96472223"
     assert (
         adapter.EXPECTED_POLICY_DIGEST
-        == "14bf24d96f4705b9356394bfc1922d11280ef8f2aa3b5981611384a1a244852d"
+        == "db3590132eb5d1c12d111ab546b2b66eb50eaa39a237a6985ffc7a1b4f932a84"
     )
     assert policy["stable_contexts"] == [
         "Hermes CI required",
@@ -97,4 +98,40 @@ def test_non_test_python_helper_forces_full_proof() -> None:
 
 def test_unknown_non_python_executable_forces_full_proof() -> None:
     assert adapter.select_tests(["scripts/novel-check.sh"]) == ([], True)
+    assert adapter.select_tests(["runtime/novel.rs"]) == ([], True)
+    assert adapter.select_tests(["runtime/novel.tsx"]) == ([], True)
     assert adapter.select_tests(["Dockerfile"]) == ([], True)
+
+
+def test_nix_and_composite_actions_force_full_proof() -> None:
+    policy = adapter.load_policy()
+    for path in ("flake.nix", "flake.lock", "nix/devShell.nix", ".github/actions/retry/action.yml"):
+        assert adapter.full_proof([path], "pull_request", policy)[0] is True
+
+
+def test_plan_emits_complete_workflow_output_contract(tmp_path, monkeypatch) -> None:
+    output = tmp_path / "github-output"
+    body = tmp_path / "body.md"
+    body.write_text("", encoding="utf-8")
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    args = argparse.Namespace(
+        changed_files_json='["tests/ci/test_runtime_os_adapter.py"]',
+        event_name="pull_request",
+        ref="refs/pull/81/merge",
+        body_file=str(body),
+        additions=1,
+        pr_number="81",
+        repo="neoengine-ai-org/hermes-agent",
+    )
+    assert adapter.plan(args) == 0
+    keys = {line.split("=", 1)[0] for line in output.read_text(encoding="utf-8").splitlines()}
+    assert keys == {
+        "plan",
+        "matrix",
+        "risk_class",
+        "review_route",
+        "review_classification",
+        "run_e2e",
+        "has_tests",
+        "telemetry_write_allowed",
+    }

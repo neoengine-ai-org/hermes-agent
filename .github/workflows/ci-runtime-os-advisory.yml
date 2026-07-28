@@ -58,7 +58,7 @@ jobs:
       - name: Read protected-main duration telemetry
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
-          path: candidate/test_durations.json
+          path: test_durations.json
           key: runtime-os-duration-readonly
           restore-keys: |
             test-durations-
@@ -74,6 +74,7 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
           RUNTIME_OS_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
+          RUNTIME_OS_DURATIONS_PATH: ${{ github.workspace }}/test_durations.json
         run: |
           set -euo pipefail
           test "$RUNTIME_OS_POLICY_VERSION" = "2.1.0"
@@ -152,11 +153,10 @@ jobs:
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
-          HERMES_TEST_WORKERS: "4"
         run: |
           source .venv/bin/activate
           python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
-          scripts/run_tests.sh --files "$SELECTED_FILES"
+          scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"
 
   e2e:
     name: Runtime OS e2e
