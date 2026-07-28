@@ -1,40 +1,7 @@
 # Hermes CI Runtime OS adapter
 
-Hermes vendors the immutable NeoEngine CI Runtime OS policy bundle `2.1.0`
-from source commit `871e416afc55db187d2b6f29c9ff7cac96472223`. The bundle JSON is
-content-addressed by `ci/runtime-os/policy-bundle.lock.json`; the dependency-free
-preflight verifies its identity before installing the test environment.
+The advisory adapter pins NeoEngine policy `2.1.0` from `871e416afc55db187d2b6f29c9ff7cac96472223` through `ci/runtime-os/policy-bundle.lock.json`.
 
-The adapter is advisory. Its trusted-base `pull_request_target` dispatcher
-publishes the stable contexts `Hermes CI required`,
-`Review evidence required`, and `Merge admission`, but this change does not make
-them required, change branch protection, add approval labels, or enable merging.
-Pull requests from forks fail closed in base-owned workflow code before candidate
-checkout or execution. Policy, classifier, and receipt validation run from the
-trusted base; the workflow does not use a private cross-repository checkout or
-token.
+Trusted-base `pull_request_target` code selects affected isolated tests, fails closed to all six slices plus e2e for broad or unknown executable changes, and emits `Hermes CI required`, `Review evidence required`, and `Merge admission` without changing repository rules or merge authority. Fork candidates fail before self-hosted execution. PRs never publish shared duration telemetry.
 
-Bootstrap note: this clean current-main landing cannot execute its own
-trusted-base dispatcher because policy 2.1.0 is intentionally absent from the
-current protected base. The dispatcher becomes self-hosting after this adapter
-lands; until then the existing main CI topology and the exact adapter/workflow
-contract proof are authoritative. No dependency on the unrelated R5 upstream
-synchronization PR is required.
-
-Affected tests are selected narrowly. Test helpers and unknown executable files
-fail closed rather than producing an empty collection. Changes to the classifier,
-test runner, packaging or dependency graph, shared CI runtime, workflow, or an
-unknown executable path fail closed to all six isolated test slices plus e2e.
-Protected `main`, nightly, and manual runs also execute the full proof. Each
-selected test file still runs in its own Python interpreter through
-`scripts/run_tests.sh`.
-
-The selector reads duration data written by the established test workflow's
-protected-`main` cache; this adapter never publishes PR duration telemetry. uv
-caching is enabled only for protected `main` pushes. Canonically excluded
-integration tests run in the separate e2e job on full-proof boundaries.
-
-Review routing follows the canonical model: R0-R2 use no CI model; R3 requires
-one head-bound post-green adversarial receipt (including a validator-approved
-degraded fallback); R4-R5 remain blocked for protected specialist review. The
-adapter never grants those reviews itself.
+R0-R2 use no CI model, R3 uses one post-green adversarial receipt under policy 2.1.0, and protected R4-R5 work remains blocked for the named specialist. Existing CI remains authoritative until the single cross-repository administration transaction; rollback is a normal revert.

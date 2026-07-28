@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-"""Dependency-free Hermes adapter for NeoEngine CI Runtime OS policy 2.1.0."""
-
 from __future__ import annotations
 
 import argparse
@@ -91,12 +89,7 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
     for raw in files:
         path = raw.replace("\\", "/").removeprefix("./")
         candidate = CANDIDATE_ROOT / path
-        if (
-            path.startswith("tests/")
-            and candidate.suffix in TEST_SUFFIXES
-            and candidate.name.startswith("test_")
-            and candidate.exists()
-        ):
+        if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.name.startswith("test_") and candidate.exists():
             selected.add(path)
             continue
         suffix = candidate.suffix.lower()
@@ -115,14 +108,8 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
 
 
 def slice_matrix(files: list[str], count: int = 6) -> dict[str, list[dict[str, object]]]:
-    durations_path = Path(
-        os.environ.get("RUNTIME_OS_DURATIONS_PATH", CANDIDATE_ROOT / "test_durations.json")
-    )
-    durations = (
-        json.loads(durations_path.read_text(encoding="utf-8"))
-        if durations_path.exists()
-        else {}
-    )
+    durations_path = Path(os.environ.get("RUNTIME_OS_DURATIONS_PATH", CANDIDATE_ROOT / "test_durations.json"))
+    durations = json.loads(durations_path.read_text(encoding="utf-8")) if durations_path.exists() else {}
     bucket_count = min(count, len(files))
     buckets: list[list[str]] = [[] for _ in range(bucket_count)]
     totals = [0.0] * bucket_count
@@ -138,13 +125,7 @@ def slice_matrix(files: list[str], count: int = 6) -> dict[str, list[dict[str, o
         index = min(range(bucket_count), key=lambda item: (totals[item], item))
         buckets[index].append(path)
         totals[index] += duration(path)
-    return {
-        "include": [
-            {"index": index + 1, "files": ":".join(bucket)}
-            for index, bucket in enumerate(buckets)
-            if bucket
-        ]
-    }
+    return {"include": [{"index": index + 1, "files": ":".join(bucket)} for index, bucket in enumerate(buckets) if bucket]}
 
 
 def write_output(name: str, value: str) -> None:
@@ -155,7 +136,6 @@ def write_output(name: str, value: str) -> None:
 
 
 def build_review_classification(classification: Any) -> dict[str, object]:
-    """Apply the cutover's minimal review model without author self-attestation."""
     review_classification = classification.as_dict()
     if classification.risk_class in {"R0", "R1", "R2"}:
         review_classification.update(
@@ -188,13 +168,7 @@ def plan(args: argparse.Namespace) -> int:
     if not isinstance(files, list) or not all(isinstance(item, str) for item in files):
         raise ValueError("changed files must be a JSON string array")
     body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
-    classification = load_classifier().classify(
-        files,
-        body,
-        additions=args.additions,
-        pr_number=args.pr_number,
-        repo=args.repo,
-    )
+    classification = load_classifier().classify(files, body, additions=args.additions, pr_number=args.pr_number, repo=args.repo)
     review_classification = build_review_classification(classification)
     run_full, reason = full_proof(files, args.event_name, policy)
     selected, unknown = select_tests(files)
@@ -202,16 +176,13 @@ def plan(args: argparse.Namespace) -> int:
         run_full, reason = True, "unknown_executable_fails_closed"
     tests = discover_tests() if run_full else selected
     matrix = slice_matrix(tests)
+    review_key = "R4-R5" if classification.risk_class in {"R4", "R5"} else "R3" if classification.risk_class == "R3" else "R0-R2"
     result = {
         "policy_version": policy["policy_version"],
         "policy_source_commit": policy["source_commit"],
         "risk_class": classification.risk_class,
         "complexity_class": classification.complexity_class,
-        "review_route": policy["review_model"]["R4-R5"]
-        if classification.risk_class in {"R4", "R5"}
-        else policy["review_model"]["R3"]
-        if classification.risk_class == "R3"
-        else policy["review_model"]["R0-R2"],
+        "review_route": policy["review_model"][review_key],
         "full_proof": run_full,
         "reason": reason,
         "run_e2e": run_full,
@@ -225,10 +196,7 @@ def plan(args: argparse.Namespace) -> int:
     write_output("matrix", json.dumps(matrix, separators=(",", ":")))
     write_output("risk_class", classification.risk_class)
     write_output("review_route", result["review_route"])
-    write_output(
-        "review_classification",
-        json.dumps(review_classification, separators=(",", ":"), sort_keys=True),
-    )
+    write_output("review_classification", json.dumps(review_classification, separators=(",", ":"), sort_keys=True))
     write_output("run_e2e", str(run_full).lower())
     write_output("has_tests", str(bool(matrix["include"])).lower())
     write_output("telemetry_write_allowed", str(result["telemetry_write_allowed"]).lower())
