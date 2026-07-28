@@ -18,6 +18,10 @@ def test_policy_lock_verifies_canonical_identity() -> None:
     policy = adapter.load_policy()
     assert policy["policy_version"] == "2.1.0"
     assert policy["source_commit"] == "871e416afc55db187d2b6f29c9ff7cac96472223"
+    assert (
+        adapter.EXPECTED_POLICY_DIGEST
+        == "14bf24d96f4705b9356394bfc1922d11280ef8f2aa3b5981611384a1a244852d"
+    )
     assert policy["stable_contexts"] == [
         "Hermes CI required",
         "Review evidence required",

@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 LOCK_PATH = ROOT / "ci/runtime-os/policy-release.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"
 EXPECTED_SOURCE_COMMIT = "871e416afc55db187d2b6f29c9ff7cac96472223"
+EXPECTED_POLICY_DIGEST = "14bf24d96f4705b9356394bfc1922d11280ef8f2aa3b5981611384a1a244852d"
 EXPECTED_CONTEXTS = ["Hermes CI required", "Review evidence required", "Merge admission"]
 FULL_EVENT_NAMES = {"push", "schedule", "workflow_dispatch"}
 TEST_SUFFIXES = {".py"}
@@ -26,8 +27,8 @@ def load_policy() -> dict[str, Any]:
     bundle_path = ROOT / lock["bundle"]
     payload = bundle_path.read_bytes()
     digest = hashlib.sha256(payload).hexdigest()
-    if digest != lock["digest"]:
-        raise ValueError(f"policy digest mismatch: expected {lock['digest']}, got {digest}")
+    if lock["digest"] != EXPECTED_POLICY_DIGEST or digest != EXPECTED_POLICY_DIGEST:
+        raise ValueError(f"policy digest mismatch: expected {EXPECTED_POLICY_DIGEST}, got {digest}")
     policy = json.loads(payload)
     required = {
         "policy_version": EXPECTED_POLICY_VERSION,
