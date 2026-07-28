@@ -1,0 +1,76 @@
+name: PR 75 Slice 1 Triage (temporary)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    name: List slice 1 quarantine-sensitive tests
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'diag/hermes75-slice1-20260728'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout diagnostic branch
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Restore duration cache
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: test-durations
+
+      - name: Reconstruct cached slice and identify suspects
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import importlib.util
+
+          root = Path.cwd()
+          spec = importlib.util.spec_from_file_location('parallel', root / 'scripts/run_tests_parallel.py')
+          module = importlib.util.module_from_spec(spec)
+          assert spec and spec.loader
+          spec.loader.exec_module(module)
+          files = module._discover_files([root / 'tests'])
+          durations = module._load_durations(root)
+          selected = module._slice_files(files, 1, 6, durations, root)
+          rels = [str(path.relative_to(root)) for path in selected]
+          Path('slice1-files.txt').write_text('\n'.join(rels) + '\n')
+
+          needles = (
+              'powerpoint',
+              'skills/productivity',
+              'bundled skill',
+              'bundled_skill',
+              'skills catalog',
+              'skills_catalog',
+              'skill count',
+              'skill_count',
+              'license.txt',
+          )
+          suspects = []
+          for path in selected:
+              text = path.read_text(errors='replace').lower()
+              hits = sorted({needle for needle in needles if needle in text})
+              if hits:
+                  suspects.append(f"{path.relative_to(root)}\t{','.join(hits)}")
+          Path('slice1-suspects.txt').write_text('\n'.join(suspects) + '\n')
+          print(f'slice1_files={len(rels)} suspects={len(suspects)}')
+          print(Path('slice1-suspects.txt').read_text())
+          PY
+
+      - name: Upload triage inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pr75-slice1-triage
+          path: |
+            slice1-files.txt
+            slice1-suspects.txt
+          if-no-files-found: error
+          retention-days: 1
