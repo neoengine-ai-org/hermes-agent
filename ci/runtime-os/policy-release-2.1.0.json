@@ -1,0 +1,44 @@
+{
+  "policy_id": "neoengine-ci-runtime-os",
+  "policy_version": "2.1.0",
+  "source_commit": "871e416afc55db187d2b6f29c9ff7cac96472223",
+  "mode": "advisory",
+  "runner_labels": [
+    "self-hosted",
+    "Linux",
+    "x64",
+    "neoengine-shared-linux",
+    "qwen-ops"
+  ],
+  "stable_contexts": [
+    "Hermes CI required",
+    "Review evidence required",
+    "Merge admission"
+  ],
+  "slice_count": 6,
+  "full_proof_triggers": [
+    ".github/workflows/",
+    ".github/actions/",
+    "flake.lock",
+    "flake.nix",
+    "nix/",
+    "packaging/",
+    "pyproject.toml",
+    "uv.lock",
+    "scripts/ci_risk_classifier.py",
+    "scripts/ci_risk_classifier_core.py",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+    "ci/runtime-os/",
+    "scripts/ci/runtime_os_adapter.py"
+  ],
+  "review_model": {
+    "R0-R2": "no_ci_model",
+    "R3": "one_adversarial_after_green_with_explicit_degraded_fallback",
+    "R4-R5": "protected_specialists"
+  },
+  "trusted_classifier": "scripts/ci_risk_classifier.py",
+  "candidate_may_rewrite_policy": false,
+  "private_cross_repo_checkout": false,
+  "telemetry_source": "protected_main_only"
+}

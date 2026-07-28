@@ -1,0 +1,284 @@
+name: CI Runtime OS advisory
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-os-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
+env:
+  RUNTIME_OS_POLICY_VERSION: "2.1.0"
+  RUNTIME_OS_SOURCE_COMMIT: 871e416afc55db187d2b6f29c9ff7cac96472223
+
+jobs:
+  preflight:
+    name: Dependency-free policy preflight
+    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      risk_class: ${{ steps.plan.outputs.risk_class }}
+      review_route: ${{ steps.plan.outputs.review_route }}
+      review_classification: ${{ steps.plan.outputs.review_classification }}
+      run_e2e: ${{ steps.plan.outputs.run_e2e }}
+      has_tests: ${{ steps.plan.outputs.has_tests }}
+      telemetry_write_allowed: ${{ steps.plan.outputs.telemetry_write_allowed }}
+    steps:
+      - name: Reject untrusted fork execution
+        if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
+        run: exit 1
+
+      - name: Checkout trusted base policy
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .runtime-os-trusted
+
+      - name: Checkout same-repository candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+
+      - name: Read protected-main duration telemetry
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: runtime-os-duration-readonly
+          restore-keys: |
+            test-durations-
+
+      - name: Verify immutable policy and select proof
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name == 'pull_request_target' && 'pull_request' || github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
+          PR_NUMBER: ${{ github.event.pull_request.number || 'unknown' }}
+          REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          RUNTIME_OS_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
+          RUNTIME_OS_DURATIONS_PATH: ${{ github.workspace }}/test_durations.json
+        run: |
+          set -euo pipefail
+          test "$RUNTIME_OS_POLICY_VERSION" = "2.1.0"
+          test "$RUNTIME_OS_SOURCE_COMMIT" = "871e416afc55db187d2b6f29c9ff7cac96472223"
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "${BASE_SHA:-}" ]; then
+            git -C candidate fetch --no-tags origin "$BASE_SHA"
+          elif [ "$EVENT_NAME" != pull_request ]; then
+            git -C candidate ls-files > changed-files.txt
+          fi
+          if [ "$EVENT_NAME" = pull_request ] \
+            && [ -n "${BASE_SHA:-}" ] \
+            && git -C candidate cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git -C candidate diff --name-only "$BASE_SHA" HEAD > changed-files.txt
+          elif [ "$EVENT_NAME" = pull_request ]; then
+            echo "::error::base commit unavailable; refusing ambiguous change selection"
+            exit 2
+          fi
+          python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
+          printf '%s' "$PR_BODY" > pr-body.md
+          python3 .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
+            --changed-files-json "$(cat changed-files.json)" \
+            --event-name "$EVENT_NAME" \
+            --ref "$EVENT_REF" \
+            --body-file pr-body.md \
+            --additions "$PR_ADDITIONS" \
+            --pr-number "$PR_NUMBER" \
+            --repo "$REPOSITORY"
+
+  test:
+    name: Runtime OS slice ${{ matrix.index }}/6
+    needs: preflight
+    if: needs.preflight.outputs.has_tests == 'true'
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned ripgrep binary
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          mkdir -p "$RUNNER_TEMP/runtime-os-bin"
+          install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" "$RUNNER_TEMP/runtime-os-bin/rg"
+          echo "$RUNNER_TEMP/runtime-os-bin" >> "$GITHUB_PATH"
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: ${{ needs.preflight.outputs.telemetry_write_allowed == 'true' }}
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install prebuilt Python and locked environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run selected files with interpreter isolation
+        env:
+          SELECTED_FILES: ${{ matrix.files }}
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
+          scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"
+
+  e2e:
+    name: Runtime OS e2e
+    needs: preflight
+    if: needs.preflight.outputs.run_e2e == 'true'
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Install pinned ripgrep binary
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          mkdir -p "$RUNNER_TEMP/runtime-os-bin"
+          install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" "$RUNNER_TEMP/runtime-os-bin/rg"
+          echo "$RUNNER_TEMP/runtime-os-bin" >> "$GITHUB_PATH"
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: ${{ needs.preflight.outputs.telemetry_write_allowed == 'true' }}
+      - name: Install prebuilt Python and locked environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+      - name: Run full e2e proof
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -m pytest -m integration tests/test_wheel_locales_e2e.py -v
+          python -m pytest tests/integration/ -v --tb=short
+          python -m pytest tests/e2e/ -v --tb=short
+
+  hermes-required:
+    name: Hermes CI required
+    if: always()
+    needs: [preflight, test, e2e]
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate immutable policy proof
+        env:
+          PREFLIGHT: ${{ needs.preflight.result }}
+          TESTS: ${{ needs.test.result }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          test "$PREFLIGHT" = success
+          test "$TESTS" = success -o "$TESTS" = skipped
+          test "$E2E" = success -o "$E2E" = skipped
+
+  review-evidence:
+    name: Review evidence required
+    if: always()
+    needs: [preflight, hermes-required]
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted review validator
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: trusted
+      - name: Validate head-bound canonical receipt
+        env:
+          RISK: ${{ needs.preflight.outputs.risk_class }}
+          HERMES_RESULT: ${{ needs.hermes-required.result }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          REVIEW_CLASSIFICATION: ${{ needs.preflight.outputs.review_classification }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          test "$HERMES_RESULT" = success
+          if [ "$EVENT_NAME" != pull_request_target ]; then
+            exit 0
+          fi
+          case "$RISK" in
+            R0|R1|R2) exit 0 ;;
+            R3|R4|R5) ;;
+            *) exit 1 ;;
+          esac
+          printf '%s' "$PR_BODY" > pr-body.md
+          printf '%s' "$REVIEW_CLASSIFICATION" > review-classification.json
+          python3 trusted/scripts/review_receipt_validator.py \
+            --classification review-classification.json \
+            --pr-body pr-body.md \
+            --head-sha "$HEAD_SHA" \
+            --base-sha "$BASE_SHA" \
+            --primary-provider codex \
+            --output-dir review-evidence \
+            --enforce
+
+  merge-admission:
+    name: Merge admission
+    if: always()
+    needs: [hermes-required, review-evidence]
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate advisory admission without mutation
+        env:
+          HERMES_RESULT: ${{ needs.hermes-required.result }}
+          REVIEW_RESULT: ${{ needs.review-evidence.result }}
+          IS_DRAFT: ${{ github.event.pull_request.draft || false }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          test "$HERMES_RESULT" = success
+          test "$REVIEW_RESULT" = success
+          test "$IS_DRAFT" != true
+          ! printf '%s' "$LABELS" | grep -Eq '"(do-not-merge|blocked|hold)"'
+          echo "Advisory only: this workflow does not merge, label, review, or alter branch protection."
