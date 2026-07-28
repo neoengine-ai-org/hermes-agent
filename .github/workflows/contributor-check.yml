@@ -65,12 +65,12 @@ jobs:
           for node in module.body:
               if not isinstance(node, ast.Assign):
                   continue
-              if any(isinstance(target, ast.Name) and target.id == "AUTHOR_MAP" for target in node.targets):
+              if any(isinstance(target, ast.Name) and target.id == "LEGACY_AUTHOR_MAP" for target in node.targets):
                   author_map = ast.literal_eval(node.value)
                   break
 
           if not isinstance(author_map, dict):
-              raise SystemExit("AUTHOR_MAP not found or is not a literal dictionary")
+              raise SystemExit("LEGACY_AUTHOR_MAP not found or is not a literal dictionary")
 
           def canonical(value: str) -> str:
               local, separator, domain = value.strip().casefold().partition("@")
