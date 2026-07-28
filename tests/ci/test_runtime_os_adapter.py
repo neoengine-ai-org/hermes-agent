@@ -58,8 +58,28 @@ def test_unknown_executable_fails_closed() -> None:
     assert unknown is True
 
 
+def test_adapter_self_change_is_not_r0() -> None:
+    classification = adapter.load_classifier().classify(
+        ["scripts/ci/runtime_os_adapter.py"], ""
+    )
+    assert classification.risk_class == "R3"
+
+
 def test_docs_only_change_does_not_manufacture_empty_test_job() -> None:
     selected, unknown = adapter.select_tests(["docs/guide.md"])
     assert selected == []
     assert unknown is False
     assert adapter.slice_matrix(selected) == {"include": []}
+
+
+def test_discovery_excludes_integration_e2e_and_docker() -> None:
+    tests = adapter.discover_tests()
+    assert not any(
+        set(Path(test).parts) & {"integration", "e2e", "docker"} for test in tests
+    )
+
+
+def test_module_mapping_is_anchored_not_substring_based() -> None:
+    selected, unknown = adapter.select_tests(["hermes/e.py"])
+    assert selected == []
+    assert unknown is True

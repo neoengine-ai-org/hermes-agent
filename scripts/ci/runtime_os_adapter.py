@@ -12,8 +12,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parents[2]
-LOCK_PATH = ROOT / "ci/runtime-os/policy-release.lock.json"
+TRUST_ROOT = Path(__file__).resolve().parents[2]
+CANDIDATE_ROOT = Path(os.environ.get("RUNTIME_OS_CANDIDATE_ROOT", TRUST_ROOT)).resolve()
+LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-release.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"
 EXPECTED_SOURCE_COMMIT = "871e416afc55db187d2b6f29c9ff7cac96472223"
 EXPECTED_POLICY_DIGEST = "14bf24d96f4705b9356394bfc1922d11280ef8f2aa3b5981611384a1a244852d"
@@ -24,7 +25,7 @@ TEST_SUFFIXES = {".py"}
 
 def load_policy() -> dict[str, Any]:
     lock = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-    bundle_path = ROOT / lock["bundle"]
+    bundle_path = TRUST_ROOT / lock["bundle"]
     payload = bundle_path.read_bytes()
     digest = hashlib.sha256(payload).hexdigest()
     if lock["digest"] != EXPECTED_POLICY_DIGEST or digest != EXPECTED_POLICY_DIGEST:
@@ -49,13 +50,14 @@ def load_policy() -> dict[str, Any]:
 
 
 def load_classifier() -> Any:
-    path = ROOT / "scripts/ci_risk_classifier.py"
+    path = TRUST_ROOT / "scripts/ci_risk_classifier.py"
     spec = importlib.util.spec_from_file_location("_runtime_os_trusted_classifier", path)
     if spec is None or spec.loader is None:
         raise RuntimeError("unable to load trusted classifier")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module.SELF_CHANGE_PATHS.add("scripts/ci/runtime_os_adapter.py")
     return module
 
 
@@ -71,10 +73,11 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
 
 
 def discover_tests() -> list[str]:
+    skip_parts = {"integration", "e2e", "docker"}
     return sorted(
-        str(path.relative_to(ROOT))
-        for path in (ROOT / "tests").rglob("test_*.py")
-        if path.is_file()
+        str(path.relative_to(CANDIDATE_ROOT))
+        for path in (CANDIDATE_ROOT / "tests").rglob("test_*.py")
+        if path.is_file() and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
     )
 
 
@@ -84,25 +87,23 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
     unknown_executable = False
     for raw in files:
         path = raw.replace("\\", "/").removeprefix("./")
-        candidate = ROOT / path
+        candidate = CANDIDATE_ROOT / path
         if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.exists():
             selected.add(path)
             continue
         if candidate.suffix != ".py" or path.startswith(("docs/", "website/")):
             continue
         stem = candidate.stem.removeprefix("test_")
-        matches = [test for test in all_tests if stem in Path(test).stem or stem in test]
+        matches = [test for test in all_tests if Path(test).stem == f"test_{stem}"]
         if matches:
             selected.update(matches)
         else:
             unknown_executable = True
-    if not selected and any(not f.startswith(("docs/", "website/")) for f in files):
-        unknown_executable = True
     return sorted(selected), unknown_executable
 
 
 def slice_matrix(files: list[str], count: int = 6) -> dict[str, list[dict[str, object]]]:
-    durations_path = ROOT / "test_durations.json"
+    durations_path = CANDIDATE_ROOT / "test_durations.json"
     durations = (
         json.loads(durations_path.read_text(encoding="utf-8"))
         if durations_path.exists()
@@ -139,6 +140,24 @@ def plan(args: argparse.Namespace) -> int:
         raise ValueError("changed files must be a JSON string array")
     body = Path(args.body_file).read_text(encoding="utf-8") if args.body_file else ""
     classification = load_classifier().classify(files, body, additions=args.additions)
+    review_classification = classification.as_dict()
+    if classification.risk_class in {"R0", "R1", "R2"}:
+        review_classification.update(
+            required_reviews=[],
+            secondary_review_required=False,
+            adversarial_review_required=False,
+            model_tier_required=0,
+        )
+    elif classification.risk_class == "R3":
+        review_classification.update(
+            required_reviews=["adversarial_review_required"],
+            secondary_review_required=False,
+            adversarial_review_required=True,
+            opposite_provider_required=False,
+            human_gate_required=False,
+            founder_review_required=False,
+            model_tier_required=0,
+        )
     run_full, reason = full_proof(files, args.event_name, policy)
     selected, unknown = select_tests(files)
     if unknown:
@@ -168,6 +187,10 @@ def plan(args: argparse.Namespace) -> int:
     write_output("matrix", json.dumps(matrix, separators=(",", ":")))
     write_output("risk_class", classification.risk_class)
     write_output("review_route", result["review_route"])
+    write_output(
+        "review_classification",
+        json.dumps(review_classification, separators=(",", ":"), sort_keys=True),
+    )
     write_output("run_e2e", str(run_full).lower())
     write_output("has_tests", str(bool(matrix["include"])).lower())
     write_output("telemetry_write_allowed", str(result["telemetry_write_allowed"]).lower())
