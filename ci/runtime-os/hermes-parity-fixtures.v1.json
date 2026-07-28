@@ -1,0 +1,66 @@
+{
+  "canonical_runtime_os": {
+    "policy_version": "2.1.0",
+    "source_commit": "871e416afc55db187d2b6f29c9ff7cac96472223",
+    "source_digests": {
+      "src/ci-runtime-os/proof-selection.ts": "sha256:fb41392b598faa4ab442f305e4a6dff61811d53cd5046a388219d09de4d41e2b",
+      "src/ci-runtime-os/__tests__/proof-selection.test.ts": "sha256:3a2b7bd064f161821773aac1ef2eedcdf2afde7215f3ce51df585fe7427211d9",
+      "src/ci-runtime-os/__tests__/review-routing.test.ts": "sha256:18a1ac74525f8a622dbd3144cb7bac8262c4d6c6f271ed5c84b89b54309a9c8a",
+      "src/ci-runtime-os/review-routing.ts": "sha256:5a9220bb1c5b741f0607ec33213c0632db25533608d1ee1bf8b19eefb7ce92a5",
+      "src/ci-runtime-os/types.ts": "sha256:cb76164215f07a4e64e0cc442adf5b6c44deec93d6b3c796ec33164f113dc71b"
+    }
+  },
+  "fixtures": [
+    {
+      "changed_files": [
+        "agent/rate_limit_tracker.py"
+      ],
+      "event_name": "pull_request",
+      "expected_full_proof": false,
+      "expected_selected_tests": [
+        "tests/agent/test_nous_rate_guard.py",
+        "tests/agent/test_rate_limit_tracker.py",
+        "tests/gateway/test_usage_command.py"
+      ],
+      "id": "historical-direct-and-monkeypatch-consumers"
+    },
+    {
+      "changed_files": [
+        "scripts/ci_risk_classifier.py"
+      ],
+      "event_name": "pull_request",
+      "expected_full_proof": true,
+      "id": "classifier-self-change"
+    },
+    {
+      "changed_files": [
+        "pyproject.toml"
+      ],
+      "event_name": "pull_request",
+      "expected_full_proof": true,
+      "id": "dependency-manifest"
+    },
+    {
+      "changed_files": [
+        "new_package/novel_runtime.py"
+      ],
+      "event_name": "pull_request",
+      "expected_full_proof": true,
+      "id": "unknown-executable-fails-closed"
+    },
+    {
+      "changed_files": [
+        "README.md"
+      ],
+      "event_name": "merge_group",
+      "expected_full_proof": true,
+      "id": "merge-group-synthetic-head"
+    }
+  ],
+  "schema_version": "hermes.ci-runtime-os-parity-fixtures.v1",
+  "stable_contexts": [
+    "Hermes CI required",
+    "Review evidence required",
+    "Merge admission"
+  ]
+}
