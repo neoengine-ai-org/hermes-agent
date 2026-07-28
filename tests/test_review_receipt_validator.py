@@ -63,6 +63,7 @@ def receipt(review_type: str, **overrides: object) -> dict[str, object]:
         "protected_claims_checked": [],
         "review_timestamp": "2026-06-01T00:00:00Z",
         "evidence_url_or_path": "https://example.invalid/review",
+        "diff_fingerprint": "",
     }
     data.update(overrides)
     return data
@@ -506,3 +507,152 @@ def test_cli_emits_artifacts_even_when_review_ready_false(tmp_path: Path) -> Non
     data = json.loads((output_dir / "review-receipts.json").read_text(encoding="utf-8"))
     assert data["review_ready"] is False
     assert (output_dir / "review-receipts.md").exists()
+
+
+FP = "sha256:" + "a" * 64
+FP_OTHER = "sha256:" + "b" * 64
+
+
+def validate_with_fingerprint(
+    data: dict[str, object],
+    receipts: list[dict[str, object]],
+    current_diff_fingerprint: str = "",
+    base_is_ancestor_of_head: bool = False,
+) -> dict[str, Any]:
+    return review_receipt_validator.validate_review_receipts(
+        data,
+        receipts,
+        current_head_sha=HEAD_SHA,
+        current_base_sha=BASE_SHA,
+        current_diff_fingerprint=current_diff_fingerprint,
+        base_is_ancestor_of_head=base_is_ancestor_of_head,
+    )
+
+
+def test_stale_head_with_matching_diff_fingerprint_is_mechanically_fresh() -> None:
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead", diff_fingerprint=FP)],
+        current_diff_fingerprint=FP,
+    )
+
+    assert result["review_ready"] is True
+    assert result["mechanical_freshness_receipts"] == ["secondary"]
+    assert "stale_review_receipt:secondary" not in result["invalid_receipt_reasons"]
+
+
+def test_stale_base_with_fingerprint_and_ancestor_is_mechanically_fresh() -> None:
+    # Base staleness clears ONLY when the current base is an ancestor of the head
+    # (head reflects the merge) — the branch-sync case.
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead", base_sha_reviewed="oldbase", diff_fingerprint=FP)],
+        current_diff_fingerprint=FP,
+        base_is_ancestor_of_head=True,
+    )
+
+    assert result["review_ready"] is True
+    assert result["base_is_ancestor_of_head"] is True
+    assert "base_sha_mismatch:secondary" not in result["invalid_receipt_reasons"]
+
+
+def test_stale_base_without_ancestor_stays_strict_even_on_fingerprint_match() -> None:
+    # Opposite-frontier round-2 MAJOR: base advanced past the head (not an
+    # ancestor) -> head blobs do not reflect the new base -> must stay strict even
+    # though the head-content fingerprint matches.
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead", base_sha_reviewed="oldbase", diff_fingerprint=FP)],
+        current_diff_fingerprint=FP,
+        base_is_ancestor_of_head=False,
+    )
+
+    assert result["review_ready"] is False
+    assert "base_sha_mismatch:secondary" in result["invalid_receipt_reasons"]
+    # Head staleness still clears (content unchanged); only the base gate holds.
+    assert "stale_review_receipt:secondary" not in result["invalid_receipt_reasons"]
+
+
+def test_stale_head_with_mismatched_fingerprint_stays_stale() -> None:
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead", diff_fingerprint=FP_OTHER)],
+        current_diff_fingerprint=FP,
+    )
+
+    assert result["review_ready"] is False
+    assert "stale_review_receipt:secondary" in result["invalid_receipt_reasons"]
+
+
+def test_stale_head_with_missing_receipt_fingerprint_stays_stale() -> None:
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead")],
+        current_diff_fingerprint=FP,
+    )
+
+    assert result["review_ready"] is False
+    assert "stale_review_receipt:secondary" in result["invalid_receipt_reasons"]
+
+
+def test_stale_head_without_current_fingerprint_stays_stale() -> None:
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", head_sha_reviewed="oldhead", diff_fingerprint=FP)],
+    )
+
+    assert result["review_ready"] is False
+    assert "stale_review_receipt:secondary" in result["invalid_receipt_reasons"]
+
+
+def test_malformed_fingerprints_stay_stale() -> None:
+    for recorded, current in ((FP.upper(), FP), ("sha256:zz", FP), (FP, "md5:" + "a" * 64), ("aaa", FP)):
+        result = validate_with_fingerprint(
+            classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+            [receipt("secondary", head_sha_reviewed="oldhead", diff_fingerprint=recorded)],
+            current_diff_fingerprint=current,
+        )
+        # upper-case recorded values are normalized to lower by _normalize_receipt,
+        # so FP.upper() actually matches; everything else must stay stale.
+        if recorded == FP.upper():
+            assert result["review_ready"] is True
+        else:
+            assert result["review_ready"] is False, (recorded, current)
+            assert "stale_review_receipt:secondary" in result["invalid_receipt_reasons"]
+
+
+def test_protected_receipt_types_never_mechanically_fresh() -> None:
+    for review_type, marker in (
+        ("founder", "founder_review_required"),
+        ("human_protected", "protected_human_review_required"),
+    ):
+        result = validate_with_fingerprint(
+            classification(required_reviews=[marker], founder_review_required=(review_type == "founder")),
+            [receipt(review_type, head_sha_reviewed="oldhead", diff_fingerprint=FP)],
+            current_diff_fingerprint=FP,
+        )
+        assert f"stale_review_receipt:{review_type}" in result["invalid_receipt_reasons"], review_type
+
+
+def test_fresh_receipt_with_fingerprints_is_not_counted_as_mechanical() -> None:
+    result = validate_with_fingerprint(
+        classification(required_reviews=["secondary_review_required"], secondary_review_required=True),
+        [receipt("secondary", diff_fingerprint=FP)],
+        current_diff_fingerprint=FP,
+    )
+
+    assert result["review_ready"] is True
+    assert result["mechanical_freshness_receipts"] == []
+
+
+def test_cli_help_advertises_current_diff_fingerprint_flag() -> None:
+    # The classifier workflow discovers the capability by grepping --help; this
+    # string is a wire contract, not cosmetics.
+    proc = subprocess.run(
+        [sys.executable, str(MODULE_PATH), "--help"],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert "--current-diff-fingerprint" in proc.stdout

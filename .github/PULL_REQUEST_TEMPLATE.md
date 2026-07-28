@@ -121,6 +121,15 @@ escalation reason.
 - protected_claims_checked:
 - review_timestamp:
 - evidence_url_or_path:
+- diff_fingerprint:
+
+<!-- diff_fingerprint (optional, model-review receipt types only): output of
+`python scripts/receipt_diff_fingerprint.py --base-sha <base> --head-sha <head>`
+at review time. It binds the full content of the PR-touched files at that head.
+If the head later moves without changing that content (e.g. a base sync that
+does not touch the PR's files), a matching fingerprint keeps the receipt valid
+instead of forcing a re-review. Protected receipt types (founder/human/waiver/
+security/finance_sensitive) always require exact head-SHA freshness. -->
 
 ## RuntimePayloadContract
 
