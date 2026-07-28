@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -13,6 +14,9 @@ assert SPEC and SPEC.loader
 adapter = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = adapter
 SPEC.loader.exec_module(adapter)
+PARITY_FIXTURES = json.loads(
+    (ROOT / "ci/runtime-os/hermes-parity-fixtures.v1.json").read_text(encoding="utf-8")
+)
 
 
 def test_policy_lock_verifies_canonical_identity() -> None:
@@ -21,13 +25,19 @@ def test_policy_lock_verifies_canonical_identity() -> None:
     assert policy["source_commit"] == "871e416afc55db187d2b6f29c9ff7cac96472223"
     assert (
         adapter.EXPECTED_POLICY_DIGEST
-        == "db3590132eb5d1c12d111ab546b2b66eb50eaa39a237a6985ffc7a1b4f932a84"
+        == "1bdb16a0322fb654b519b49e4608d6d9f369fa1572ac1901a596605262525b19"
+    )
+    assert (
+        adapter.EXPECTED_PARITY_FIXTURE_DIGEST
+        == "ed3f140b8324c746791173a084e4a6ea7bedb2e6e27c3eb9079cb5d194f708dd"
     )
     assert policy["stable_contexts"] == [
         "Hermes CI required",
         "Review evidence required",
         "Merge admission",
     ]
+    assert policy["repository_profile"]["id"] == "hermes-agent"
+    assert policy["canonical_decision_contract"]["types_digest"].startswith("sha256:")
 
 
 def test_classifier_change_requires_full_six_slice_proof() -> None:
@@ -42,6 +52,20 @@ def test_main_and_nightly_require_full_proof() -> None:
     policy = adapter.load_policy()
     assert adapter.full_proof(["README.md"], "push", policy)[0] is True
     assert adapter.full_proof(["README.md"], "schedule", policy)[0] is True
+
+
+def test_canonical_parity_and_historical_escape_fixtures() -> None:
+    policy = adapter.load_policy()
+    assert PARITY_FIXTURES["canonical_runtime_os"]["source_commit"] == policy["source_commit"]
+    assert PARITY_FIXTURES["stable_contexts"] == policy["stable_contexts"]
+    for fixture in PARITY_FIXTURES["fixtures"]:
+        files = fixture["changed_files"]
+        full, _ = adapter.full_proof(files, fixture["event_name"], policy)
+        selected, unknown = adapter.select_tests(files)
+        observed_full = full or unknown
+        assert observed_full is fixture["expected_full_proof"], fixture["id"]
+        if "expected_selected_tests" in fixture:
+            assert set(fixture["expected_selected_tests"]).issubset(selected), fixture["id"]
 
 
 def test_direct_test_selection_is_narrow_and_nonempty() -> None:
@@ -88,6 +112,22 @@ def test_module_mapping_is_anchored_not_substring_based() -> None:
     selected, unknown = adapter.select_tests(["hermes/e.py"])
     assert selected == []
     assert unknown is True
+
+
+def test_module_mapping_includes_direct_import_and_monkeypatch_consumers() -> None:
+    selected, unknown = adapter.select_tests(["agent/rate_limit_tracker.py"])
+    assert "tests/agent/test_rate_limit_tracker.py" in selected
+    assert "tests/agent/test_nous_rate_guard.py" in selected
+    assert "tests/gateway/test_usage_command.py" in selected
+    assert unknown is False
+
+
+def test_module_mapping_closes_transitive_source_to_test_dependencies() -> None:
+    selected, unknown = adapter.select_tests(["agent/file_safety.py"])
+    assert "tests/agent/test_file_safety_credentials.py" in selected
+    assert "tests/tools/test_write_deny.py" in selected
+    assert "tests/agent/test_copilot_acp_deprecation.py" in selected
+    assert unknown is False
 
 
 def test_non_test_python_helper_forces_full_proof() -> None:

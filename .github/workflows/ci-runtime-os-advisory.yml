@@ -2,7 +2,11 @@ name: CI Runtime OS advisory
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
   schedule:
@@ -11,9 +15,10 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
-  group: runtime-os-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  group: runtime-os-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'push' }}
 
 env:
@@ -23,7 +28,9 @@ env:
 jobs:
   preflight:
     name: Dependency-free policy preflight
-    if: github.event_name != 'pull_request_target' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 10
     outputs:
@@ -34,6 +41,8 @@ jobs:
       run_e2e: ${{ steps.plan.outputs.run_e2e }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
       telemetry_write_allowed: ${{ steps.plan.outputs.telemetry_write_allowed }}
+      environment_digest: ${{ steps.environment.outputs.environment_digest }}
+      duration_cache_key: ${{ steps.environment.outputs.duration_cache_key }}
     steps:
       - name: Reject untrusted fork execution
         if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
@@ -44,7 +53,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
           path: .runtime-os-trusted
 
       - name: Checkout same-repository candidate
@@ -55,24 +64,43 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           path: candidate
 
+      - name: Compute immutable environment and duration identities
+        id: environment
+        run: |
+          set -euo pipefail
+          dependency_digest="$(sha256sum candidate/uv.lock | cut -d' ' -f1)"
+          test_manifest_digest="$(
+            find candidate/tests -type f -name 'test_*.py' -print0 |
+              sort -z |
+              xargs -0 sha256sum |
+              sha256sum |
+              cut -d' ' -f1
+          )"
+          environment_digest="$(printf '%s\n%s\n%s\n' \
+            "$RUNTIME_OS_SOURCE_COMMIT" "$dependency_digest" "$test_manifest_digest" |
+            sha256sum |
+            cut -d' ' -f1)"
+          echo "environment_digest=$environment_digest" >> "$GITHUB_OUTPUT"
+          echo "duration_cache_key=runtime-os-duration-${test_manifest_digest}-${dependency_digest}" >> "$GITHUB_OUTPUT"
+
       - name: Read protected-main duration telemetry
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
-          key: runtime-os-duration-readonly
+          key: ${{ steps.environment.outputs.duration_cache_key }}-${{ github.sha }}
           restore-keys: |
-            test-durations-
+            ${{ steps.environment.outputs.duration_cache_key }}-
 
       - name: Verify immutable policy and select proof
         id: plan
         env:
-          EVENT_NAME: ${{ github.event_name == 'pull_request_target' && 'pull_request' || github.event_name }}
+          EVENT_NAME: ${{ contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) && 'pull_request' || github.event_name }}
           EVENT_REF: ${{ github.ref }}
           PR_BODY: ${{ github.event.pull_request.body || '' }}
           PR_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
           PR_NUMBER: ${{ github.event.pull_request.number || 'unknown' }}
           REPOSITORY: ${{ github.repository }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           RUNTIME_OS_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
           RUNTIME_OS_DURATIONS_PATH: ${{ github.workspace }}/test_durations.json
         run: |
@@ -103,9 +131,72 @@ jobs:
             --pr-number "$PR_NUMBER" \
             --repo "$REPOSITORY"
 
+  environment:
+    name: Build immutable ci-fast environment once
+    needs: preflight
+    if: needs.preflight.outputs.has_tests == 'true' || needs.preflight.outputs.run_e2e == 'true'
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+
+      - name: Install pinned uv once
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: false
+
+      - name: Install pinned ripgrep once
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 1 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          mkdir -p ci-fast/bin
+          install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" ci-fast/bin/rg
+
+      - name: Build locked environment with one infra-only retry
+        run: |
+          set -euo pipefail
+          attempt=1
+          while true; do
+            set +e
+            uv sync --locked --python 3.11 --extra all --extra dev 2>uv-sync.err
+            status=$?
+            set -e
+            if [ "$status" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq 1 ] &&
+               grep -Eiq '(timed out|connection reset|temporary failure|502|503|504)' uv-sync.err; then
+              attempt=2
+              continue
+            fi
+            cat uv-sync.err >&2
+            exit "$status"
+          done
+          mkdir -p ci-fast
+          test "$(sha256sum uv.lock | cut -d' ' -f1)" != ""
+          tar -czf ci-fast/hermes-ci-fast-environment.tar.gz .venv ci-fast/bin
+
+      - name: Publish immutable run-scoped environment
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hermes-ci-fast-${{ needs.preflight.outputs.environment_digest }}
+          path: ci-fast/hermes-ci-fast-environment.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
   test:
     name: Runtime OS slice ${{ matrix.index }}/6
-    needs: preflight
+    needs: [preflight, environment]
     if: needs.preflight.outputs.has_tests == 'true'
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 30
@@ -117,35 +208,18 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
 
-      - name: Install pinned ripgrep binary
-        run: |
-          set -euo pipefail
-          RG_VERSION=15.1.0
-          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
-          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
-          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
-            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
-          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
-          tar -xzf "$RG_TARBALL"
-          mkdir -p "$RUNNER_TEMP/runtime-os-bin"
-          install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" "$RUNNER_TEMP/runtime-os-bin/rg"
-          echo "$RUNNER_TEMP/runtime-os-bin" >> "$GITHUB_PATH"
-          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
-
-      - name: Install pinned uv
-        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+      - name: Download immutable ci-fast environment
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          enable-cache: ${{ needs.preflight.outputs.telemetry_write_allowed == 'true' }}
-          cache-dependency-glob: |
-            pyproject.toml
-            uv.lock
+          name: hermes-ci-fast-${{ needs.preflight.outputs.environment_digest }}
+          path: ci-fast
 
-      - name: Install prebuilt Python and locked environment
+      - name: Restore immutable environment
         run: |
-          uv python install 3.11
-          uv sync --locked --python 3.11 --extra all --extra dev
+          tar -xzf ci-fast/hermes-ci-fast-environment.tar.gz
+          echo "$GITHUB_WORKSPACE/ci-fast/bin" >> "$GITHUB_PATH"
 
       - name: Run selected files with interpreter isolation
         env:
@@ -158,9 +232,55 @@ jobs:
           python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
           scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"
 
+      - name: Upload protected-main duration sample
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: runtime-os-duration-${{ matrix.index }}-${{ github.run_id }}
+          path: test_durations.json
+          if-no-files-found: error
+          retention-days: 1
+
+  duration-telemetry:
+    name: Publish protected-main duration telemetry
+    needs: [preflight, test]
+    if: >-
+      always() &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      needs.test.result == 'success'
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Download exact-run duration samples
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: runtime-os-duration-*-${{ github.run_id }}
+          path: durations
+      - name: Merge duration samples deterministically
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          merged = {}
+          for path in sorted(glob.glob("durations/**/test_durations.json", recursive=True)):
+              with open(path, encoding="utf-8") as handle:
+                  merged.update(json.load(handle))
+          if not merged:
+              raise SystemExit("no protected-main duration samples were produced")
+          with open("test_durations.json", "w", encoding="utf-8") as handle:
+              json.dump(merged, handle, indent=2, sort_keys=True)
+              handle.write("\n")
+          PY
+      - name: Save manifest-and-dependency-bound telemetry
+        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: ${{ needs.preflight.outputs.duration_cache_key }}-${{ github.sha }}
+
   e2e:
     name: Runtime OS e2e
-    needs: preflight
+    needs: [preflight, environment]
     if: needs.preflight.outputs.run_e2e == 'true'
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 20
@@ -168,28 +288,16 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      - name: Install pinned ripgrep binary
-        run: |
-          set -euo pipefail
-          RG_VERSION=15.1.0
-          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
-          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
-          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
-            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
-          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
-          tar -xzf "$RG_TARBALL"
-          mkdir -p "$RUNNER_TEMP/runtime-os-bin"
-          install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" "$RUNNER_TEMP/runtime-os-bin/rg"
-          echo "$RUNNER_TEMP/runtime-os-bin" >> "$GITHUB_PATH"
-          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
-      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+      - name: Download immutable ci-fast environment
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          enable-cache: ${{ needs.preflight.outputs.telemetry_write_allowed == 'true' }}
-      - name: Install prebuilt Python and locked environment
+          name: hermes-ci-fast-${{ needs.preflight.outputs.environment_digest }}
+          path: ci-fast
+      - name: Restore immutable environment
         run: |
-          uv python install 3.11
-          uv sync --locked --python 3.11 --extra all --extra dev
+          tar -xzf ci-fast/hermes-ci-fast-environment.tar.gz
+          echo "$GITHUB_WORKSPACE/ci-fast/bin" >> "$GITHUB_PATH"
       - name: Run full e2e proof
         env:
           OPENROUTER_API_KEY: ""
@@ -204,17 +312,19 @@ jobs:
   hermes-required:
     name: Hermes CI required
     if: always()
-    needs: [preflight, test, e2e]
+    needs: [preflight, environment, test, e2e]
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 5
     steps:
       - name: Aggregate immutable policy proof
         env:
           PREFLIGHT: ${{ needs.preflight.result }}
+          ENVIRONMENT: ${{ needs.environment.result }}
           TESTS: ${{ needs.test.result }}
           E2E: ${{ needs.e2e.result }}
         run: |
           test "$PREFLIGHT" = success
+          test "$ENVIRONMENT" = success -o "$ENVIRONMENT" = skipped
           test "$TESTS" = success -o "$TESTS" = skipped
           test "$E2E" = success -o "$E2E" = skipped
 
@@ -229,33 +339,132 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
           path: trusted
+      - name: Collect authenticated exact-head GitHub reviews
+        if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_PR: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          RECEIPT_TTL_HOURS: "24"
+        with:
+          script: |
+            const fs = require('fs');
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(process.env.EXPECTED_PR),
+              per_page: 100,
+            });
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(process.env.EXPECTED_PR),
+              per_page: 100,
+            });
+            const builders = new Set([process.env.PR_AUTHOR]);
+            for (const commit of commits) {
+              if (commit.author && commit.author.login) builders.add(commit.author.login);
+              if (commit.committer && commit.committer.login) builders.add(commit.committer.login);
+            }
+            const latestByReviewer = new Map();
+            for (const review of reviews) {
+              const login = review.user && review.user.login;
+              if (
+                login &&
+                review.commit_id === process.env.EXPECTED_HEAD &&
+                (!latestByReviewer.has(login) ||
+                  latestByReviewer.get(login).id < review.id)
+              ) {
+                latestByReviewer.set(login, review);
+              }
+            }
+            const now = Date.now();
+            const ttlMs = Number(process.env.RECEIPT_TTL_HOURS) * 60 * 60 * 1000;
+            const accepted = [];
+            for (const review of latestByReviewer.values()) {
+              const login = review.user && review.user.login;
+              const submitted = Date.parse(review.submitted_at || '');
+              const evidence =
+                `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                `/pull/${process.env.EXPECTED_PR}#pullrequestreview-${review.id}`;
+              const body = String(review.body || '');
+              const identity = body.match(/^- reviewer_identity:\s*(.+)$/mi);
+              const evidenceField = body.match(/^- evidence_url_or_path:\s*(.+)$/mi);
+              const receiptHeadings = body.match(/^## Review Receipt\b/gmi) || [];
+              if (
+                review.commit_id !== process.env.EXPECTED_HEAD ||
+                !login ||
+                builders.has(login) ||
+                !['OWNER', 'MEMBER', 'COLLABORATOR'].includes(review.author_association) ||
+                !['APPROVED', 'COMMENTED'].includes(review.state) ||
+                !Number.isFinite(submitted) ||
+                now - submitted < 0 ||
+                now - submitted > ttlMs ||
+                !identity ||
+                identity[1].trim() !== login ||
+                !evidenceField ||
+                evidenceField[1].trim() !== evidence ||
+                receiptHeadings.length !== 1 ||
+                !/^- review_type:\s*adversarial$/mi.test(body) ||
+                !new RegExp(`^- pr_reviewed:\\s*${process.env.EXPECTED_PR}$`, 'mi').test(body) ||
+                !new RegExp(`^- head_sha_reviewed:\\s*${process.env.EXPECTED_HEAD}$`, 'mi').test(body) ||
+                !/^- verdict:\s*(PASS|PASS_WITH_CAVEATS)$/mi.test(body) ||
+                !/^- unresolved_blockers:\s*(none|n\/a)$/mi.test(body)
+              ) {
+                continue;
+              }
+              accepted.push(
+                `${body}\n` +
+                `- github_review_id: ${review.id}\n` +
+                `- github_review_commit_id: ${review.commit_id}\n` +
+                `- github_reviewer_login: ${login}\n` +
+                `- github_review_submitted_at: ${review.submitted_at}\n`,
+              );
+            }
+            fs.writeFileSync(
+              'authenticated-reviews.md',
+              accepted.join('\n'),
+              { encoding: 'utf8', mode: 0o600 },
+            );
+            core.info(`Collected ${accepted.length} exact-head authenticated review receipt(s)`);
+      - name: Validate every merge-group constituent review
+        if: github.event_name == 'merge_group'
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            core.setFailed(
+              'Merge-group review/admission is fail-closed until protected authority supplies complete constituent membership and per-member risk classification',
+            );
       - name: Validate head-bound canonical receipt
         env:
           RISK: ${{ needs.preflight.outputs.risk_class }}
           HERMES_RESULT: ${{ needs.hermes-required.result }}
-          PR_BODY: ${{ github.event.pull_request.body || '' }}
           REVIEW_CLASSIFICATION: ${{ needs.preflight.outputs.review_classification }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          EVENT_NAME: ${{ github.event_name }}
+          EVENT_NAME: ${{ contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) && 'pull_request' || github.event_name }}
         run: |
           set -euo pipefail
           test "$HERMES_RESULT" = success
-          if [ "$EVENT_NAME" != pull_request_target ]; then
+          if [ "$EVENT_NAME" != pull_request ]; then
             exit 0
           fi
           case "$RISK" in
             R0|R1|R2) exit 0 ;;
-            R3|R4|R5) ;;
+            R3) ;;
+            R4|R5)
+              echo "::error::protected specialist review transport is not authenticated"
+              exit 1
+              ;;
             *) exit 1 ;;
           esac
-          printf '%s' "$PR_BODY" > pr-body.md
           printf '%s' "$REVIEW_CLASSIFICATION" > review-classification.json
           python3 trusted/scripts/review_receipt_validator.py \
             --classification review-classification.json \
-            --pr-body pr-body.md \
+            --pr-body authenticated-reviews.md \
             --head-sha "$HEAD_SHA" \
             --base-sha "$BASE_SHA" \
             --primary-provider codex \
@@ -269,6 +478,92 @@ jobs:
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 5
     steps:
+      - name: Verify live exact-head admission state
+        if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_PR: ${{ github.event.pull_request.number }}
+        with:
+          script: |
+            const { data: pull } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(process.env.EXPECTED_PR),
+            });
+            const { data: base } = await github.rest.repos.getBranch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: pull.base.ref,
+            });
+            const labels = new Set(
+              (pull.labels || []).map((label) => String(label.name).toLowerCase()),
+            );
+            const optOut = [
+              'hold',
+              'do-not-merge',
+              'manual-merge',
+              'manual-merge-required',
+              'no-auto-merge',
+              'incident-quarantine',
+              'blocked',
+            ];
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: Number(process.env.EXPECTED_PR),
+              per_page: 100,
+            });
+            const latest = new Map();
+            for (const review of reviews) {
+              const login = review.user && review.user.login;
+              if (
+                login &&
+                review.commit_id === process.env.EXPECTED_HEAD &&
+                (!latest.has(login) || latest.get(login).id < review.id)
+              ) {
+                latest.set(login, review);
+              }
+            }
+            const changesRequested =
+              [...latest.values()].some((review) => review.state === 'CHANGES_REQUESTED');
+            const threadData = await github.graphql(
+              `query($owner:String!,$repo:String!,$number:Int!){
+                repository(owner:$owner,name:$repo){
+                  pullRequest(number:$number){
+                    reviewDecision
+                    reviewThreads(first:100){
+                      pageInfo{hasNextPage}
+                      nodes{isResolved}
+                    }
+                  }
+                }
+              }`,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                number: Number(process.env.EXPECTED_PR),
+              },
+            );
+            const reviewState = threadData.repository.pullRequest;
+            const threads = reviewState.reviewThreads;
+            if (
+              pull.head.sha !== process.env.EXPECTED_HEAD ||
+              pull.base.sha !== process.env.EXPECTED_BASE ||
+              base.commit.sha !== process.env.EXPECTED_BASE ||
+              pull.draft ||
+              pull.mergeable !== true ||
+              optOut.some((label) => labels.has(label)) ||
+              changesRequested ||
+              reviewState.reviewDecision === 'CHANGES_REQUESTED' ||
+              threads.pageInfo.hasNextPage ||
+              threads.nodes.some((thread) => !thread.isResolved)
+            ) {
+              core.setFailed(
+                'Live admission state is stale, conflicted, draft, held, or not bound to current base',
+              );
+            }
       - name: Evaluate advisory admission without mutation
         env:
           HERMES_RESULT: ${{ needs.hermes-required.result }}
@@ -280,5 +575,8 @@ jobs:
           test "$HERMES_RESULT" = success
           test "$REVIEW_RESULT" = success
           test "$IS_DRAFT" != true
-          ! printf '%s' "$LABELS" | grep -Eq '"(do-not-merge|blocked|hold)"'
+          if printf '%s' "$LABELS" | grep -Eiq '"(hold|do-not-merge|manual-merge|manual-merge-required|no-auto-merge|incident-quarantine|blocked)"'; then
+            echo "Merge admission denied by an exact-head opt-out label." >&2
+            exit 1
+          fi
           echo "Advisory only: this workflow does not merge, label, review, or alter branch protection."
