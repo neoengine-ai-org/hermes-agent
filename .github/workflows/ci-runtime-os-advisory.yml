@@ -1,0 +1,241 @@
+name: CI Runtime OS advisory
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-os-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUNTIME_OS_POLICY_VERSION: "2.1.0"
+  RUNTIME_OS_SOURCE_COMMIT: 871e416afc55db187d2b6f29c9ff7cac96472223
+
+jobs:
+  preflight:
+    name: Dependency-free policy preflight
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      risk_class: ${{ steps.plan.outputs.risk_class }}
+      review_route: ${{ steps.plan.outputs.review_route }}
+      run_e2e: ${{ steps.plan.outputs.run_e2e }}
+      has_tests: ${{ steps.plan.outputs.has_tests }}
+      telemetry_write_allowed: ${{ steps.plan.outputs.telemetry_write_allowed }}
+    steps:
+      - name: Reject untrusted fork execution
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: exit 1
+
+      - name: Checkout candidate without cross-repo credentials
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Read protected-main duration telemetry
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: test_durations.json
+          key: runtime-os-duration-readonly
+          restore-keys: |
+            test-durations-
+
+      - name: Verify immutable policy and select proof
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+          PR_ADDITIONS: ${{ github.event.pull_request.additions || 0 }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          test "$RUNTIME_OS_POLICY_VERSION" = "2.1.0"
+          test "$RUNTIME_OS_SOURCE_COMMIT" = "871e416afc55db187d2b6f29c9ff7cac96472223"
+          if [ -n "${BASE_SHA:-}" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE_SHA" HEAD > changed-files.txt
+          else
+            git ls-files > changed-files.txt
+          fi
+          python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
+          printf '%s' "$PR_BODY" > pr-body.md
+          python3 scripts/ci/runtime_os_adapter.py \
+            --changed-files-json "$(cat changed-files.json)" \
+            --event-name "$EVENT_NAME" \
+            --ref "$EVENT_REF" \
+            --body-file pr-body.md \
+            --additions "$PR_ADDITIONS"
+
+  test:
+    name: Runtime OS slice ${{ matrix.index }}/6
+    needs: preflight
+    if: needs.preflight.outputs.has_tests == 'true'
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.matrix) }}
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install pinned ripgrep binary
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: ${{ needs.preflight.outputs.telemetry_write_allowed == 'true' }}
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install prebuilt Python and locked environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+
+      - name: Run selected files with interpreter isolation
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          scripts/run_tests.sh --files '${{ matrix.files }}'
+
+      - name: Publish protected-main duration telemetry
+        if: needs.preflight.outputs.telemetry_write_allowed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: runtime-os-duration-slice-${{ matrix.index }}
+          path: test_durations.json
+          retention-days: 1
+
+  e2e:
+    name: Runtime OS e2e
+    needs: preflight
+    if: needs.preflight.outputs.run_e2e == 'true'
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install pinned ripgrep binary
+        run: |
+          set -euo pipefail
+          RG_VERSION=15.1.0
+          RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+          RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+          curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+            "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+          echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+          tar -xzf "$RG_TARBALL"
+          sudo install -m 0755 "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+          rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: ${{ needs.preflight.outputs.telemetry_write_allowed == 'true' }}
+      - name: Install prebuilt Python and locked environment
+        run: |
+          uv python install 3.11
+          uv sync --locked --python 3.11 --extra all --extra dev
+      - name: Run full e2e proof
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: |
+          source .venv/bin/activate
+          python -m pytest -m integration tests/test_wheel_locales_e2e.py -v
+          python -m pytest tests/e2e/ -v --tb=short
+
+  hermes-required:
+    name: Hermes CI required
+    if: always()
+    needs: [preflight, test, e2e]
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate immutable policy proof
+        env:
+          PREFLIGHT: ${{ needs.preflight.result }}
+          TESTS: ${{ needs.test.result }}
+          E2E: ${{ needs.e2e.result }}
+        run: |
+          test "$PREFLIGHT" = success
+          test "$TESTS" = success -o "$TESTS" = skipped
+          test "$E2E" = success -o "$E2E" = skipped
+
+  review-evidence:
+    name: Review evidence required
+    if: always()
+    needs: [preflight, hermes-required]
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Apply canonical risk review route
+        env:
+          RISK: ${{ needs.preflight.outputs.risk_class }}
+          HERMES_RESULT: ${{ needs.hermes-required.result }}
+          PR_BODY: ${{ github.event.pull_request.body || '' }}
+        run: |
+          set -euo pipefail
+          test "$HERMES_RESULT" = success
+          case "$RISK" in
+            R0|R1|R2) exit 0 ;;
+            R3)
+              printf '%s' "$PR_BODY" | grep -Eq 'CI-Adversarial-Review:[[:space:]]*(PASS|DEGRADED)'
+              ;;
+            R4|R5)
+              echo "Protected specialist review is required; advisory adapter cannot authorize it."
+              exit 1
+              ;;
+            *) exit 1 ;;
+          esac
+
+  merge-admission:
+    name: Merge admission
+    if: always()
+    needs: [hermes-required, review-evidence]
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 5
+    steps:
+      - name: Evaluate advisory admission without mutation
+        env:
+          HERMES_RESULT: ${{ needs.hermes-required.result }}
+          REVIEW_RESULT: ${{ needs.review-evidence.result }}
+          IS_DRAFT: ${{ github.event.pull_request.draft || false }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          test "$HERMES_RESULT" = success
+          test "$REVIEW_RESULT" = success
+          test "$IS_DRAFT" != true
+          ! printf '%s' "$LABELS" | grep -Eq '"(do-not-merge|blocked|hold)"'
+          echo "Advisory only: this workflow does not merge, label, review, or alter branch protection."
