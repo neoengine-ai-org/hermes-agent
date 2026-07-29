@@ -1,0 +1,70 @@
+{
+  "policy_id": "neoengine-ci-runtime-os",
+  "policy_version": "2.1.0",
+  "source_commit": "871e416afc55db187d2b6f29c9ff7cac96472223",
+  "canonical_decision_contract": {
+    "proof_selection_digest": "sha256:fb41392b598faa4ab442f305e4a6dff61811d53cd5046a388219d09de4d41e2b",
+    "proof_selection_test_digest": "sha256:3a2b7bd064f161821773aac1ef2eedcdf2afde7215f3ce51df585fe7427211d9",
+    "review_routing_digest": "sha256:5a9220bb1c5b741f0607ec33213c0632db25533608d1ee1bf8b19eefb7ce92a5",
+    "review_routing_test_digest": "sha256:18a1ac74525f8a622dbd3144cb7bac8262c4d6c6f271ed5c84b89b54309a9c8a",
+    "types_digest": "sha256:cb76164215f07a4e64e0cc442adf5b6c44deec93d6b3c796ec33164f113dc71b"
+  },
+  "mode": "advisory",
+  "runner_labels": [
+    "self-hosted",
+    "Linux",
+    "x64",
+    "neoengine-shared-linux",
+    "qwen-ops"
+  ],
+  "stable_contexts": [
+    "Hermes CI required",
+    "Review evidence required",
+    "Merge admission"
+  ],
+  "slice_count": 6,
+  "full_proof_triggers": [
+    ".github/workflows/",
+    ".github/actions/",
+    "flake.lock",
+    "flake.nix",
+    "nix/",
+    "packaging/",
+    "pyproject.toml",
+    "uv.lock",
+    "scripts/ci_risk_classifier.py",
+    "scripts/ci_risk_classifier_core.py",
+    "scripts/run_tests.sh",
+    "scripts/run_tests_parallel.py",
+    "ci/runtime-os/",
+    "scripts/ci/runtime_os_adapter.py"
+  ],
+  "review_model": {
+    "R0-R2": "no_ci_model",
+    "R3": "one_adversarial_after_green_with_explicit_degraded_fallback",
+    "R4-R5": "protected_specialists"
+  },
+  "trusted_classifier": "scripts/ci_risk_classifier.py",
+  "candidate_may_rewrite_policy": false,
+  "private_cross_repo_checkout": false,
+  "telemetry_source": "protected_main_only",
+  "repository_profile": {
+    "capability_classes": [
+      "deterministic_unit",
+      "integration_e2e",
+      "review_evidence",
+      "merge_admission"
+    ],
+    "full_proof_events": [
+      "merge_group",
+      "push",
+      "schedule",
+      "workflow_dispatch"
+    ],
+    "id": "hermes-agent",
+    "narrow_selection": "transitive_python_import_closure",
+    "parity_fixtures": "ci/runtime-os/hermes-parity-fixtures.v1.json",
+    "unknown_impact": "full_proof",
+    "version": 1
+  }
+}

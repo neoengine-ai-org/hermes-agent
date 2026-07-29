@@ -1,0 +1,7 @@
+{
+  "algorithm": "sha256",
+  "bundle": "ci/runtime-os/policy-bundle-2.1.0.json",
+  "digest": "1bdb16a0322fb654b519b49e4608d6d9f369fa1572ac1901a596605262525b19",
+  "policy_version": "2.1.0",
+  "source_commit": "871e416afc55db187d2b6f29c9ff7cac96472223"
+}
