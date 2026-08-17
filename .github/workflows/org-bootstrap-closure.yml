@@ -1,0 +1,144 @@
+name: org-bootstrap-closure
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/org-bootstrap-closure.yml'
+      - '.github/workflows/tests.yml'
+      - 'AGENTS.md'
+      - 'README.md'
+      - 'acp_adapter/entry.py'
+      - 'config/hermes-bootstrap-closure-v1.json'
+      - 'hermes_bootstrap.py'
+      - 'hermes_constants.py'
+      - 'hermes_cli/main.py'
+      - 'pyproject.toml'
+      - 'run_agent.py'
+      - 'scripts/hermes_progress.py'
+      - 'scripts/run_tests.sh'
+      - 'scripts/run_tests_parallel.py'
+      - 'scripts/validate_hermes_bootstrap_closure.py'
+      - 'tests/bootstrap/test_bootstrap_closure.py'
+      - 'uv.lock'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/org-bootstrap-closure.yml'
+      - '.github/workflows/tests.yml'
+      - 'AGENTS.md'
+      - 'README.md'
+      - 'acp_adapter/entry.py'
+      - 'config/hermes-bootstrap-closure-v1.json'
+      - 'hermes_bootstrap.py'
+      - 'hermes_constants.py'
+      - 'hermes_cli/main.py'
+      - 'pyproject.toml'
+      - 'run_agent.py'
+      - 'scripts/hermes_progress.py'
+      - 'scripts/run_tests.sh'
+      - 'scripts/run_tests_parallel.py'
+      - 'scripts/validate_hermes_bootstrap_closure.py'
+      - 'tests/bootstrap/test_bootstrap_closure.py'
+      - 'uv.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-agent-org-bootstrap-closure-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checkout-local-bootstrap-closure:
+    name: checkout-local bootstrap closure
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 30
+    env:
+      GIT_CONFIG_GLOBAL: /tmp/qwen-empty-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+      GIT_CONFIG_NOSYSTEM: '1'
+      HOME: /tmp/qwen-empty-home-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+      UV_NO_PROGRESS: '1'
+    steps:
+      - name: Prepare isolated runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${GIT_CONFIG_GLOBAL}" in
+            /tmp/qwen-empty-gitconfig-*) ;;
+            *) echo "::error::invalid isolated git config path"; exit 1 ;;
+          esac
+          case "${HOME}" in
+            /tmp/qwen-empty-home-*) ;;
+            *) echo "::error::invalid isolated HOME path"; exit 1 ;;
+          esac
+          install -m 0600 /dev/null "${GIT_CONFIG_GLOBAL}"
+          install -d -m 0700 "${HOME}"
+          install -m 0600 /dev/null "${HOME}/.gitconfig"
+
+      - name: Verify governed runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ runner.os }}" = "Linux"
+          case "${{ runner.name }}" in
+            qwen-ops-01|qwen-ops-01-r*) ;;
+            *) echo "::error::refusing non-Qwen runner ${{ runner.name }}"; exit 1 ;;
+          esac
+
+      - name: Check out exact candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Create clean checkout-local proof environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv venv .bootstrap-proof-venv --python 3.11
+          UV_PROJECT_ENVIRONMENT=.bootstrap-proof-venv \
+            uv sync --locked --python .bootstrap-proof-venv/bin/python
+
+      - name: Prove checkout-local bootstrap closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/bootstrap
+          .bootstrap-proof-venv/bin/python scripts/validate_hermes_bootstrap_closure.py \
+            --root . \
+            --receipt-venv .bootstrap-proof-venv \
+            --receipt-out artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json \
+            --format json
+
+      - name: Install hostile-test dependencies after clean proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          UV_PROJECT_ENVIRONMENT=.bootstrap-proof-venv \
+            uv sync --locked --python .bootstrap-proof-venv/bin/python --extra dev
+
+      - name: Run bootstrap hostile tests in receipt mode
+        shell: bash
+        env:
+          HERMES_RECEIPT_VENV: ${{ github.workspace }}/.bootstrap-proof-venv
+        run: |
+          set -euo pipefail
+          scripts/run_tests.sh --receipt-mode tests/bootstrap/test_bootstrap_closure.py
+
+      - name: Compile validator
+        shell: bash
+        run: .bootstrap-proof-venv/bin/python -m py_compile scripts/validate_hermes_bootstrap_closure.py
+
+      - name: Upload checkout-local bootstrap receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-bootstrap-closure
+          path: artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json
+          if-no-files-found: error
+          retention-days: 14
