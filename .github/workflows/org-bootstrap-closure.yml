@@ -1,0 +1,93 @@
+name: org-bootstrap-closure
+
+on:
+  pull_request:
+    paths:
+      - 'config/org-bootstrap-closure-v1.json'
+      - 'scripts/validate-org-bootstrap-closure.py'
+      - 'docs/operations/org-bootstrap-closure.md'
+      - '.github/workflows/org-bootstrap-closure.yml'
+      - 'AGENTS.md'
+      - 'pyproject.toml'
+      - 'scripts/run_tests.sh'
+      - 'run_agent.py'
+      - 'model_tools.py'
+      - 'toolsets.py'
+      - 'cli.py'
+      - 'skills/**'
+  push:
+    branches: [main]
+    paths:
+      - 'config/org-bootstrap-closure-v1.json'
+      - 'scripts/validate-org-bootstrap-closure.py'
+      - 'docs/operations/org-bootstrap-closure.md'
+      - '.github/workflows/org-bootstrap-closure.yml'
+      - 'AGENTS.md'
+      - 'pyproject.toml'
+      - 'scripts/run_tests.sh'
+      - 'run_agent.py'
+      - 'model_tools.py'
+      - 'toolsets.py'
+      - 'cli.py'
+      - 'skills/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-agent-org-bootstrap-closure-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checkout-local-bootstrap-closure:
+    name: checkout-local bootstrap closure
+    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    timeout-minutes: 20
+    env:
+      GIT_CONFIG_GLOBAL: /tmp/qwen-empty-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+      GIT_CONFIG_NOSYSTEM: "1"
+      HOME: /tmp/qwen-empty-home-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+    steps:
+      - name: Prepare isolated runner environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${GIT_CONFIG_GLOBAL}" in
+            /tmp/qwen-empty-gitconfig-*) ;;
+            *) echo "::error::invalid isolated git config path"; exit 1 ;;
+          esac
+          case "${HOME}" in
+            /tmp/qwen-empty-home-*) ;;
+            *) echo "::error::invalid isolated HOME path"; exit 1 ;;
+          esac
+          install -m 0600 /dev/null "${GIT_CONFIG_GLOBAL}"
+          install -d -m 0700 "${HOME}"
+          install -m 0600 /dev/null "${HOME}/.gitconfig"
+      - name: Verify governed runner identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ runner.os }}" = "Linux"
+          case "${{ runner.name }}" in
+            qwen-ops-01|qwen-ops-01-r*) ;;
+            *) echo "::error::refusing non-Qwen runner ${{ runner.name }}"; exit 1 ;;
+          esac
+      - name: Check out exact candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Run validator negative controls
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validate-org-bootstrap-closure.py --self-test --json
+      - name: Prove checkout-local bootstrap closure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validate-org-bootstrap-closure.py --root . --json
+      - name: Compile validator
+        shell: bash
+        run: python3 -m py_compile scripts/validate-org-bootstrap-closure.py
