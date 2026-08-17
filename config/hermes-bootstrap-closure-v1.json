@@ -1,0 +1,139 @@
+{
+  "schema_version": "hermes.bootstrap-closure-manifest/1.0",
+  "repository": {
+    "full_name": "neoengine-ai-org/hermes-agent",
+    "default_branch": "main"
+  },
+  "result_state": "HERMES_BOOTSTRAP_CLOSURE_READY",
+  "project": {
+    "name": "hermes-agent",
+    "python_requires": ">=3.11",
+    "lock_validation": "uv lock --check"
+  },
+  "console_entrypoints": {
+    "hermes": "hermes_cli.main:main",
+    "hermes-acp": "acp_adapter.entry:main",
+    "hermes-agent": "run_agent:main",
+    "hermes-progress": "scripts.hermes_progress:main"
+  },
+  "required_artifacts": [
+    {
+      "dependency_id": "ci-admission",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": ".github/workflows/tests.yml"
+    },
+    {
+      "dependency_id": "agent-instructions",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "AGENTS.md"
+    },
+    {
+      "dependency_id": "readme",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "README.md"
+    },
+    {
+      "dependency_id": "acp-entrypoint",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "acp_adapter/entry.py"
+    },
+    {
+      "dependency_id": "bootstrap-manifest",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "config/hermes-bootstrap-closure-v1.json"
+    },
+    {
+      "dependency_id": "windows-bootstrap",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "hermes_bootstrap.py"
+    },
+    {
+      "dependency_id": "path-constants",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "hermes_constants.py"
+    },
+    {
+      "dependency_id": "cli-entrypoint",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "hermes_cli/main.py"
+    },
+    {
+      "dependency_id": "package-metadata",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "pyproject.toml"
+    },
+    {
+      "dependency_id": "agent-entrypoint",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "run_agent.py"
+    },
+    {
+      "dependency_id": "progress-entrypoint",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "scripts/hermes_progress.py"
+    },
+    {
+      "dependency_id": "test-runner",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "scripts/run_tests.sh"
+    },
+    {
+      "dependency_id": "parallel-test-runner",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "scripts/run_tests_parallel.py"
+    },
+    {
+      "dependency_id": "bootstrap-validator",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "scripts/validate_hermes_bootstrap_closure.py"
+    },
+    {
+      "dependency_id": "hostile-tests",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "tests/bootstrap/test_bootstrap_closure.py"
+    },
+    {
+      "dependency_id": "lockfile",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "uv.lock"
+    }
+  ],
+  "receipt_provenance": {
+    "accepted_repo_local_venvs": [
+      ".venv",
+      ".bootstrap-proof-venv"
+    ],
+    "explicit_repo_local_venv_allowed": true,
+    "shared_home_venv_allowed": false,
+    "home_pytest_plugin_allowed": false
+  },
+  "optional_surfaces": [
+    {
+      "dependency_id": "provider-and-plugin-extras",
+      "dependency_class": "CHILD_OR_PROVIDER_OPTIONAL",
+      "local_required": false,
+      "status": "DEFERRED"
+    },
+    {
+      "dependency_id": "home-config-credentials-and-cache",
+      "dependency_class": "ASSEMBLED_WORKSPACE_ONLY",
+      "local_required": false,
+      "status": "NOT_BOOTSTRAP_PROOF"
+    }
+  ],
+  "receipt": {
+    "schema_version": "hermes.bootstrap-closure-receipt/1.0",
+    "deterministic": true,
+    "pass_only": true
+  },
+  "non_claims": [
+    "api_credential_or_provider_activation",
+    "branch_protection_or_review_bypass",
+    "external_service_call",
+    "gateway_or_platform_deployment",
+    "global_installation",
+    "package_publication_or_release",
+    "production_readiness",
+    "user_home_mutation"
+  ]
+}

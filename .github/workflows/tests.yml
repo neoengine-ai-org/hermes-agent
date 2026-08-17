@@ -15,7 +15,54 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  bootstrap-closure:
+    name: Checkout-local bootstrap closure
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
+
+      - name: Create clean checkout-local proof environment
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv venv .bootstrap-proof-venv --python 3.11
+          UV_PROJECT_ENVIRONMENT=.bootstrap-proof-venv \
+            uv sync --locked --python .bootstrap-proof-venv/bin/python
+
+      - name: Validate checkout-local runtime bootstrap
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/bootstrap
+          .bootstrap-proof-venv/bin/python scripts/validate_hermes_bootstrap_closure.py \
+            --root . \
+            --receipt-venv .bootstrap-proof-venv \
+            --receipt-out artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json
+
+      - name: Install hostile-test dependencies after clean proof
+        run: |
+          UV_PROJECT_ENVIRONMENT=.bootstrap-proof-venv \
+            uv sync --locked --python .bootstrap-proof-venv/bin/python --extra dev
+
+      - name: Run bootstrap hostile tests in receipt mode
+        env:
+          HERMES_RECEIPT_VENV: ${{ github.workspace }}/.bootstrap-proof-venv
+        run: scripts/run_tests.sh --receipt-mode tests/bootstrap/test_bootstrap_closure.py
+
+      - name: Upload checkout-local bootstrap receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: hermes-bootstrap-closure
+          path: artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json
+          if-no-files-found: error
+          retention-days: 7
+
   test:
+    needs: bootstrap-closure
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

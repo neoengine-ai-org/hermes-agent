@@ -106,7 +106,7 @@ jobs:
           CLASSIFIER_COMMIT: ${{ github.event.pull_request.base.sha }}
         run: |
           cd pr-head
-          if python ../trusted-classifier/scripts/ci_risk_classifier.py --help | grep -q -- '--base-classification'; then
+          if python ../trusted-classifier/scripts/ci_risk_classifier.py --help 2>&1 | grep -F -- '--base-classification' >/dev/null; then
             FINALIZER=../trusted-classifier/scripts/ci_risk_classifier.py
           else
             # Bootstrap compatibility for the PR that introduces trusted finalization:
@@ -257,7 +257,7 @@ jobs:
             VALIDATOR=pr-head/scripts/review_receipt_validator.py
             echo pr-head-bootstrap-telemetry > review-receipt-validator-source.txt
           fi
-          if python "$VALIDATOR" --help | grep -q -- '--enforce'; then
+          if python "$VALIDATOR" --help 2>&1 | grep -F -- '--enforce' >/dev/null; then
             ENFORCE_ARGS=(--enforce)
           else
             # Bootstrap compatibility for cc-review-tier4-merge-gate-v1. Before
@@ -280,7 +280,7 @@ jobs:
           # freshness — fail-closed by construction.
           FRESHNESS_ARGS=()
           if [ -f trusted-classifier/scripts/receipt_diff_fingerprint.py ] \
-            && python "$VALIDATOR" --help | grep -q -- '--current-diff-fingerprint'; then
+            && python "$VALIDATOR" --help 2>&1 | grep -F -- '--current-diff-fingerprint' >/dev/null; then
             if current_fp="$(python trusted-classifier/scripts/receipt_diff_fingerprint.py \
                 --repo pr-head \
                 --base-sha "${{ github.event.pull_request.base.sha }}" \
