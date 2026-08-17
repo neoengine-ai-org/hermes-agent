@@ -126,21 +126,23 @@ def self_test()->dict[str,Any]:
         root=Path(td); subprocess.run(["git","init","-q",str(root)],check=True)
         git(root,"config","user.email","test@example.invalid"); git(root,"config","user.name","Test")
         (root/"config").mkdir(); (root/"scripts").mkdir(); (root/"skills/x").mkdir(parents=True)
-        script=root/"scripts/validate-org-bootstrap-closure.py"; script.write_text(Path(__file__).read_text())
-        (root/"AGENTS.md").write_text("# x\n"); (root/"skills/x/SKILL.md").write_text("---\nname: x\nversion: 1.0.0\n---\n")
+        script=root/"scripts/validate-org-bootstrap-closure.py"
+        script.write_text(Path(__file__).read_text(encoding="utf-8"),encoding="utf-8")
+        (root/"AGENTS.md").write_text("# x\n",encoding="utf-8")
+        (root/"skills/x/SKILL.md").write_text("---\nname: x\nversion: 1.0.0\n---\n",encoding="utf-8")
         manifest={"schema_version":SCHEMA,"repository":{"full_name":"x/y"},"terminal_state_prefix":"TEST",
           "dependency_classes":sorted(ALL),"authority_files":[],"required_files":[{"path":"AGENTS.md","class":"ORG_NATIVE_BOOTSTRAP"}],
           "required_skills":[{"id":"x","class":"ORG_NATIVE_BOOTSTRAP","canonical_path":"skills/x/SKILL.md","minimum_version":"1.0.0","mirrors":[]}],
           "binding_files":[],"declared_optional_external_references":[]}
-        mp=root/"config/org-bootstrap-closure-v1.json"; mp.write_text(json.dumps(manifest))
+        mp=root/"config/org-bootstrap-closure-v1.json"; mp.write_text(json.dumps(manifest),encoding="utf-8")
         subprocess.run(["git","-C",str(root),"add","-A"],check=True); subprocess.run(["git","-C",str(root),"commit","-qm","valid"],check=True)
         def run(): return subprocess.run([sys.executable,str(script),"--root",str(root),"--json"],capture_output=True,text=True)
         if run().returncode: raise Blocked("valid self-test fixture failed")
         (root/"AGENTS.md").unlink()
         if run().returncode==0: raise Blocked("missing-file self-test passed")
         subprocess.run(["git","-C",str(root),"checkout","--","AGENTS.md"],check=True)
-        (root/"bindings.json").write_text(json.dumps({"bindings":[{"canonical_path":"../x","runtime_executable":True}]}))
-        manifest["binding_files"]=[{"path":"bindings.json"}]; mp.write_text(json.dumps(manifest))
+        (root/"bindings.json").write_text(json.dumps({"bindings":[{"canonical_path":"../x","runtime_executable":True}]}),encoding="utf-8")
+        manifest["binding_files"]=[{"path":"bindings.json"}]; mp.write_text(json.dumps(manifest),encoding="utf-8")
         subprocess.run(["git","-C",str(root),"add","-A"],check=True); subprocess.run(["git","-C",str(root),"commit","-qm","negative"],check=True)
         if run().returncode==0: raise Blocked("external-runtime self-test passed")
     return {"state":"ORG_BOOTSTRAP_CLOSURE_SELF_TEST_PASS","cases":["valid","missing_file","external_runtime"]}
