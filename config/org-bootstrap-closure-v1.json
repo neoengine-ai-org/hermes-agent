@@ -1,0 +1,56 @@
+{
+  "schema_version": "org-bootstrap-closure/1.0.0",
+  "repository": {
+    "full_name": "neoengine-ai-org/hermes-agent",
+    "default_branch": "main",
+    "architecture_owner": "PRODUCT_REPOSITORY"
+  },
+  "terminal_state_prefix": "HERMES_AGENT",
+  "dependency_classes": [
+    "ASSEMBLED_WORKSPACE_ONLY",
+    "CHILD_OR_PROVIDER_OPTIONAL",
+    "ORG_NATIVE_BOOTSTRAP",
+    "SHARED_PLATFORM_CONTRACT"
+  ],
+  "authority_files": [
+    ".github/workflows/org-bootstrap-closure.yml",
+    "docs/operations/org-bootstrap-closure.md"
+  ],
+  "required_files": [
+    {"path": "AGENTS.md", "class": "ORG_NATIVE_BOOTSTRAP"},
+    {"path": "pyproject.toml", "class": "ORG_NATIVE_BOOTSTRAP"},
+    {"path": "scripts/run_tests.sh", "class": "ORG_NATIVE_BOOTSTRAP"},
+    {"path": "run_agent.py", "class": "ORG_NATIVE_BOOTSTRAP"},
+    {"path": "model_tools.py", "class": "ORG_NATIVE_BOOTSTRAP"},
+    {"path": "toolsets.py", "class": "ORG_NATIVE_BOOTSTRAP"},
+    {"path": "cli.py", "class": "ORG_NATIVE_BOOTSTRAP"}
+  ],
+  "required_skills": [],
+  "binding_files": [],
+  "declared_optional_external_references": [
+    {
+      "id": "shared-main-checkout-venv",
+      "class": "ASSEMBLED_WORKSPACE_ONLY",
+      "reference": "$HOME/.hermes/hermes-agent/venv",
+      "required_at_bootstrap": false,
+      "reason": "The test runner may reuse this environment, but repository bootstrap and source discovery cannot depend on it."
+    },
+    {
+      "id": "user-installed-skills",
+      "class": "ASSEMBLED_WORKSPACE_ONLY",
+      "reference": "$HOME/.hermes/skills",
+      "required_at_bootstrap": false,
+      "reason": "User-installed skills are runtime extensions and never prove repository checkout closure."
+    }
+  ],
+  "admission_points": [
+    "clean_checkout_ci",
+    "before_repo_local_agent_development",
+    "before_bundled_skill_or_tool_discovery"
+  ],
+  "non_claims": [
+    "no model-provider or credential activation",
+    "no gateway, plugin, release, deployment, or production authority",
+    "no user-home installation is treated as checkout proof"
+  ]
+}
