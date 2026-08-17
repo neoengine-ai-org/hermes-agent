@@ -1,0 +1,151 @@
+name: one-shot-hermes-bootstrap-receipt-subject
+
+on:
+  push:
+    branches:
+      - automation/hermes-bootstrap-receipt-subject-constructor-v1
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: one-shot-hermes-bootstrap-receipt-subject
+  cancel-in-progress: false
+
+jobs:
+  construct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out protected main
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Create bounded receipt subject branch
+        shell: bash
+        env:
+          SUBJECT_BRANCH: evidence/hermes-bootstrap-receipt-subject-v1
+        run: |
+          set -euo pipefail
+          git switch -c "${SUBJECT_BRANCH}"
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('README.md')
+          text = path.read_text(encoding='utf-8')
+          marker = '<!-- hermes-bootstrap-closure-receipt-subject-v1 -->'
+          if marker in text:
+              raise SystemExit('receipt subject marker already exists')
+          addition = '''
+
+<!-- hermes-bootstrap-closure-receipt-subject-v1 -->
+## Checkout-local bootstrap closure evidence
+
+This repository produces a product-owned, credential-free checkout-local bootstrap proof through `.github/workflows/org-bootstrap-closure.yml`. Canonical cross-org readiness is published separately from the reviewed subject commit and does not grant provider, deployment, production, customer-data, finance, or trading authority.
+'''
+          path.write_text(text.rstrip() + addition + '\n', encoding='utf-8')
+          PY
+          git diff --check
+          test "$(git diff --name-only)" = "README.md"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m 'docs(evidence): establish Hermes bootstrap receipt subject'
+          git push origin "HEAD:refs/heads/${SUBJECT_BRANCH}"
+
+      - name: Open bot-authored subject PR
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SUBJECT_BRANCH: evidence/hermes-bootstrap-receipt-subject-v1
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          branch = os.environ['SUBJECT_BRANCH']
+          owner = repo.split('/', 1)[0]
+          headers = {
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'Content-Type': 'application/json',
+              'User-Agent': 'hermes-bootstrap-receipt-subject-constructor',
+          }
+          query = urllib.parse.urlencode({'state': 'open', 'head': f'{owner}:{branch}', 'base': 'main'})
+          list_request = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/pulls?{query}',
+              headers=headers,
+              method='GET',
+          )
+          with urllib.request.urlopen(list_request, timeout=30) as response:
+              existing = json.load(response)
+          if existing:
+              print(f"subject PR already exists: #{existing[0]['number']}")
+              raise SystemExit(0)
+          payload = {
+              'title': 'docs(evidence): establish Hermes bootstrap receipt subject',
+              'head': branch,
+              'base': 'main',
+              'draft': False,
+              'maintainer_can_modify': True,
+              'body': '''## Purpose
+
+Create one bounded, independently reviewable subject commit for the Hermes checkout-local bootstrap receipt.
+
+The only source change is a durable README evidence note. The product-owned workflow `org-bootstrap-closure` must run on this exact PR head; a nonauthor native GitHub approval must bind to the same head; canonical receipt publication remains a later strict-descendant PR.
+
+## Non-claims
+
+No provider, credential, release, deployment, production, customer-data, finance, science, brokerage, capital, order, position, trading, branch-protection, or all-org readiness authority is granted.
+''',
+          }
+          request = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/pulls',
+              data=json.dumps(payload).encode('utf-8'),
+              headers=headers,
+              method='POST',
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              created = json.load(response)
+          print(f"created subject PR #{created['number']} author={created['user']['login']} head={created['head']['sha']}")
+          PY
+
+      - name: Delete constructor branch
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import urllib.request
+
+          repo = os.environ['GITHUB_REPOSITORY']
+          token = os.environ['GH_TOKEN']
+          branch = 'automation/hermes-bootstrap-receipt-subject-constructor-v1'
+          request = urllib.request.Request(
+              f'https://api.github.com/repos/{repo}/git/refs/heads/{branch}',
+              headers={
+                  'Authorization': f'Bearer {token}',
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'User-Agent': 'hermes-bootstrap-receipt-subject-constructor',
+              },
+              method='DELETE',
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              if response.status != 204:
+                  raise SystemExit(f'unexpected delete status {response.status}')
+          print('constructor branch deleted')
+          PY
