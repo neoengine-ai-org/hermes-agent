@@ -55,6 +55,7 @@ def _fixture_report(
 ) -> dict[str, object]:
     interpreter = root / ".venv" / "bin" / "python" if receipt_mode else Path(sys.executable)
     if receipt_mode:
+        (root / ".git" / "info" / "exclude").write_text(".venv/\n", encoding="utf-8")
         (root / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
         (root / ".venv" / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
     if monkeypatch is not None:
@@ -210,10 +211,60 @@ def test_receipt_changes_with_protected_inputs(checkout: Path, relative: str) ->
     first = closure.build_receipt(checkout, report)
     target = checkout / relative
     target.write_text(target.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    _git(checkout, "add", "--", relative)
+    _git(checkout, "commit", "-qm", "changed protected input")
     changed = _fixture_report(checkout, receipt_mode=True)
     assert changed["state"] == closure.READY
     second = closure.build_receipt(checkout, changed)
     assert second["receipt_id"] != first["receipt_id"]
+
+
+def test_dirty_checkout_cannot_emit_head_bound_receipt(checkout: Path) -> None:
+    report = _fixture_report(checkout, receipt_mode=True)
+    assert report["state"] == closure.READY
+    target = checkout / "AGENTS.md"
+    target.write_text(target.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    dirty = _fixture_report(checkout, receipt_mode=True)
+    assert dirty["state"] == closure.BLOCKED
+    assert "DIRTY_CHECKOUT" in {item["code"] for item in dirty["findings"]}
+    with pytest.raises(ValueError, match="receipt-mode ready"):
+        closure.build_receipt(checkout, dirty)
+
+
+def test_cached_ready_report_cannot_emit_after_worktree_mutation(checkout: Path) -> None:
+    report = _fixture_report(checkout, receipt_mode=True)
+    assert report["state"] == closure.READY
+    target = checkout / "AGENTS.md"
+    target.write_text(target.read_text(encoding="utf-8") + "\nmutated\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="clean checkout"):
+        closure.build_receipt(checkout, report)
+
+
+def test_hardlinked_required_artifact_fails_closed(checkout: Path, tmp_path: Path) -> None:
+    artifact = checkout / "AGENTS.md"
+    outside = tmp_path / "outside-agents.md"
+    outside.write_bytes(artifact.read_bytes())
+    artifact.unlink()
+    os.link(outside, artifact)
+    report = _fixture_report(checkout)
+    assert report["state"] == closure.BLOCKED
+    assert "MISSING_ARTIFACT" in {item["code"] for item in report["findings"]}
+
+
+@pytest.mark.parametrize("alias", [r"config\hermes-bootstrap-closure-v1.json", "docs/e\u0301vidence.md"])
+def test_noncanonical_artifact_alias_is_rejected(checkout: Path, alias: str) -> None:
+    _path, finding = closure._contained_regular_file(checkout, alias)
+    assert finding is not None
+    assert finding["code"] == "PATH_ESCAPE"
+
+
+def test_receipt_output_cannot_overwrite_product_source(checkout: Path) -> None:
+    report = _fixture_report(checkout, receipt_mode=True)
+    assert report["state"] == closure.READY
+    original = (checkout / "AGENTS.md").read_bytes()
+    with pytest.raises(ValueError, match="output path"):
+        closure._write_receipt(checkout, "AGENTS.md", closure.build_receipt(checkout, report))
+    assert (checkout / "AGENTS.md").read_bytes() == original
 
 
 def test_receipt_changes_with_head_even_when_tree_is_unchanged(checkout: Path) -> None:

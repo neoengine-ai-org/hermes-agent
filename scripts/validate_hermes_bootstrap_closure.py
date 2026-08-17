@@ -7,10 +7,12 @@ import argparse
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
 import tomllib
+import unicodedata
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -148,6 +150,16 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _head_blob(root: Path, relative_text: str) -> tuple[str, bytes]:
+    blob_sha = _git(root, "rev-parse", f"HEAD:{relative_text}").stdout.strip()
+    blob = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "blob", blob_sha],
+        capture_output=True,
+        check=True,
+    ).stdout
+    return blob_sha, blob
+
+
 def _canonical_digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -157,7 +169,12 @@ def _contained_regular_file(root: Path, relative_text: str) -> tuple[Path | None
     if not isinstance(relative_text, str) or not relative_text:
         return None, _finding("MANIFEST_PATH_INVALID", "artifact path must be a non-empty string")
     pure = PurePosixPath(relative_text)
-    if pure.is_absolute() or ".." in pure.parts or pure == PurePosixPath("."):
+    if (
+        pure.is_absolute() or ".." in pure.parts or pure == PurePosixPath(".")
+        or "\\" in relative_text or "\x00" in relative_text
+        or relative_text != unicodedata.normalize("NFC", relative_text)
+        or pure.as_posix() != relative_text
+    ):
         return None, _finding("PATH_ESCAPE", "artifact path must be checkout-relative", relative_text)
     relative = Path(*pure.parts)
     probe = root
@@ -170,7 +187,11 @@ def _contained_regular_file(root: Path, relative_text: str) -> tuple[Path | None
         candidate.resolve(strict=False).relative_to(root)
     except (OSError, ValueError) as error:
         return None, _finding("PATH_ESCAPE", f"artifact escapes checkout: {error}", relative_text)
-    if not candidate.is_file():
+    try:
+        metadata = os.lstat(candidate)
+    except OSError:
+        metadata = None
+    if metadata is None or not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
         return None, _finding("MISSING_ARTIFACT", "mandatory artifact is missing or not a regular file", relative_text)
     tracked = _git(root, "ls-files", "--error-unmatch", "--", relative.as_posix(), check=False)
     if tracked.returncode != 0:
@@ -485,6 +506,9 @@ def validate(
         plugins = {item.strip() for item in os.environ.get("PYTEST_PLUGINS", "").split(",")}
         if "pytest_live_guard" in plugins or "pytest_live_guard" in sys.modules:
             findings.append(_finding("HOME_PLUGIN", "receipt mode rejects the home pytest plugin"))
+        cleanliness = _git(root, "status", "--porcelain=v1", "--untracked-files=all", check=False)
+        if cleanliness.returncode != 0 or cleanliness.stdout:
+            findings.append(_finding("DIRTY_CHECKOUT", "receipt-grade validation requires a clean checkout"))
     else:
         provenance = {
             "classification": "ASSEMBLED_WORKSPACE_ONLY",
@@ -536,14 +560,21 @@ def validate(
 def build_receipt(root: Path, report: dict[str, Any]) -> dict[str, Any]:
     if report.get("state") != READY or report.get("receipt_mode") is not True:
         raise ValueError("receipt emission requires a receipt-mode ready report")
+    head = _git(root, "rev-parse", "HEAD").stdout.strip()
+    tree = _git(root, "rev-parse", "HEAD^{tree}").stdout.strip()
+    _assert_receipt_snapshot(root, report, head, tree)
     dependencies = []
     for artifact in report["artifacts"]:
         item = dict(artifact)
-        path = root / item["canonical_path_or_provider"]
+        blob_sha, blob = _head_blob(root, item["canonical_path_or_provider"])
+        if hashlib.sha256(blob).hexdigest() != item["sha256"]:
+            raise ValueError("receipt artifact does not match the validated HEAD blob")
         item["digest"] = item.pop("sha256")
         item["version"] = "1"
-        item["blob_sha"] = _git(root, "hash-object", "--", str(path)).stdout.strip()
+        item["blob_sha"] = blob_sha
         dependencies.append(item)
+    manifest_blob_sha, manifest_blob = _head_blob(root, MANIFEST_PATH.as_posix())
+    validator_blob_sha, validator_blob = _head_blob(root, VALIDATOR_PATH.as_posix())
     payload: dict[str, Any] = {
         "schema_version": "hermes.bootstrap-closure-receipt/1.0",
         "emitter_repository": {
@@ -553,14 +584,14 @@ def build_receipt(root: Path, report: dict[str, Any]) -> dict[str, Any]:
         "source": report["source"],
         "manifest": {
             "path": MANIFEST_PATH.as_posix(),
-            "blob_sha": _git(root, "hash-object", "--", str(root / MANIFEST_PATH)).stdout.strip(),
-            "sha256": _sha256(root / MANIFEST_PATH),
+            "blob_sha": manifest_blob_sha,
+            "sha256": hashlib.sha256(manifest_blob).hexdigest(),
             "schema_version": "hermes.bootstrap-closure-manifest/1.0",
         },
         "validator": {
             "path": VALIDATOR_PATH.as_posix(),
-            "blob_sha": _git(root, "hash-object", "--", str(root / VALIDATOR_PATH)).stdout.strip(),
-            "sha256": _sha256(root / VALIDATOR_PATH),
+            "blob_sha": validator_blob_sha,
+            "sha256": hashlib.sha256(validator_blob).hexdigest(),
             "version": VERSION,
         },
         "dependencies": dependencies,
@@ -593,10 +624,26 @@ def build_receipt(root: Path, report: dict[str, Any]) -> dict[str, Any]:
     receipt = dict(payload)
     receipt["receipt_id"] = f"hermes-bootstrap-{digest[:20]}"
     receipt["canonical_payload_digest"] = digest
+    _assert_receipt_snapshot(root, report, head, tree)
     return receipt
 
 
+def _assert_receipt_snapshot(root: Path, report: dict[str, Any], head: str, tree: str) -> None:
+    if _git(root, "status", "--porcelain=v1", "--untracked-files=all").stdout:
+        raise ValueError("receipt emission requires a clean checkout")
+    if report.get("source", {}).get("head") != head or report.get("source", {}).get("tree") != tree:
+        raise ValueError("receipt source differs from the validated checkout")
+    if _git(root, "rev-parse", "HEAD").stdout.strip() != head or _git(root, "rev-parse", "HEAD^{tree}").stdout.strip() != tree:
+        raise ValueError("receipt source changed during emission")
+    for artifact in report.get("artifacts", []):
+        _blob_sha, blob = _head_blob(root, artifact["canonical_path_or_provider"])
+        if hashlib.sha256(blob).hexdigest() != artifact["sha256"]:
+            raise ValueError("receipt artifact changed after validation")
+
+
 def _write_receipt(root: Path, relative_text: str, receipt: dict[str, Any]) -> None:
+    if relative_text != "artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json":
+        raise ValueError("receipt output path differs from the product-owned contract")
     pure = PurePosixPath(relative_text)
     if pure.is_absolute() or ".." in pure.parts or pure == PurePosixPath("."):
         raise ValueError("receipt output must be checkout-relative")
@@ -608,6 +655,8 @@ def _write_receipt(root: Path, relative_text: str, receipt: dict[str, Any]) -> N
             raise ValueError("receipt output parent contains a symlink")
     output.resolve(strict=False).relative_to(root)
     output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and (output.is_symlink() or not output.is_file()):
+        raise ValueError("receipt output target is not a regular file")
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
