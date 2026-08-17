@@ -25,9 +25,10 @@ _core = cast(Any, importlib.util.module_from_spec(_SPEC))
 sys.modules[_CORE_MODULE_NAME] = _core
 _SPEC.loader.exec_module(_core)
 
-# Any future change to the preserved core is itself a classifier change and must
-# remain inside the trusted self-change path set.
+# Any future change to the preserved core or trusted finalizer is itself a
+# classifier change and must remain inside the trusted self-change path set.
 _core.SELF_CHANGE_PATHS.add("scripts/ci_risk_classifier_core.py")
+_core.SELF_CHANGE_PATHS.add("scripts/ci_risk_classifier_finalizer.py")
 _original_infer_surfaces = _core.infer_surfaces
 
 # These paths contain repository tooling, tests, workflow definitions, or
