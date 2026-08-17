@@ -66,7 +66,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@19fecc8c6b3ec65573f8416f8a013e30d4ae84e3 # v6
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
       - name: Create clean checkout-local proof environment
         shell: bash
