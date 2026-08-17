@@ -40,14 +40,16 @@ jobs:
           marker = '<!-- hermes-bootstrap-closure-receipt-subject-v1 -->'
           if marker in text:
               raise SystemExit('receipt subject marker already exists')
-          addition = '''
-
-<!-- hermes-bootstrap-closure-receipt-subject-v1 -->
-## Checkout-local bootstrap closure evidence
-
-This repository produces a product-owned, credential-free checkout-local bootstrap proof through `.github/workflows/org-bootstrap-closure.yml`. Canonical cross-org readiness is published separately from the reviewed subject commit and does not grant provider, deployment, production, customer-data, finance, or trading authority.
-'''
-          path.write_text(text.rstrip() + addition + '\n', encoding='utf-8')
+          lines = [
+              '',
+              '',
+              marker,
+              '## Checkout-local bootstrap closure evidence',
+              '',
+              'This repository produces a product-owned, credential-free checkout-local bootstrap proof through `.github/workflows/org-bootstrap-closure.yml`. Canonical cross-org readiness is published separately from the reviewed subject commit and does not grant provider, deployment, production, customer-data, finance, or trading authority.',
+              '',
+          ]
+          path.write_text(text.rstrip() + '\n'.join(lines), encoding='utf-8')
           PY
           git diff --check
           test "$(git diff --name-only)" = "README.md"
@@ -92,22 +94,25 @@ This repository produces a product-owned, credential-free checkout-local bootstr
           if existing:
               print(f"subject PR already exists: #{existing[0]['number']}")
               raise SystemExit(0)
+          body = '\n'.join([
+              '## Purpose',
+              '',
+              'Create one bounded, independently reviewable subject commit for the Hermes checkout-local bootstrap receipt.',
+              '',
+              'The only source change is a durable README evidence note. The product-owned workflow `org-bootstrap-closure` must run on this exact PR head; a nonauthor native GitHub approval must bind to the same head; canonical receipt publication remains a later strict-descendant PR.',
+              '',
+              '## Non-claims',
+              '',
+              'No provider, credential, release, deployment, production, customer-data, finance, science, brokerage, capital, order, position, trading, branch-protection, or all-org readiness authority is granted.',
+              '',
+          ])
           payload = {
               'title': 'docs(evidence): establish Hermes bootstrap receipt subject',
               'head': branch,
               'base': 'main',
               'draft': False,
               'maintainer_can_modify': True,
-              'body': '''## Purpose
-
-Create one bounded, independently reviewable subject commit for the Hermes checkout-local bootstrap receipt.
-
-The only source change is a durable README evidence note. The product-owned workflow `org-bootstrap-closure` must run on this exact PR head; a nonauthor native GitHub approval must bind to the same head; canonical receipt publication remains a later strict-descendant PR.
-
-## Non-claims
-
-No provider, credential, release, deployment, production, customer-data, finance, science, brokerage, capital, order, position, trading, branch-protection, or all-org readiness authority is granted.
-''',
+              'body': body,
           }
           request = urllib.request.Request(
               f'https://api.github.com/repos/{repo}/pulls',
