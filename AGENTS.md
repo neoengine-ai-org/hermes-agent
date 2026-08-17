@@ -13,6 +13,13 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+For checkout-local proof use `scripts/run_tests.sh --receipt-mode`; it accepts
+only `.venv` or an explicitly selected repository-local receipt venv, disables
+the optional home pytest plugin, clears credentials, and runs the bootstrap
+validator before tests. `--local-venv-only` forbids the shared-home fallback.
+`--allow-shared-venv` preserves explicit developer convenience, but that mode is
+always non-receipt. See `docs/development/bootstrap-closure.md`.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
