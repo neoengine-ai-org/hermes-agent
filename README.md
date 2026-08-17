@@ -213,3 +213,8 @@ scripts/run_tests.sh
 MIT — see [LICENSE](LICENSE).
 
 Built by [Nous Research](https://nousresearch.com).
+
+<!-- hermes-bootstrap-closure-receipt-subject-v1 -->
+## Checkout-local bootstrap closure evidence
+
+This repository produces a product-owned, credential-free checkout-local bootstrap proof through `.github/workflows/org-bootstrap-closure.yml`. Canonical cross-org readiness is published separately from the reviewed subject commit and does not grant provider, deployment, production, customer-data, finance, or trading authority.
