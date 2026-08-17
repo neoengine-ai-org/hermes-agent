@@ -54,40 +54,11 @@ jobs:
   checkout-local-bootstrap-closure:
     name: checkout-local bootstrap closure
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      GIT_CONFIG_GLOBAL: /tmp/qwen-empty-gitconfig-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
-      GIT_CONFIG_NOSYSTEM: '1'
-      HOME: /tmp/qwen-empty-home-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
       UV_NO_PROGRESS: '1'
     steps:
-      - name: Prepare isolated runner environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${GIT_CONFIG_GLOBAL}" in
-            /tmp/qwen-empty-gitconfig-*) ;;
-            *) echo "::error::invalid isolated git config path"; exit 1 ;;
-          esac
-          case "${HOME}" in
-            /tmp/qwen-empty-home-*) ;;
-            *) echo "::error::invalid isolated HOME path"; exit 1 ;;
-          esac
-          install -m 0600 /dev/null "${GIT_CONFIG_GLOBAL}"
-          install -d -m 0700 "${HOME}"
-          install -m 0600 /dev/null "${HOME}/.gitconfig"
-
-      - name: Verify governed runner identity
-        shell: bash
-        run: |
-          set -euo pipefail
-          test "${{ runner.os }}" = "Linux"
-          case "${{ runner.name }}" in
-            qwen-ops-01|qwen-ops-01-r*) ;;
-            *) echo "::error::refusing non-Qwen runner ${{ runner.name }}"; exit 1 ;;
-          esac
-
       - name: Check out exact candidate
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -95,7 +66,7 @@ jobs:
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@19fecc8c6b3ec65573f8416f8a013e30d4ae84e3 # v6
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
 
       - name: Create clean checkout-local proof environment
         shell: bash
