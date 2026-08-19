@@ -1,0 +1,69 @@
+{
+  "artifacts": [
+    {
+      "dependency_id": "package-metadata",
+      "destination": "pyproject.toml",
+      "lock_timeout_seconds": 30,
+      "mode": "0644",
+      "source_blob_sha": "297992928f94f6b63f506ca9be320ec4f65f246b",
+      "source_path": "pyproject.toml",
+      "source_ref": "b271297a54b71a16d76d746e424469267134005e"
+    },
+    {
+      "dependency_id": "lockfile",
+      "destination": "uv.lock",
+      "lock_timeout_seconds": 30,
+      "mode": "0644",
+      "source_blob_sha": "1c0dd1cf17d09acf2f077a774ff1089c2730969d",
+      "source_path": "uv.lock",
+      "source_ref": "b271297a54b71a16d76d746e424469267134005e"
+    }
+  ],
+  "durable_repair": {
+    "dedupe": "repository+dependency+blob+base",
+    "mode": "DEDICATED_REPAIR_PR",
+    "owner_repository": "neoengine-ai-org/hermes-agent"
+  },
+  "environment": {
+    "allowed_venvs": [
+      ".venv",
+      ".bootstrap-proof-venv"
+    ],
+    "home_pytest_plugin": "NON_AUTHORITATIVE",
+    "lock_mode": "uv-sync-locked",
+    "shared_home_venv": "NON_AUTHORITATIVE"
+  },
+  "environment_timeout_seconds": 900,
+  "lock_blob_sha": "1c0dd1cf17d09acf2f077a774ff1089c2730969d",
+  "non_claims": [
+    "no shared-home environment authority",
+    "no arbitrary package installation",
+    "no provider credential or production authority",
+    "no branch-protection or review bypass"
+  ],
+  "operations": {
+    "validate-bootstrap": {
+      "argv": [
+        "{python}",
+        "-c",
+        "print('HERMES_BOOTSTRAP_OPERATION_RETRY_PASS')"
+      ],
+      "retry_limit": 1,
+      "timeout_seconds": 30
+    }
+  },
+  "python": "3.11",
+  "repository": "neoengine-ai-org/hermes-agent",
+  "schema_version": "hermes.self-healing-bootstrap-acquisition/2.0.0",
+  "shared_home_authority_allowed": false,
+  "source_commit": "b271297a54b71a16d76d746e424469267134005e",
+  "stage0": {
+    "blob_sha": "f82dc82861886252cb226197e375e568f1fa2365",
+    "path": "scripts/bootstrap_stage0_v2.py"
+  },
+  "stage1": {
+    "blob_sha": "e701eebb2f4eca4c87d1601cb05a561f8d5362b3",
+    "path": "scripts/bootstrap_resolver_v2.py"
+  },
+  "validation_timeout_seconds": 180
+}
