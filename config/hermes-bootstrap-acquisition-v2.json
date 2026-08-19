@@ -57,8 +57,8 @@
     "path": "scripts/bootstrap_stage0_v2.py"
   },
   "stage1": {
-    "blob_sha": "6debf03c94154ea70e9b66348f2c13ad323cedbc",
-    "path": "scripts/bootstrap_resolver_v2_hardened.py"
+    "blob_sha": "5cda1fb8f8cd60189c2a87cd117b831d9e6be8bd",
+    "path": "scripts/bootstrap_resolver_v2_final.py"
   },
   "validation_timeout_seconds": 180
 }
