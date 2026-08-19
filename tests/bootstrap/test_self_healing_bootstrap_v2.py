@@ -20,6 +20,7 @@ def test_policy_pin_and_shared_home_refusal():
 def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
     checkout=tmp_path/"hermes"
     assert run(["git","clone","--no-local","--quiet",str(ROOT),str(checkout)],tmp_path).returncode==0
+    assert run(["git","remote","set-url","origin","https://github.com/neoengine-ai-org/hermes-agent.git"],checkout).returncode==0
     resolver=checkout/"scripts/bootstrap_resolver_v2.py"
     resolver.unlink()
     fake=tmp_path/"bin"; fake.mkdir()
