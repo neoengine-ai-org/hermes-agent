@@ -17,12 +17,14 @@ def test_policy_pin_and_shared_home_refusal():
     policy=json.loads(raw)
     assert policy["shared_home_authority_allowed"] is False
     assert policy["environment"]["allowed_venvs"]==[".venv",".bootstrap-proof-venv"]
+    assert "argv" not in policy["operations"]["validate-bootstrap"]
 
 def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
     checkout=tmp_path/"hermes"
     assert run(["git","clone","--no-local","--quiet",str(ROOT),str(checkout)],tmp_path).returncode==0
     assert run(["git","remote","set-url","origin","https://github.com/neoengine-ai-org/hermes-agent.git"],checkout).returncode==0
-    resolver=checkout/"scripts/bootstrap_resolver_v2.py"
+    policy=json.loads((checkout/"config/hermes-bootstrap-acquisition-v2.json").read_text(encoding="utf-8"))
+    resolver=checkout/policy["stage1"]["path"]
     resolver.unlink()
 
     # The production resolver validates the repaired environment by importing
