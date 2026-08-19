@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from typing import Any
 READY = "HERMES_SELF_HEALING_BOOTSTRAP_READY"
 RECOVERED = "HERMES_SELF_HEALING_BOOTSTRAP_RECOVERED"
 BLOCKED = "HERMES_SELF_HEALING_BOOTSTRAP_BLOCKED"
+GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 class RecoveryError(RuntimeError):
     def __init__(self, code: str, message: str):
@@ -100,7 +102,54 @@ def atomic_write(path: Path, data: bytes, mode: int) -> None:
         with contextlib.suppress(FileNotFoundError):
             temp.unlink()
 
-def git_blob(root: Path, ref: str, path: str) -> tuple[bytes, str]:
+def normalize_remote(value: str) -> str:
+    cleaned = value.strip()
+    if cleaned.endswith(".git"):
+        cleaned = cleaned[:-4]
+    if cleaned.startswith("git@github.com:"):
+        cleaned = "https://github.com/" + cleaned.removeprefix("git@github.com:")
+    return cleaned.rstrip("/")
+
+def ensure_source_commit(root: Path, repository: str, ref: str) -> None:
+    if not GIT_SHA_RE.fullmatch(ref):
+        raise RecoveryError("SOURCE_REF_INVALID", ref)
+    expected_remote = f"https://github.com/{repository}"
+    observed_remote = subprocess.run(
+        ["git", "-C", str(root), "remote", "get-url", "origin"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if observed_remote.returncode or normalize_remote(observed_remote.stdout) != expected_remote:
+        raise RecoveryError("SOURCE_REPOSITORY_MISMATCH", observed_remote.stdout.strip() or repository)
+    present = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    )
+    if present.returncode == 0:
+        return
+    fetched = subprocess.run(
+        ["git", "-C", str(root), "fetch", "--no-tags", "--depth=1", "origin", ref],
+        text=True,
+        capture_output=True,
+        timeout=90,
+        check=False,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+    )
+    if fetched.returncode:
+        raise RecoveryError("SOURCE_FETCH_FAILED", fetched.stderr[-4000:] or fetched.stdout[-4000:])
+    verified = subprocess.run(
+        ["git", "-C", str(root), "cat-file", "-e", f"{ref}^{{commit}}"],
+        capture_output=True,
+        check=False,
+    )
+    if verified.returncode:
+        raise RecoveryError("SOURCE_REF_UNAVAILABLE_AFTER_FETCH", ref)
+
+def git_blob(root: Path, repository: str, ref: str, path: str) -> tuple[bytes, str]:
+    relative(path)
+    ensure_source_commit(root, repository, ref)
     shown = subprocess.run(["git", "-C", str(root), "show", f"{ref}:{path}"],
                            capture_output=True, check=False)
     if shown.returncode:
@@ -129,6 +178,8 @@ def load_policy(root: Path, policy_rel: str, pin_rel: str) -> tuple[dict[str, An
         raise RecoveryError("POLICY_INVALID", policy_rel)
     if value.get("shared_home_authority_allowed") is not False:
         raise RecoveryError("POLICY_AUTHORITY_INVALID", "shared-home authority must remain false")
+    if value.get("repository") != "neoengine-ai-org/hermes-agent":
+        raise RecoveryError("POLICY_REPOSITORY_INVALID", str(value.get("repository")))
     return value, observed
 
 def repair_artifacts(root: Path, policy: dict[str, Any], repair: bool) -> list[str]:
@@ -137,7 +188,7 @@ def repair_artifacts(root: Path, policy: dict[str, Any], repair: bool) -> list[s
     lock_root.mkdir(parents=True, exist_ok=True)
     for item in policy["artifacts"]:
         with lock(lock_root / f"{item['dependency_id']}.lock", int(item["lock_timeout_seconds"])):
-            data, blob = git_blob(root, item["source_ref"], item["source_path"])
+            data, blob = git_blob(root, policy["repository"], item["source_ref"], item["source_path"])
             if blob != item["source_blob_sha"]:
                 raise RecoveryError("SOURCE_BLOB_MISMATCH", item["dependency_id"])
             target_rel = relative(item["destination"])
