@@ -12,6 +12,21 @@ for arg in "$@"; do
     break
   fi
 done
+case "$VENV" in
+  "$REPO_ROOT"/*) VENV_REL="${VENV#"$REPO_ROOT"/}" ;;
+  /*)
+    echo "Hermes bootstrap venv escapes the repository: $VENV" >&2
+    exit 2
+    ;;
+  *) VENV_REL="$VENV" ;;
+esac
+case "$VENV_REL" in
+  .venv|.bootstrap-proof-venv) ;;
+  *)
+    echo "Hermes bootstrap venv is not admitted: $VENV_REL" >&2
+    exit 2
+    ;;
+esac
 python3 -S "$SCRIPT_DIR/bootstrap_stage0_v2.py" ensure \
-  --repair --venv "$VENV" --operation-id validate-bootstrap
+  --repair --venv "$VENV_REL" --operation-id validate-bootstrap
 exec "$SCRIPT_DIR/run_tests_v1.sh" "${MODE_ARGS[@]}"
