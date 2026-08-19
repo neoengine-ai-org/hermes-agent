@@ -1,6 +1,7 @@
 from __future__ import annotations
 import hashlib, json, os
 from pathlib import Path
+import shutil
 import subprocess, sys
 
 ROOT=Path(__file__).resolve().parents[2]
@@ -23,18 +24,18 @@ def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
     assert run(["git","remote","set-url","origin","https://github.com/neoengine-ai-org/hermes-agent.git"],checkout).returncode==0
     resolver=checkout/"scripts/bootstrap_resolver_v2.py"
     resolver.unlink()
-    fake=tmp_path/"bin"; fake.mkdir()
-    uv=fake/"uv"
-    uv.write_text("""#!/usr/bin/env python3
-import pathlib, sys
-args=sys.argv[1:]
-if args[0]=='venv':
- p=pathlib.Path(args[1]); (p/'bin').mkdir(parents=True); (p/'bin/python').symlink_to(sys.executable); (p/'pyvenv.cfg').write_text('home = fixture\\n')
-elif args[0]=='sync':
- pass
-""", encoding="utf-8")
-    uv.chmod(0o755)
-    env={**os.environ,"PATH":str(fake)+os.pathsep+os.environ["PATH"],"PYTHONNOUSERSITE":"1"}
+
+    # The production resolver validates the repaired environment by importing
+    # every mandatory Hermes entrypoint. A no-op fake `uv sync` can only prove
+    # file restoration and produces a deliberately invalid environment. Use
+    # the workflow-installed, lock-backed uv runtime so this hostile fixture
+    # proves the complete recovery contract without weakening import smoke.
+    assert shutil.which("uv") is not None, "uv is required by the admitted Hermes recovery policy"
+    env={
+        **os.environ,
+        "PYTHONNOUSERSITE":"1",
+        "UV_NO_PROGRESS":"1",
+    }
     result=run([sys.executable,"-S","scripts/bootstrap_stage0_v2.py","ensure","--repair"],checkout,env)
     assert result.returncode==0,result.stderr
     assert resolver.is_file()
