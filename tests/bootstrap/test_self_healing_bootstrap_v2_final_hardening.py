@@ -111,6 +111,7 @@ def test_live_owner_is_preserved(tmp_path: Path) -> None:
         assert os.WEXITSTATUS(status) == 0
 
 
+@pytest.mark.timeout(300)
 def test_fingerprinted_corrupt_environment_rebuilds_once(tmp_path: Path) -> None:
     checkout = tmp_path / "hermes"
     clone = run(
