@@ -29,7 +29,7 @@ def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
 import pathlib, sys
 args=sys.argv[1:]
 if args[0]=='venv':
- p=pathlib.Path(args[1]); (p/'bin').mkdir(parents=True); (p/'bin/python').symlink_to(sys.executable)
+ p=pathlib.Path(args[1]); (p/'bin').mkdir(parents=True); (p/'bin/python').symlink_to(sys.executable); (p/'pyvenv.cfg').write_text('home = fixture\\n')
 elif args[0]=='sync':
  pass
 """, encoding="utf-8")
