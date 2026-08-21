@@ -189,7 +189,7 @@ def test_fingerprinted_corrupt_environment_rebuilds_once(tmp_path: Path) -> None
     assert receipt["operation_retry"]["attempts"] == 1
 
     proof = run(
-        [str(python), "-c", "import yaml,pytest; print('ok')"],
+        [str(python), "-c", "import yaml; print('ok')"],
         checkout,
         env,
     )

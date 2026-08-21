@@ -53,7 +53,7 @@
   "shared_home_authority_allowed": false,
   "source_commit": "b271297a54b71a16d76d746e424469267134005e",
   "stage0": {
-    "blob_sha": "f82dc82861886252cb226197e375e568f1fa2365",
+    "blob_sha": "51feb4dfe7d5096f6880b66a304a4ac436613918",
     "path": "scripts/bootstrap_stage0_v2.py"
   },
   "stage1": {
