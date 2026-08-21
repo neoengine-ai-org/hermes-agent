@@ -20,6 +20,23 @@ def write(path: Path, data: bytes, mode: int) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError): temp.unlink()
 
+def tracked_mode(root: Path, relative: str) -> int:
+    observed = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "HEAD", "--", relative],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    fields = observed.stdout.strip().split(None, 3)
+    if len(fields) != 4:
+        raise RuntimeError("RESOLVER_GIT_MODE_MISSING")
+    git_mode = fields[0]
+    if git_mode == "100644":
+        return 0o644
+    if git_mode == "100755":
+        return 0o755
+    raise RuntimeError(f"RESOLVER_GIT_MODE_UNSUPPORTED:{git_mode}")
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("command", choices=("ensure", "diagnose"))
@@ -48,7 +65,7 @@ def main() -> int:
             if not args.repair: raise RuntimeError("RESOLVER_REPAIR_REQUIRED")
             shown = subprocess.run(["git","-C",str(root),"show",f"HEAD:{resolver['path']}"],
                                    capture_output=True,check=True)
-            write(target, shown.stdout, 0o755)
+            write(target, shown.stdout, tracked_mode(root, resolver["path"]))
         argv=[sys.executable,"-S",str(target),args.command,"--root",str(root),
               "--policy",args.policy,"--pin",args.pin,"--venv",args.venv]
         if args.repair: argv.append("--repair")

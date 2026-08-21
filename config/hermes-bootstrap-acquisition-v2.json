@@ -43,13 +43,8 @@
   ],
   "operations": {
     "validate-bootstrap": {
-      "argv": [
-        "{python}",
-        "-c",
-        "print('HERMES_BOOTSTRAP_OPERATION_RETRY_PASS')"
-      ],
       "retry_limit": 1,
-      "timeout_seconds": 30
+      "timeout_seconds": 180
     }
   },
   "python": "3.11",
@@ -58,12 +53,12 @@
   "shared_home_authority_allowed": false,
   "source_commit": "b271297a54b71a16d76d746e424469267134005e",
   "stage0": {
-    "blob_sha": "f82dc82861886252cb226197e375e568f1fa2365",
+    "blob_sha": "51feb4dfe7d5096f6880b66a304a4ac436613918",
     "path": "scripts/bootstrap_stage0_v2.py"
   },
   "stage1": {
-    "blob_sha": "5efe18020a5e9d7719c9f46abc35309b75f3989b",
-    "path": "scripts/bootstrap_resolver_v2.py"
+    "blob_sha": "5cda1fb8f8cd60189c2a87cd117b831d9e6be8bd",
+    "path": "scripts/bootstrap_resolver_v2_final.py"
   },
   "validation_timeout_seconds": 180
 }
