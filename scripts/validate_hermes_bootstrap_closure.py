@@ -277,7 +277,8 @@ def interpreter_provenance(
         requested = receipt_venv if receipt_venv.is_absolute() else root / receipt_venv
         requested = Path(os.path.abspath(requested))
         try:
-            requested.resolve(strict=True).relative_to(root)
+            requested_resolved = requested.resolve(strict=True)
+            requested_resolved.relative_to(root)
         except (OSError, ValueError):
             return (
                 {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
@@ -289,7 +290,7 @@ def interpreter_provenance(
                 accepted_resolved.add(allowed.resolve(strict=True))
             except OSError:
                 continue
-        if requested.resolve(strict=True) not in accepted_resolved:
+        if requested_resolved not in accepted_resolved:
             return (
                 {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
                 _finding("SHARED_VENV", "explicit receipt venv is not in the protected allowlist", str(requested)),
@@ -486,9 +487,18 @@ def validate(
                 findings.append(error)
                 continue
             assert artifact is not None
-            if relative in {"scripts/run_tests.sh", "scripts/run_tests_v1.sh"} and not (os.stat(artifact).st_mode & 0o111):
-                findings.append(_finding("ARTIFACT_MODE", "test runner must be executable", relative))
-                continue
+            if relative in {"scripts/run_tests.sh", "scripts/run_tests_v1.sh"}:
+                index_entry = _git(root, "ls-files", "-s", "--", relative).stdout.strip()
+                index_mode = index_entry.split(maxsplit=1)[0] if index_entry else ""
+                if index_mode != "100755":
+                    findings.append(
+                        _finding(
+                            "ARTIFACT_MODE",
+                            "test runner must have executable mode 100755 in the Git index",
+                            relative,
+                        )
+                    )
+                    continue
             artifacts.append(
                 {
                     "dependency_id": dependency_id,

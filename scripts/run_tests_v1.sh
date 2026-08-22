@@ -87,6 +87,18 @@ if [[ "$RUNNER_MODE" == "receipt" && "${HERMES_RECEIPT_VENV+x}" == "x" ]]; then
     echo "error: explicit receipt virtualenv is empty" >&2
     exit 1
   fi
+  case "$HERMES_RECEIPT_VENV" in
+    /*) RECEIPT_VENV_LEXICAL="$HERMES_RECEIPT_VENV" ;;
+    *) RECEIPT_VENV_LEXICAL="$REPO_ROOT/$HERMES_RECEIPT_VENV" ;;
+  esac
+  case "$RECEIPT_VENV_LEXICAL" in
+    "$REPO_ROOT/.venv"|"$REPO_ROOT/.bootstrap-proof-venv") ;;
+    *)
+      echo "error: explicit receipt virtualenv is not admitted: $HERMES_RECEIPT_VENV" >&2
+      exit 1
+      ;;
+  esac
+  HERMES_RECEIPT_VENV="$RECEIPT_VENV_LEXICAL"
   if [[ ! -f "$HERMES_RECEIPT_VENV/bin/activate" \
         || ! -x "$HERMES_RECEIPT_VENV/bin/python" ]]; then
     echo "error: explicit receipt virtualenv is missing or incomplete: $HERMES_RECEIPT_VENV" >&2
@@ -104,7 +116,7 @@ if [[ "$RUNNER_MODE" == "receipt" && "${HERMES_RECEIPT_VENV+x}" == "x" ]]; then
       exit 1
       ;;
   esac
-  if [[ -L "$HERMES_RECEIPT_VENV" ]]; then
+  if [[ -L "${HERMES_RECEIPT_VENV%/}" ]]; then
     echo "error: explicit receipt virtualenv cannot be a symlink: $HERMES_RECEIPT_VENV" >&2
     exit 1
   fi

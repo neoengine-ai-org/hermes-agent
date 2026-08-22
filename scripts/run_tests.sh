@@ -9,7 +9,7 @@ RECEIPT_MODE=0
 for arg in "$@"; do
   if [[ "$arg" == "--receipt-mode" ]]; then
     RECEIPT_MODE=1
-    VENV="${HERMES_RECEIPT_VENV:-$REPO_ROOT/.bootstrap-proof-venv}"
+    VENV="${HERMES_RECEIPT_VENV-$REPO_ROOT/.bootstrap-proof-venv}"
     break
   fi
 done

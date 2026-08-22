@@ -193,6 +193,18 @@ def test_explicit_receipt_venv_must_be_in_protected_allowlist(checkout: Path) ->
     assert finding["code"] == "SHARED_VENV"
 
 
+def test_runner_mode_is_bound_to_attested_git_index(checkout: Path) -> None:
+    runner = checkout / "scripts" / "run_tests_v1.sh"
+    _git(checkout, "update-index", "--chmod=-x", "scripts/run_tests_v1.sh")
+    _git(checkout, "commit", "-qm", "remove attested executable mode")
+    _git(checkout, "config", "core.fileMode", "false")
+    runner.chmod(0o755)
+    assert _git(checkout, "status", "--porcelain", "--untracked-files=all") == ""
+    report = _fixture_report(checkout)
+    assert report["state"] == closure.BLOCKED
+    assert "ARTIFACT_MODE" in {item["code"] for item in report["findings"]}
+
+
 def test_home_pytest_plugin_cannot_affect_receipt_grade_result(
     checkout: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -405,7 +417,7 @@ def test_runner_receipt_mode_refuses_missing_explicit_venv_without_fallback(
 ) -> None:
     root = _runner_fixture(tmp_path)
     _fake_venv(root / ".venv")
-    missing = root / ".receipt-missing"
+    missing = root / ".bootstrap-proof-venv"
     result = subprocess.run(
         [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
         env={**os.environ, "HERMES_RECEIPT_VENV": str(missing)},
@@ -416,6 +428,29 @@ def test_runner_receipt_mode_refuses_missing_explicit_venv_without_fallback(
     assert result.returncode != 0
     assert "explicit receipt virtualenv is missing or incomplete" in result.stderr
     assert f"interpreter={root / '.venv/bin/python'}" not in result.stdout
+
+
+def test_v1_runner_refuses_nonallowlisted_interpreter_before_execution(
+    tmp_path: Path,
+) -> None:
+    root = _runner_fixture(tmp_path)
+    selected = root / "node_modules" / ".cache" / "pip-build"
+    _fake_venv(selected)
+    marker = root / "hostile-interpreter-ran"
+    (selected / "bin" / "python").write_text(
+        f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8"
+    )
+    (selected / "bin" / "python").chmod(0o755)
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "explicit receipt virtualenv is not admitted" in result.stderr
+    assert not marker.exists()
 
 
 @pytest.mark.parametrize("value", [""])
@@ -442,8 +477,8 @@ def test_runner_receipt_mode_refuses_parent_escape_and_symlink(
     root = _runner_fixture(tmp_path)
     outside = tmp_path / "outside-venv"
     _fake_venv(outside)
-    for selected in (root / ".." / "outside-venv", root / ".linked-venv"):
-        if selected.name == ".linked-venv":
+    for selected in (root / ".." / "outside-venv", root / ".bootstrap-proof-venv"):
+        if selected.name == ".bootstrap-proof-venv":
             selected.symlink_to(outside, target_is_directory=True)
         result = subprocess.run(
             [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
@@ -453,5 +488,17 @@ def test_runner_receipt_mode_refuses_parent_escape_and_symlink(
             check=False,
         )
         assert result.returncode != 0
-        assert "escapes the repository" in result.stderr
+        assert "not admitted" in result.stderr or "escapes the repository" in result.stderr
         assert result.stdout == ""
+
+    trailing = f"{root / '.bootstrap-proof-venv'}/"
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
+        env={**os.environ, "HERMES_RECEIPT_VENV": trailing},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "not admitted" in result.stderr
+    assert result.stdout == ""
