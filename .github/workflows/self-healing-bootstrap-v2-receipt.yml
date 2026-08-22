@@ -1,0 +1,194 @@
+name: Hermes self-healing bootstrap V2 receipt
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/self-healing-bootstrap-v2-receipt.yml'
+      - '.github/workflows/tests.yml'
+      - 'AGENTS.md'
+      - 'README.md'
+      - 'acp_adapter/entry.py'
+      - 'config/hermes-bootstrap-closure-v1.json'
+      - 'hermes_bootstrap.py'
+      - 'hermes_constants.py'
+      - 'hermes_cli/main.py'
+      - 'pyproject.toml'
+      - 'run_agent.py'
+      - 'scripts/hermes_progress.py'
+      - 'scripts/bootstrap_stage0_v2.py'
+      - 'scripts/run_tests.sh'
+      - 'scripts/run_tests_v1.sh'
+      - 'scripts/run_tests_parallel.py'
+      - 'scripts/validate_hermes_bootstrap_closure.py'
+      - 'tests/bootstrap/test_bootstrap_closure.py'
+      - 'uv.lock'
+      - 'config/hermes-bootstrap-acquisition-v2.json'
+      - 'config/hermes-bootstrap-acquisition-v2.sha256'
+      - 'scripts/bootstrap_resolver_v2_hardened.py'
+      - 'scripts/bootstrap_resolver_v2_final.py'
+      - 'scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py'
+      - 'tests/bootstrap/test_self_healing_bootstrap_v2.py'
+      - 'tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py'
+      - 'tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/self-healing-bootstrap-v2-receipt.yml'
+      - '.github/workflows/tests.yml'
+      - 'AGENTS.md'
+      - 'README.md'
+      - 'acp_adapter/entry.py'
+      - 'config/hermes-bootstrap-closure-v1.json'
+      - 'hermes_bootstrap.py'
+      - 'hermes_constants.py'
+      - 'hermes_cli/main.py'
+      - 'pyproject.toml'
+      - 'run_agent.py'
+      - 'scripts/hermes_progress.py'
+      - 'scripts/bootstrap_stage0_v2.py'
+      - 'scripts/run_tests.sh'
+      - 'scripts/run_tests_v1.sh'
+      - 'scripts/run_tests_parallel.py'
+      - 'scripts/validate_hermes_bootstrap_closure.py'
+      - 'tests/bootstrap/test_bootstrap_closure.py'
+      - 'uv.lock'
+      - 'config/hermes-bootstrap-acquisition-v2.json'
+      - 'config/hermes-bootstrap-acquisition-v2.sha256'
+      - 'scripts/bootstrap_resolver_v2_hardened.py'
+      - 'scripts/bootstrap_resolver_v2_final.py'
+      - 'scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py'
+      - 'tests/bootstrap/test_self_healing_bootstrap_v2.py'
+      - 'tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py'
+      - 'tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-self-healing-bootstrap-v2-receipt-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  receipt:
+    name: Protected-source recovery receipt
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UV_NO_PROGRESS: '1'
+    steps:
+      - name: Check out exact candidate with protected ancestry
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+
+      - name: Create locked receipt environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv python install 3.11
+          uv venv .bootstrap-proof-venv --python 3.11
+          UV_PROJECT_ENVIRONMENT=.bootstrap-proof-venv \
+            uv sync --locked --python .bootstrap-proof-venv/bin/python --extra dev
+
+      - name: Verify protected source identity and ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit='518c00b34eb2df7f550a0791bb9c5b657ec38071'
+          source_tree='7975b8563ca7d3a58a237cab9bdfc8329c19c408'
+          git cat-file -e "${source_commit}^{commit}"
+          git merge-base --is-ancestor "${source_commit}" HEAD
+          test "$(git rev-parse "${source_commit}^{tree}")" = "${source_tree}"
+
+      - name: Emit exact V1 base-closure receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/bootstrap
+          .bootstrap-proof-venv/bin/python \
+            scripts/validate_hermes_bootstrap_closure.py \
+            --root . \
+            --receipt-venv .bootstrap-proof-venv \
+            --receipt-out artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json \
+            --format json \
+            > artifacts/bootstrap/hermes-bootstrap-closure-validation-v1.json
+          .bootstrap-proof-venv/bin/python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(
+              Path('artifacts/bootstrap/hermes-bootstrap-closure-validation-v1.json')
+              .read_text(encoding='utf-8')
+          )
+          assert report['state'] == 'HERMES_BOOTSTRAP_CLOSURE_READY'
+          assert report['findings'] == []
+          assert report['receipt_mode'] is True
+          assert report['source']['head']
+          assert report['source']['tree']
+          assert report['receipt']['path'] == (
+              'artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json'
+          )
+          PY
+
+      - name: Run complete V2 recovery and receipt proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          .bootstrap-proof-venv/bin/python -m pytest -q \
+            tests/bootstrap/test_self_healing_bootstrap_v2.py \
+            tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py \
+            tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py
+
+      - name: Emit exact joined V2 candidate receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          .bootstrap-proof-venv/bin/python \
+            scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py \
+            --root . \
+            --base-receipt artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json \
+            --proof-suite-result PASS \
+            --output artifacts/bootstrap/hermes-self-healing-bootstrap-v2-candidate.json
+          .bootstrap-proof-venv/bin/python - <<'PY'
+          import json
+          from pathlib import Path
+
+          receipt = json.loads(
+              Path('artifacts/bootstrap/hermes-self-healing-bootstrap-v2-candidate.json')
+              .read_text(encoding='utf-8')
+          )
+          assert receipt['canonical'] is False
+          assert receipt['state'] == 'HERMES_SELF_HEALING_BOOTSTRAP_V2_CANDIDATE'
+          assert receipt['source_subject'] == {
+              'commit': '518c00b34eb2df7f550a0791bb9c5b657ec38071',
+              'tree': '7975b8563ca7d3a58a237cab9bdfc8329c19c408',
+          }
+          assert receipt['base_closure']['result_state'] == (
+              'HERMES_BOOTSTRAP_CLOSURE_READY'
+          )
+          assert receipt['base_closure']['dependency_count'] == 18
+          assert receipt['recovery_proof']['result'] == 'PASS'
+          assert receipt['recovery_proof']['base_v1_closure'] == 'PASS'
+          assert receipt['publication']['candidate_artifact_only'] is True
+          assert receipt['publication']['requires_protected_commit_check_readback'] is True
+          assert receipt['publication']['requires_exact_artifact_member_verification'] is True
+          assert receipt['publication']['requires_strict_descendant_receipt_pr'] is True
+          PY
+
+      - name: Diff hygiene
+        shell: bash
+        run: git diff --check
+
+      - name: Upload one exact candidate receipt member
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-self-healing-bootstrap-v2-candidate
+          path: artifacts/bootstrap/hermes-self-healing-bootstrap-v2-candidate.json
+          if-no-files-found: error
+          retention-days: 30
