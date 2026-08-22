@@ -80,7 +80,8 @@ VENV=""
 VENV_PROVENANCE=""
 EXPLICIT_RECEIPT_VENV=0
 CANDIDATES=()
-if [[ "$RUNNER_MODE" == "receipt" && "${HERMES_RECEIPT_VENV+x}" == "x" ]]; then
+if [[ "$RUNNER_MODE" == "receipt" ]]; then
+  HERMES_RECEIPT_VENV="${HERMES_RECEIPT_VENV-$REPO_ROOT/.venv}"
   # The repair-first wrapper has already validated and rebuilt this exact
   # checkout-local environment. It must outrank any stale developer .venv.
   if [[ -z "$HERMES_RECEIPT_VENV" ]]; then
@@ -116,10 +117,56 @@ if [[ "$RUNNER_MODE" == "receipt" && "${HERMES_RECEIPT_VENV+x}" == "x" ]]; then
       exit 1
       ;;
   esac
-  if [[ -L "${HERMES_RECEIPT_VENV%/}" ]]; then
-    echo "error: explicit receipt virtualenv cannot be a symlink: $HERMES_RECEIPT_VENV" >&2
+  if [[ -z "${HERMES_BOOTSTRAP_TRUSTED_PYTHON:-}" || ! -x "$HERMES_BOOTSTRAP_TRUSTED_PYTHON" ]]; then
+    echo "error: receipt mode requires the wrapper-selected trusted Python" >&2
     exit 1
   fi
+  "$HERMES_BOOTSTRAP_TRUSTED_PYTHON" -I -S - "$ROOT_REAL" "$HERMES_RECEIPT_VENV" <<'PY'
+import os, stat, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve(strict=True)
+venv = Path(sys.argv[2])
+allowed = {root / ".venv", root / ".bootstrap-proof-venv"}
+if venv not in allowed:
+    raise SystemExit("error: explicit receipt virtualenv is not admitted")
+for path, kind in ((venv, "venv"), (venv / "bin", "bin")):
+    observed = os.lstat(path)
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISDIR(observed.st_mode):
+        raise SystemExit(f"error: explicit receipt virtualenv {kind} is unsafe")
+for path, kind in ((venv / "bin" / "activate", "activate"), (venv / "pyvenv.cfg", "pyvenv.cfg")):
+    observed = os.lstat(path)
+    if stat.S_ISLNK(observed.st_mode) or not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1:
+        raise SystemExit(f"error: explicit receipt virtualenv {kind} is unsafe")
+python = venv / "bin" / "python"
+observed = os.lstat(python)
+if not (stat.S_ISREG(observed.st_mode) or stat.S_ISLNK(observed.st_mode)):
+    raise SystemExit("error: explicit receipt virtualenv interpreter is unsafe")
+resolved = python.resolve(strict=True)
+try:
+    resolved.relative_to(venv)
+    admitted = True
+except ValueError:
+    admitted = False
+fields = {}
+for line in (venv / "pyvenv.cfg").read_text(encoding="utf-8").splitlines():
+    if "=" in line:
+        key, value = line.split("=", 1)
+        fields[key.strip()] = value.strip()
+recorded = fields.get("executable")
+home = fields.get("home")
+if recorded:
+    try:
+        admitted = admitted or (Path(recorded).resolve(strict=True) == resolved)
+    except OSError:
+        pass
+if home:
+    try:
+        admitted = admitted or (Path(home).resolve(strict=True) == resolved.parent)
+    except OSError:
+        pass
+if not admitted:
+    raise SystemExit("error: explicit receipt virtualenv interpreter provenance is unsafe")
+PY
   HERMES_RECEIPT_VENV="$VENV_REAL"
   CANDIDATES+=("$VENV_REAL")
   EXPLICIT_RECEIPT_VENV=1
@@ -175,7 +222,7 @@ if [[ "$RUNNER_MODE" == "receipt" ]]; then
   RECEIPT_HOME="$(mktemp -d)"
   trap 'rm -rf -- "$RECEIPT_HOME"' EXIT
   receipt_args=(
-    --root "$REPO_ROOT"
+    --root "$ROOT_REAL"
     --receipt-venv "$VENV"
   )
   if [[ -n "${HERMES_BOOTSTRAP_RECEIPT_OUT:-}" ]]; then

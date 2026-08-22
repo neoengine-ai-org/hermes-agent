@@ -73,6 +73,11 @@
       "path": "scripts/hermes_progress.py"
     },
     {
+      "dependency_id": "bootstrap-stage0",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "scripts/bootstrap_stage0_v2.py"
+    },
+    {
       "dependency_id": "test-runner",
       "dependency_class": "ORG_NATIVE_BOOTSTRAP",
       "path": "scripts/run_tests.sh"

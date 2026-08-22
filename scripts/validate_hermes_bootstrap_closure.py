@@ -43,6 +43,7 @@ EXPECTED_ARTIFACTS = (
     ("package-metadata", "pyproject.toml"),
     ("agent-entrypoint", "run_agent.py"),
     ("progress-entrypoint", "scripts/hermes_progress.py"),
+    ("bootstrap-stage0", "scripts/bootstrap_stage0_v2.py"),
     ("test-runner", "scripts/run_tests.sh"),
     ("test-runner-v1", "scripts/run_tests_v1.sh"),
     ("parallel-test-runner", "scripts/run_tests_parallel.py"),
@@ -295,12 +296,15 @@ def interpreter_provenance(
                 {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
                 _finding("SHARED_VENV", "explicit receipt venv is not in the protected allowlist", str(requested)),
             )
-        allowed_roots = [requested]
+        allowed_roots = [requested_resolved]
     for allowed in allowed_roots:
-        try:
-            allowed_resolved = allowed.resolve(strict=True)
-        except OSError:
-            continue
+        if receipt_venv is not None:
+            allowed_resolved = requested_resolved
+        else:
+            try:
+                allowed_resolved = allowed.resolve(strict=True)
+            except OSError:
+                continue
         if executable_venv != allowed_resolved:
             continue
         try:
@@ -499,6 +503,17 @@ def validate(
                         )
                     )
                     continue
+            _blob_sha, head_bytes = _head_blob(root, relative)
+            worktree_bytes = artifact.read_bytes()
+            if worktree_bytes != head_bytes:
+                findings.append(
+                    _finding(
+                        "ARTIFACT_HEAD_MISMATCH",
+                        "protected artifact bytes differ from the attested HEAD blob",
+                        relative,
+                    )
+                )
+                continue
             artifacts.append(
                 {
                     "dependency_id": dependency_id,
