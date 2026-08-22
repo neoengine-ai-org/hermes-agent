@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 
-import pytest
+import pytest  # type: ignore[unresolved-import]
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,17 +33,32 @@ def environment():
     }
 
 
-def test_candidate_receipt_binds_protected_source_policy_and_proof():
+def current_subject() -> tuple[str, str]:
+    return (
+        MODULE.git(ROOT, "rev-parse", "HEAD"),
+        MODULE.git(ROOT, "rev-parse", "HEAD^{tree}"),
+    )
+
+
+def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
+    # Repository-wide test shards intentionally use a depth-1 PR merge checkout.
+    # Use the current exact commit as the unit-test source so this test validates
+    # receipt shape and policy binding without pretending the protected source
+    # object exists locally. The dedicated receipt workflow uses fetch-depth: 0
+    # and the compiler defaults, proving the real protected source and tree.
+    source_subject, source_tree = current_subject()
     receipt = MODULE.build_receipt(
         root=ROOT,
         environment=environment(),
         proof_suite_result="PASS",
+        source_subject=source_subject,
+        expected_source_tree=source_tree,
     )
     assert receipt["state"] == "HERMES_SELF_HEALING_BOOTSTRAP_V2_CANDIDATE"
     assert receipt["canonical"] is False
     assert receipt["source_subject"] == {
-        "commit": MODULE.SOURCE_SUBJECT,
-        "tree": MODULE.SOURCE_TREE,
+        "commit": source_subject,
+        "tree": source_tree,
     }
     assert receipt["source_under_test"]["strict_descendant_or_subject"] is True
     assert receipt["policy"]["shared_home_authority_allowed"] is False
@@ -55,6 +70,14 @@ def test_candidate_receipt_binds_protected_source_policy_and_proof():
     assert receipt["recovery_proof"]["exactly_one_retry"] == "PASS"
     assert receipt["publication"]["candidate_artifact_only"] is True
     assert receipt["publication"]["requires_strict_descendant_receipt_pr"] is True
+
+
+def test_protected_source_constants_are_exact():
+    assert MODULE.SOURCE_SUBJECT == "518c00b34eb2df7f550a0791bb9c5b657ec38071"
+    assert MODULE.SOURCE_TREE == "7975b8563ca7d3a58a237cab9bdfc8329c19c408"
+    assert MODULE.WORKFLOW_PATH == (
+        ".github/workflows/self-healing-bootstrap-v2-receipt.yml"
+    )
 
 
 def test_policy_refuses_manifest_supplied_operation_command():
@@ -82,24 +105,36 @@ def test_policy_pin_mismatch_fails_closed():
         )
 
 
-def test_wrong_or_unrelated_source_subject_fails_closed():
+def test_wrong_or_unavailable_source_subject_fails_closed():
+    source_subject, source_tree = current_subject()
     with pytest.raises(ValueError, match="source subject"):
         MODULE.build_receipt(
             root=ROOT,
             environment=environment(),
             proof_suite_result="PASS",
             source_subject="not-a-commit",
+            expected_source_tree=source_tree,
         )
-    with pytest.raises(ValueError, match="not an ancestor"):
+    with pytest.raises(ValueError, match="unavailable|not an ancestor"):
         MODULE.build_receipt(
             root=ROOT,
             environment=environment(),
             proof_suite_result="PASS",
             source_subject="f" * 40,
+            expected_source_tree=source_tree,
+        )
+    with pytest.raises(ValueError, match="tree differs"):
+        MODULE.build_receipt(
+            root=ROOT,
+            environment=environment(),
+            proof_suite_result="PASS",
+            source_subject=source_subject,
+            expected_source_tree="f" * 40,
         )
 
 
-def test_workflow_identity_and_pass_result_are_mandatory():
+def test_workflow_identity_and_pass_result_are_mandatory_before_history_probe():
+    source_subject, source_tree = current_subject()
     invalid = environment()
     invalid["GITHUB_SHA"] = "a" * 40
     with pytest.raises(ValueError, match="workflow or proof-suite"):
@@ -107,10 +142,14 @@ def test_workflow_identity_and_pass_result_are_mandatory():
             root=ROOT,
             environment=invalid,
             proof_suite_result="PASS",
+            source_subject=source_subject,
+            expected_source_tree=source_tree,
         )
     with pytest.raises(ValueError, match="workflow or proof-suite"):
         MODULE.build_receipt(
             root=ROOT,
             environment=environment(),
             proof_suite_result="FAIL",
+            source_subject=source_subject,
+            expected_source_tree=source_tree,
         )
