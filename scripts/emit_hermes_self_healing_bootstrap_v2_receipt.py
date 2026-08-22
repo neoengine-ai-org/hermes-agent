@@ -20,8 +20,34 @@ SOURCE_SUBJECT = "518c00b34eb2df7f550a0791bb9c5b657ec38071"
 SOURCE_TREE = "7975b8563ca7d3a58a237cab9bdfc8329c19c408"
 POLICY_REL = Path("config/hermes-bootstrap-acquisition-v2.json")
 PIN_REL = Path("config/hermes-bootstrap-acquisition-v2.sha256")
+BASE_MANIFEST_REL = Path("config/hermes-bootstrap-closure-v1.json")
+BASE_VALIDATOR_REL = Path("scripts/validate_hermes_bootstrap_closure.py")
 SHA40 = re.compile(r"^[a-f0-9]{40}$")
 SHA64 = re.compile(r"^[a-f0-9]{64}$")
+RECEIPT_ID = re.compile(r"^hermes-bootstrap-[a-f0-9]{20}$")
+BASE_TYPED_OMISSIONS = {
+    "protected_main_live_verification",
+    "ci_run_identity",
+    "independent_exact_head_review",
+}
+BASE_DEPENDENCIES = {
+    "ci-admission": ".github/workflows/tests.yml",
+    "agent-instructions": "AGENTS.md",
+    "readme": "README.md",
+    "acp-entrypoint": "acp_adapter/entry.py",
+    "bootstrap-manifest": "config/hermes-bootstrap-closure-v1.json",
+    "windows-bootstrap": "hermes_bootstrap.py",
+    "path-constants": "hermes_constants.py",
+    "cli-entrypoint": "hermes_cli/main.py",
+    "package-metadata": "pyproject.toml",
+    "agent-entrypoint": "run_agent.py",
+    "progress-entrypoint": "scripts/hermes_progress.py",
+    "test-runner": "scripts/run_tests.sh",
+    "parallel-test-runner": "scripts/run_tests_parallel.py",
+    "bootstrap-validator": "scripts/validate_hermes_bootstrap_closure.py",
+    "hostile-tests": "tests/bootstrap/test_bootstrap_closure.py",
+    "lockfile": "uv.lock",
+}
 
 
 def git(root: Path, *arguments: str, check: bool = True) -> str:
@@ -36,6 +62,17 @@ def git(root: Path, *arguments: str, check: bool = True) -> str:
     return completed.stdout.strip()
 
 
+def git_bytes(root: Path, *arguments: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        raise ValueError(completed.stderr.decode("utf-8", errors="replace").strip() or "git command failed")
+    return completed.stdout
+
+
 def git_returncode(root: Path, *arguments: str) -> int:
     return subprocess.run(
         ["git", "-C", str(root), *arguments],
@@ -47,6 +84,18 @@ def git_returncode(root: Path, *arguments: str) -> int:
 
 def sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def canonical_digest(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def head_blob(root: Path, relative: str) -> tuple[str, bytes]:
+    blob_sha = git(root, "rev-parse", f"HEAD:{relative}")
+    if not SHA40.fullmatch(blob_sha):
+        raise ValueError(f"HEAD blob identity is invalid: {relative}")
+    return blob_sha, git_bytes(root, "cat-file", "blob", blob_sha)
 
 
 def validate_policy(
@@ -126,11 +175,113 @@ def validate_source_ancestry(
     return subject_tree
 
 
+def validate_base_receipt(
+    *,
+    root: Path,
+    receipt: dict[str, Any],
+    head: str,
+    tree: str,
+) -> dict[str, Any]:
+    if receipt.get("schema_version") != "hermes.bootstrap-closure-receipt/1.0":
+        raise ValueError("base receipt schema differs")
+    if receipt.get("emitter_repository") != {
+        "full_name": REPOSITORY,
+        "default_branch": "main",
+    }:
+        raise ValueError("base receipt repository differs")
+    source = receipt.get("source")
+    if not isinstance(source, dict) or source.get("head") != head or source.get("tree") != tree:
+        raise ValueError("base receipt source differs from the exact checkout")
+    current_lock_digest = sha256((root / "uv.lock").read_bytes())
+    if source.get("lock_sha256") != current_lock_digest:
+        raise ValueError("base receipt lock digest differs")
+    if receipt.get("result_state") != "HERMES_BOOTSTRAP_CLOSURE_READY":
+        raise ValueError("base receipt is not ready")
+    if receipt.get("coverage") != "candidate_checkout":
+        raise ValueError("base receipt coverage differs")
+    if set(receipt.get("typed_omissions", [])) != BASE_TYPED_OMISSIONS:
+        raise ValueError("base receipt typed omissions differ")
+
+    manifest = receipt.get("manifest")
+    validator = receipt.get("validator")
+    for label, row, relative in (
+        ("manifest", manifest, BASE_MANIFEST_REL.as_posix()),
+        ("validator", validator, BASE_VALIDATOR_REL.as_posix()),
+    ):
+        if not isinstance(row, dict) or row.get("path") != relative:
+            raise ValueError(f"base receipt {label} path differs")
+        blob_sha, blob = head_blob(root, relative)
+        if row.get("blob_sha") != blob_sha or row.get("sha256") != sha256(blob):
+            raise ValueError(f"base receipt {label} provenance differs")
+
+    dependencies = receipt.get("dependencies")
+    if not isinstance(dependencies, list):
+        raise ValueError("base receipt dependencies are missing")
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in dependencies:
+        if not isinstance(item, dict) or not isinstance(item.get("dependency_id"), str):
+            raise ValueError("base receipt dependency is malformed")
+        dependency_id = item["dependency_id"]
+        if dependency_id in by_id:
+            raise ValueError("base receipt dependency ID is duplicated")
+        by_id[dependency_id] = item
+    if set(by_id) != set(BASE_DEPENDENCIES):
+        raise ValueError("base receipt dependency surface differs")
+    for dependency_id, relative in BASE_DEPENDENCIES.items():
+        item = by_id[dependency_id]
+        blob_sha, blob = head_blob(root, relative)
+        if (
+            item.get("canonical_path_or_provider") != relative
+            or item.get("dependency_class") != "ORG_NATIVE_BOOTSTRAP"
+            or item.get("local_required") is not True
+            or item.get("status") != "READY"
+            or item.get("blob_sha") != blob_sha
+            or item.get("digest") != sha256(blob)
+        ):
+            raise ValueError(f"base receipt dependency provenance differs: {dependency_id}")
+
+    receipt_id = receipt.get("receipt_id")
+    payload_digest = receipt.get("canonical_payload_digest")
+    if not isinstance(receipt_id, str) or not RECEIPT_ID.fullmatch(receipt_id):
+        raise ValueError("base receipt ID is invalid")
+    if not isinstance(payload_digest, str) or not SHA64.fullmatch(payload_digest):
+        raise ValueError("base receipt payload digest is invalid")
+    payload = {
+        key: value
+        for key, value in receipt.items()
+        if key not in {"receipt_id", "canonical_payload_digest"}
+    }
+    observed_digest = canonical_digest(payload)
+    if observed_digest != payload_digest or receipt_id != f"hermes-bootstrap-{payload_digest[:20]}":
+        raise ValueError("base receipt canonical digest differs")
+
+    return {
+        "receipt_id": receipt_id,
+        "canonical_payload_digest": payload_digest,
+        "source": {"head": head, "tree": tree, "lock_sha256": current_lock_digest},
+        "manifest": {
+            "path": manifest["path"],
+            "blob_sha": manifest["blob_sha"],
+            "sha256": manifest["sha256"],
+        },
+        "validator": {
+            "path": validator["path"],
+            "blob_sha": validator["blob_sha"],
+            "sha256": validator["sha256"],
+            "version": validator.get("version"),
+        },
+        "dependency_count": len(BASE_DEPENDENCIES),
+        "result_state": receipt["result_state"],
+        "typed_omissions": sorted(BASE_TYPED_OMISSIONS),
+    }
+
+
 def build_receipt(
     *,
     root: Path,
     environment: dict[str, str],
     proof_suite_result: str,
+    base_receipt: dict[str, Any],
     source_subject: str = SOURCE_SUBJECT,
     expected_source_tree: str = SOURCE_TREE,
 ) -> dict[str, Any]:
@@ -138,10 +289,6 @@ def build_receipt(
     head = git(root, "rev-parse", "HEAD")
     tree = git(root, "rev-parse", "HEAD^{tree}")
 
-    # Validate the workflow before Git-history inspection so a forged run identity
-    # cannot be obscured by a shallow checkout. Unit tests may use the current
-    # commit as their synthetic source; the dedicated full-history workflow uses
-    # the protected SOURCE_SUBJECT/SOURCE_TREE defaults and is receipt-grade.
     run_id, run_attempt = validate_workflow_identity(
         environment=environment,
         head=head,
@@ -152,6 +299,12 @@ def build_receipt(
         head=head,
         source_subject=source_subject,
         expected_source_tree=expected_source_tree,
+    )
+    base_closure = validate_base_receipt(
+        root=root,
+        receipt=base_receipt,
+        head=head,
+        tree=tree,
     )
 
     policy_bytes = (root / POLICY_REL).read_bytes()
@@ -188,6 +341,7 @@ def build_receipt(
             "tree": tree,
             "strict_descendant_or_subject": True,
         },
+        "base_closure": base_closure,
         "policy": {
             "path": POLICY_REL.as_posix(),
             "sha256": validated["sha256"],
@@ -207,7 +361,9 @@ def build_receipt(
             "corrupt_fingerprinted_environment_rebuilt_once": "PASS",
             "exactly_one_retry": "PASS",
             "fixed_operation_no_manifest_argv": "PASS",
+            "base_v1_closure": "PASS",
             "proof_suites": [
+                "tests/bootstrap/test_bootstrap_closure.py",
                 "tests/bootstrap/test_self_healing_bootstrap_v2.py",
                 "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py",
                 "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py",
@@ -228,6 +384,8 @@ def build_receipt(
             "candidate_artifact_only": True,
             "canonical_path": "evidence/bootstrap-closure/receipt-v1.json",
             "requires_protected_main_push": True,
+            "requires_protected_commit_check_readback": True,
+            "requires_exact_artifact_member_verification": True,
             "requires_strict_descendant_receipt_pr": True,
         },
         "non_claims": [
@@ -238,6 +396,7 @@ def build_receipt(
             "no customer-data finance science brokerage capital or trading authority",
             "no branch-protection review or merge bypass",
             "candidate artifact is not the canonical product receipt",
+            "protected-main check-run and exact archive-member verification remain publication gates",
         ],
     }
 
@@ -245,13 +404,18 @@ def build_receipt(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=".", type=Path)
+    parser.add_argument("--base-receipt", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--proof-suite-result", required=True, choices=("PASS",))
     args = parser.parse_args()
+    base_receipt = json.loads(args.base_receipt.read_text(encoding="utf-8"))
+    if not isinstance(base_receipt, dict):
+        raise SystemExit("base receipt must be a JSON object")
     receipt = build_receipt(
         root=args.root,
         environment=dict(os.environ),
         proof_suite_result=args.proof_suite_result,
+        base_receipt=base_receipt,
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
