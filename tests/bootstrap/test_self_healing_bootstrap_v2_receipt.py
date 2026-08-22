@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sys
 
-import pytest  # type: ignore[unresolved-import]
+import pytest  # ty: ignore[unresolved-import]
 
 
 ROOT = Path(__file__).resolve().parents[2]
