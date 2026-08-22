@@ -43,7 +43,9 @@ EXPECTED_ARTIFACTS = (
     ("package-metadata", "pyproject.toml"),
     ("agent-entrypoint", "run_agent.py"),
     ("progress-entrypoint", "scripts/hermes_progress.py"),
+    ("bootstrap-stage0", "scripts/bootstrap_stage0_v2.py"),
     ("test-runner", "scripts/run_tests.sh"),
+    ("test-runner-v1", "scripts/run_tests_v1.sh"),
     ("parallel-test-runner", "scripts/run_tests_parallel.py"),
     ("bootstrap-validator", VALIDATOR_PATH.as_posix()),
     ("hostile-tests", "tests/bootstrap/test_bootstrap_closure.py"),
@@ -276,18 +278,38 @@ def interpreter_provenance(
         requested = receipt_venv if receipt_venv.is_absolute() else root / receipt_venv
         requested = Path(os.path.abspath(requested))
         try:
-            requested.resolve(strict=True).relative_to(root)
+            requested_resolved = requested.resolve(strict=True)
+            requested_resolved.relative_to(root)
         except (OSError, ValueError):
             return (
                 {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
                 _finding("SHARED_VENV", "explicit receipt venv escapes the checkout", str(requested)),
             )
-        allowed_roots.append(requested)
+        accepted_resolved = set()
+        for allowed in allowed_roots:
+            try:
+                accepted_resolved.add(allowed.resolve(strict=True))
+            except OSError:
+                continue
+        if requested_resolved not in accepted_resolved:
+            return (
+                {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
+                _finding("SHARED_VENV", "explicit receipt venv is not in the protected allowlist", str(requested)),
+            )
+        if requested.is_symlink():
+            return (
+                {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
+                _finding("SHARED_VENV", "explicit receipt venv cannot be a symlink", str(requested)),
+            )
+        allowed_roots = [requested_resolved]
     for allowed in allowed_roots:
-        try:
-            allowed_resolved = allowed.resolve(strict=True)
-        except OSError:
-            continue
+        if receipt_venv is not None:
+            allowed_resolved = requested_resolved
+        else:
+            try:
+                allowed_resolved = allowed.resolve(strict=True)
+            except OSError:
+                continue
         if executable_venv != allowed_resolved:
             continue
         try:
@@ -474,6 +496,39 @@ def validate(
                 findings.append(error)
                 continue
             assert artifact is not None
+            try:
+                _blob_sha, head_bytes = _head_blob(root, relative)
+            except (OSError, subprocess.CalledProcessError):
+                findings.append(
+                    _finding(
+                        "ARTIFACT_HEAD_MISSING",
+                        "protected artifact is absent from the attested HEAD",
+                        relative,
+                    )
+                )
+                continue
+            if relative in {"scripts/run_tests.sh", "scripts/run_tests_v1.sh"}:
+                tree_entry = _git(root, "ls-tree", "-z", "HEAD", "--", relative).stdout
+                head_mode = tree_entry.split(maxsplit=1)[0] if tree_entry else ""
+                if head_mode != "100755":
+                    findings.append(
+                        _finding(
+                            "ARTIFACT_MODE",
+                            "test runner must have executable mode 100755 in the attested HEAD tree",
+                            relative,
+                        )
+                    )
+                    continue
+            worktree_bytes = artifact.read_bytes()
+            if worktree_bytes != head_bytes:
+                findings.append(
+                    _finding(
+                        "ARTIFACT_HEAD_MISMATCH",
+                        "protected artifact bytes differ from the attested HEAD blob",
+                        relative,
+                    )
+                )
+                continue
             artifacts.append(
                 {
                     "dependency_id": dependency_id,
