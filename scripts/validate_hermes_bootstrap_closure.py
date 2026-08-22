@@ -296,6 +296,11 @@ def interpreter_provenance(
                 {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
                 _finding("SHARED_VENV", "explicit receipt venv is not in the protected allowlist", str(requested)),
             )
+        if requested.is_symlink():
+            return (
+                {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
+                _finding("SHARED_VENV", "explicit receipt venv cannot be a symlink", str(requested)),
+            )
         allowed_roots = [requested_resolved]
     for allowed in allowed_roots:
         if receipt_venv is not None:
@@ -491,19 +496,29 @@ def validate(
                 findings.append(error)
                 continue
             assert artifact is not None
+            try:
+                _blob_sha, head_bytes = _head_blob(root, relative)
+            except (OSError, subprocess.CalledProcessError):
+                findings.append(
+                    _finding(
+                        "ARTIFACT_HEAD_MISSING",
+                        "protected artifact is absent from the attested HEAD",
+                        relative,
+                    )
+                )
+                continue
             if relative in {"scripts/run_tests.sh", "scripts/run_tests_v1.sh"}:
-                index_entry = _git(root, "ls-files", "-s", "--", relative).stdout.strip()
-                index_mode = index_entry.split(maxsplit=1)[0] if index_entry else ""
-                if index_mode != "100755":
+                tree_entry = _git(root, "ls-tree", "-z", "HEAD", "--", relative).stdout
+                head_mode = tree_entry.split(maxsplit=1)[0] if tree_entry else ""
+                if head_mode != "100755":
                     findings.append(
                         _finding(
                             "ARTIFACT_MODE",
-                            "test runner must have executable mode 100755 in the Git index",
+                            "test runner must have executable mode 100755 in the attested HEAD tree",
                             relative,
                         )
                     )
                     continue
-            _blob_sha, head_bytes = _head_blob(root, relative)
             worktree_bytes = artifact.read_bytes()
             if worktree_bytes != head_bytes:
                 findings.append(

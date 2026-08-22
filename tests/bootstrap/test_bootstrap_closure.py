@@ -195,6 +195,21 @@ def test_explicit_receipt_venv_must_be_in_protected_allowlist(checkout: Path) ->
     assert finding["code"] == "SHARED_VENV"
 
 
+def test_explicit_receipt_venv_lexical_symlink_is_refused(checkout: Path) -> None:
+    selected = checkout / "node_modules" / ".evil-venv"
+    _fake_venv(selected)
+    alias = checkout / ".venv"
+    alias.symlink_to(selected, target_is_directory=True)
+    provenance, finding = closure.interpreter_provenance(
+        checkout,
+        alias / "bin" / "python",
+        receipt_venv=alias,
+    )
+    assert provenance["classification"] == "ASSEMBLED_WORKSPACE_ONLY"
+    assert finding is not None
+    assert finding["code"] == "SHARED_VENV"
+
+
 def test_runner_mode_is_bound_to_attested_git_index(checkout: Path) -> None:
     runner = checkout / "scripts" / "run_tests_v1.sh"
     _git(checkout, "update-index", "--chmod=-x", "scripts/run_tests_v1.sh")
@@ -337,8 +352,50 @@ def _fake_venv(path: Path) -> None:
     (bin_dir / "activate").write_text("# test fixture\n", encoding="utf-8")
     (path / "pyvenv.cfg").write_text("home = test\n", encoding="utf-8")
     wrapper = bin_dir / "python"
-    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
-    wrapper.chmod(0o755)
+    wrapper.symlink_to(Path(sys.executable).resolve())
+
+
+def _wrapper_trusted_python() -> Path:
+    """Resolve the same policy-fixed 3.11 runtime the wrapper anchors trust to.
+
+    Receipt mode runs this suite under an isolated HOME, and ``uv python find``
+    discovers managed runtimes beneath HOME. Under receipt mode the running
+    interpreter already *is* the admitted 3.11 runtime, so prefer it and only
+    shell out to uv for developer-mode runs.
+    """
+    running = Path(sys.executable).resolve(strict=True)
+    if sys.version_info[:2] == (3, 11):
+        return running
+    located = subprocess.run(
+        ["uv", "python", "find", "3.11"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return Path(located).resolve(strict=True)
+
+
+def _uv_python_store_env() -> dict[str, str]:
+    """Keep uv's managed-interpreter store reachable when a test relocates HOME.
+
+    ``uv python find`` discovers managed runtimes under ``$HOME``. Tests that
+    substitute a hostile developer HOME must still let the wrapper resolve the
+    policy-fixed 3.11 runtime, or they assert on a lookup failure instead of on
+    the isolation behaviour they are meant to cover.
+    """
+    existing = os.environ.get("UV_PYTHON_INSTALL_DIR")
+    if existing:
+        return {"UV_PYTHON_INSTALL_DIR": existing}
+    trusted = _wrapper_trusted_python()
+    if len(trusted.parents) < 3:
+        return {}
+    return {"UV_PYTHON_INSTALL_DIR": str(trusted.parents[2])}
+
+
+def _fake_wrapper_receipt_venv(path: Path) -> None:
+    _fake_venv(path)
+    (path / "bin" / "python").unlink()
+    (path / "bin" / "python").symlink_to(_wrapper_trusted_python())
 
 
 def _runner_fixture(tmp_path: Path) -> Path:
@@ -398,14 +455,18 @@ def test_wrapper_zero_arg_invocation_is_bash_3_compatible(tmp_path: Path) -> Non
 def test_runner_receipt_mode_uses_isolated_home_and_no_home_plugin(tmp_path: Path) -> None:
     root = _runner_fixture(tmp_path)
     _fake_venv(root / ".venv")
-    _fake_venv(root / ".bootstrap-proof-venv")
+    _fake_wrapper_receipt_venv(root / ".bootstrap-proof-venv")
     home = tmp_path / "developer-home"
     plugin = home / ".hermes" / "pytest_live_guard.py"
     plugin.parent.mkdir(parents=True, exist_ok=True)
     plugin.write_text("# test fixture\n", encoding="utf-8")
     result = subprocess.run(
         [str(root / "scripts" / "run_tests.sh"), "--receipt-mode"],
-        env={**{key: value for key, value in os.environ.items() if key != "HERMES_RECEIPT_VENV"}, "HOME": str(home)},
+        env={
+            **{key: value for key, value in os.environ.items() if key != "HERMES_RECEIPT_VENV"},
+            "HOME": str(home),
+            **_uv_python_store_env(),
+        },
         capture_output=True,
         text=True,
         check=False,
@@ -466,6 +527,9 @@ def test_v1_runner_refuses_nonallowlisted_interpreter_before_execution(
     selected = root / "node_modules" / ".cache" / "pip-build"
     _fake_venv(selected)
     marker = root / "hostile-interpreter-ran"
+    # Never write through the fixture symlink: its target is the real host
+    # interpreter. Replace the link with a checkout-local hostile payload.
+    (selected / "bin" / "python").unlink()
     (selected / "bin" / "python").write_text(
         f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8"
     )
@@ -511,6 +575,48 @@ def test_wrapper_receipt_mode_refuses_empty_explicit_venv(tmp_path: Path) -> Non
     )
     assert result.returncode == 2
     assert "Hermes bootstrap venv is empty" in result.stderr
+    assert result.stdout == ""
+
+
+def test_wrapper_receipt_mode_diagnoses_absent_uv(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    _fake_wrapper_receipt_venv(root / ".bootstrap-proof-venv")
+    stub_path = tmp_path / "no-uv-bin"
+    stub_path.mkdir()
+    assert shutil.which("uv", path=f"{stub_path}:/usr/bin:/bin") is None
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests.sh"), "--receipt-mode"],
+        env={"PATH": f"{stub_path}:/usr/bin:/bin", "HOME": str(tmp_path / "home")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "requires uv to resolve the admitted Python 3.11 runtime" in result.stderr
+    assert result.stdout == ""
+
+
+def test_wrapper_receipt_mode_diagnoses_unresolvable_policy_python(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    _fake_wrapper_receipt_venv(root / ".bootstrap-proof-venv")
+    stub_path = tmp_path / "failing-uv-bin"
+    stub_path.mkdir()
+    stub = stub_path / "uv"
+    stub.write_text(
+        "#!/bin/sh\necho 'error: No interpreter found for Python 3.11' >&2\nexit 2\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests.sh"), "--receipt-mode"],
+        env={"PATH": f"{stub_path}:/usr/bin:/bin", "HOME": str(tmp_path / "home")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "cannot resolve the admitted Python 3.11 runtime" in result.stderr
+    assert "No interpreter found for Python 3.11" in result.stderr
     assert result.stdout == ""
 
 
@@ -569,7 +675,69 @@ def test_runner_refuses_hostile_python_inside_admitted_venv(tmp_path: Path) -> N
     assert not marker.exists()
 
 
-def test_runner_unset_receipt_selection_cannot_follow_dot_venv_escape(tmp_path: Path) -> None:
+def test_runner_refuses_internal_payload_and_forged_pyvenv_provenance(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    selected = root / ".bootstrap-proof-venv"
+    _fake_venv(selected)
+    marker = tmp_path / "internal-hostile-ran"
+    payload = selected / "bin" / "python-payload"
+    payload.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8")
+    payload.chmod(0o755)
+    (selected / "bin" / "python").unlink()
+    (selected / "bin" / "python").symlink_to(payload)
+    (selected / "pyvenv.cfg").write_text(f"executable = {payload}\nhome = {payload.parent}\n", encoding="utf-8")
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": sys.executable},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "interpreter provenance is unsafe" in result.stderr
+    assert not marker.exists()
+
+
+def test_runner_refuses_forged_trusted_python_without_launching_candidate(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    selected = root / ".bootstrap-proof-venv"
+    _fake_venv(selected)
+    marker = tmp_path / "candidate-ran"
+    (selected / "bin" / "python").unlink()
+    (selected / "bin" / "python").write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 0\n", encoding="utf-8")
+    (selected / "bin" / "python").chmod(0o755)
+    result = subprocess.run(
+        [str(root / "scripts" / "run_tests_v1.sh"), "--receipt-mode"],
+        env={**os.environ, "HERMES_RECEIPT_VENV": str(selected), "HERMES_BOOTSTRAP_TRUSTED_PYTHON": "/usr/bin/true"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "did not verify" in result.stderr
+    assert not marker.exists()
+
+
+def test_wrapper_receipt_mode_accepts_symlinked_checkout_alias(tmp_path: Path) -> None:
+    root = _runner_fixture(tmp_path)
+    _fake_wrapper_receipt_venv(root / ".bootstrap-proof-venv")
+    alias = tmp_path / "runner-alias"
+    alias.symlink_to(root, target_is_directory=True)
+    result = subprocess.run(
+        [str(alias / "scripts" / "run_tests.sh"), "--receipt-mode"],
+        env={
+            **{key: value for key, value in os.environ.items() if key != "HERMES_RECEIPT_VENV"},
+            **_uv_python_store_env(),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "interpreter_provenance=explicit-receipt-venv" in result.stdout
+
+
+def test_runner_default_receipt_selection_ignores_dot_venv_escape(tmp_path: Path) -> None:
     root = _runner_fixture(tmp_path)
     outside = tmp_path / "outside-default-venv"
     _fake_venv(outside)
@@ -584,4 +752,4 @@ def test_runner_unset_receipt_selection_cannot_follow_dot_venv_escape(tmp_path: 
         check=False,
     )
     assert result.returncode != 0
-    assert "escapes the repository" in result.stderr
+    assert "missing or incomplete" in result.stderr
