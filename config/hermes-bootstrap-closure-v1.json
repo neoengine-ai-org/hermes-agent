@@ -78,6 +78,11 @@
       "path": "scripts/run_tests.sh"
     },
     {
+      "dependency_id": "test-runner-v1",
+      "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+      "path": "scripts/run_tests_v1.sh"
+    },
+    {
       "dependency_id": "parallel-test-runner",
       "dependency_class": "ORG_NATIVE_BOOTSTRAP",
       "path": "scripts/run_tests_parallel.py"

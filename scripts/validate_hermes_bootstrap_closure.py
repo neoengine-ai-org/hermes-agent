@@ -44,6 +44,7 @@ EXPECTED_ARTIFACTS = (
     ("agent-entrypoint", "run_agent.py"),
     ("progress-entrypoint", "scripts/hermes_progress.py"),
     ("test-runner", "scripts/run_tests.sh"),
+    ("test-runner-v1", "scripts/run_tests_v1.sh"),
     ("parallel-test-runner", "scripts/run_tests_parallel.py"),
     ("bootstrap-validator", VALIDATOR_PATH.as_posix()),
     ("hostile-tests", "tests/bootstrap/test_bootstrap_closure.py"),
@@ -282,7 +283,18 @@ def interpreter_provenance(
                 {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
                 _finding("SHARED_VENV", "explicit receipt venv escapes the checkout", str(requested)),
             )
-        allowed_roots.append(requested)
+        accepted_resolved = set()
+        for allowed in allowed_roots:
+            try:
+                accepted_resolved.add(allowed.resolve(strict=True))
+            except OSError:
+                continue
+        if requested.resolve(strict=True) not in accepted_resolved:
+            return (
+                {"classification": "ASSEMBLED_WORKSPACE_ONLY", "path": "external-interpreter"},
+                _finding("SHARED_VENV", "explicit receipt venv is not in the protected allowlist", str(requested)),
+            )
+        allowed_roots = [requested]
     for allowed in allowed_roots:
         try:
             allowed_resolved = allowed.resolve(strict=True)
@@ -474,6 +486,9 @@ def validate(
                 findings.append(error)
                 continue
             assert artifact is not None
+            if relative in {"scripts/run_tests.sh", "scripts/run_tests_v1.sh"} and not (os.stat(artifact).st_mode & 0o111):
+                findings.append(_finding("ARTIFACT_MODE", "test runner must be executable", relative))
+                continue
             artifacts.append(
                 {
                     "dependency_id": dependency_id,

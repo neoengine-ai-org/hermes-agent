@@ -10,7 +10,6 @@ for arg in "$@"; do
   if [[ "$arg" == "--receipt-mode" ]]; then
     RECEIPT_MODE=1
     VENV="${HERMES_RECEIPT_VENV:-$REPO_ROOT/.bootstrap-proof-venv}"
-    export HERMES_RECEIPT_VENV="$VENV"
     break
   fi
 done
@@ -20,7 +19,7 @@ case "$VENV" in
     echo "Hermes bootstrap venv escapes the repository: $VENV" >&2
     exit 2
     ;;
-  *) VENV_REL="$VENV" ;;
+  *) VENV_REL="$VENV"; VENV="$REPO_ROOT/$VENV_REL" ;;
 esac
 case "$VENV_REL" in
   .venv|.bootstrap-proof-venv) ;;
@@ -29,6 +28,9 @@ case "$VENV_REL" in
     exit 2
     ;;
 esac
+if [[ "$RECEIPT_MODE" -eq 1 ]]; then
+  export HERMES_RECEIPT_VENV="$VENV"
+fi
 
 # Real repository executions are always repair-first. The V1 hostile test file
 # also builds intentionally minimal non-Git runner fixtures to verify preserved
