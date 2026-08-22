@@ -10,6 +10,10 @@ for arg in "$@"; do
   if [[ "$arg" == "--receipt-mode" ]]; then
     RECEIPT_MODE=1
     VENV="${HERMES_RECEIPT_VENV-$REPO_ROOT/.bootstrap-proof-venv}"
+    if [[ -z "$VENV" ]]; then
+      echo "Hermes bootstrap venv is empty" >&2
+      exit 2
+    fi
     break
   fi
 done
@@ -30,6 +34,19 @@ case "$VENV_REL" in
 esac
 if [[ "$RECEIPT_MODE" -eq 1 ]]; then
   export HERMES_RECEIPT_VENV="$VENV"
+  # Stage-0 materializes the policy-fixed Python 3.11 runtime through uv. Use
+  # the same admitted runtime family as the independent provenance anchor;
+  # the host's unrelated default `python3` may be a different version.
+  if ! command -v uv >/dev/null 2>&1; then
+    echo "Hermes receipt mode requires uv to resolve the admitted Python 3.11 runtime" >&2
+    exit 2
+  fi
+  if ! TRUSTED_PYTHON_COMMAND="$(uv python find 3.11 2>&1)"; then
+    echo "Hermes receipt mode cannot resolve the admitted Python 3.11 runtime: $TRUSTED_PYTHON_COMMAND" >&2
+    exit 2
+  fi
+  HERMES_BOOTSTRAP_TRUSTED_PYTHON="$("$TRUSTED_PYTHON_COMMAND" -I -S -c 'import os,sys; assert sys.implementation.name == "cpython"; print(os.path.realpath(sys.executable))')"
+  export HERMES_BOOTSTRAP_TRUSTED_PYTHON
 fi
 
 # Real repository executions are always repair-first. The V1 hostile test file
@@ -53,4 +70,4 @@ if git -C "$REPO_ROOT" rev-parse --show-toplevel >/dev/null 2>&1; then
   fi
 fi
 
-exec "$SCRIPT_DIR/run_tests_v1.sh" "${MODE_ARGS[@]}"
+exec "$SCRIPT_DIR/run_tests_v1.sh" ${MODE_ARGS[@]+"${MODE_ARGS[@]}"}
