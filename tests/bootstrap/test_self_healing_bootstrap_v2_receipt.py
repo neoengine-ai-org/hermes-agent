@@ -41,6 +41,20 @@ def current_subject() -> tuple[str, str]:
     )
 
 
+def passing_junit(path: Path) -> Path:
+    nodes = sorted(MODULE.JUNIT_BOUND_NODES)
+    cases = "".join(
+        f'<testcase classname="{node.split(".py::", 1)[0].replace("/", ".")}" '
+        f'name="{node.split("::", 1)[1]}" />'
+        for node in nodes
+    )
+    path.write_text(
+        f'<testsuites><testsuite tests="{len(nodes)}" failures="0" errors="0" skipped="0">'
+        f"{cases}</testsuite></testsuites>"
+    )
+    return path
+
+
 def current_base_receipt() -> dict:
     head, tree = current_subject()
     dependencies = []
@@ -105,7 +119,7 @@ def current_base_receipt() -> dict:
     }
 
 
-def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
+def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout(tmp_path):
     # Repository-wide shards use a depth-1 PR merge checkout. The unit proof uses
     # the current exact commit as its synthetic source; the dedicated full-history
     # workflow uses the protected source constants and is receipt-grade.
@@ -115,6 +129,8 @@ def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
         environment=environment(),
         proof_suite_result="PASS",
         base_receipt=current_base_receipt(),
+        proof_observation=MODULE.observed_proof(passing_junit(tmp_path / "proof.xml")),
+        base_receipt_path="artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json",
         source_subject=source_subject,
         expected_source_tree=source_tree,
     )
@@ -138,11 +154,83 @@ def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
     }
     assert receipt["recovery_proof"]["result"] == "PASS"
     assert receipt["recovery_proof"]["base_v1_closure"] == "PASS"
-    assert receipt["recovery_proof"]["exactly_one_retry"] == "PASS"
+    assert receipt["recovery_proof"]["single_attempt_on_success"] == "PASS"
+    assert set(receipt["recovery_proof"]["proof_bindings"]) == {
+        "abrupt_exit_lock_release",
+        "base_v1_closure",
+        "corrupt_fingerprinted_environment_rebuilt_once",
+        "deleted_stage1_exact_recovery",
+        "exact_mode_restoration",
+        "single_attempt_on_success",
+        "fixed_operation_no_manifest_argv",
+        "post_repair_noop",
+        "live_owner_preserved",
+        "malformed_lock_recovery",
+        "receipt_contract_validation",
+    }
+    assert receipt["recovery_proof"]["proof_suites"] == [
+        "tests/bootstrap/test_self_healing_bootstrap_v2.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py",
+    ]
+    assert receipt["schema_version"] == "hermes.self-healing-bootstrap-receipt/3.0.0"
+    assert receipt["recovery_proof"]["proof_bindings"] == {
+        "post_repair_noop": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_fingerprinted_corrupt_environment_rebuilds_once",
+        "deleted_stage1_exact_recovery": "tests/bootstrap/test_self_healing_bootstrap_v2.py::test_stage0_restores_deleted_resolver_and_rejects_wrong_pin",
+        "exact_mode_restoration": "tests/bootstrap/test_self_healing_bootstrap_v2.py::test_stage0_restores_deleted_resolver_and_rejects_wrong_pin",
+        "malformed_lock_recovery": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_malformed_lock_payload_recovers_and_persists",
+        "abrupt_exit_lock_release": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_abrupt_exit_releases_kernel_lock",
+        "live_owner_preserved": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_live_owner_is_preserved",
+        "corrupt_fingerprinted_environment_rebuilt_once": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_fingerprinted_corrupt_environment_rebuilds_once",
+        "single_attempt_on_success": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_fingerprinted_corrupt_environment_rebuilds_once",
+        "fixed_operation_no_manifest_argv": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_policy_pin_fixed_operation_and_final_entrypoint",
+        "base_v1_closure": "validated-base-receipt:artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json",
+        "receipt_contract_validation": "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py::test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout",
+    }
     assert receipt["publication"]["candidate_artifact_only"] is True
     assert receipt["publication"]["requires_protected_commit_check_readback"] is True
     assert receipt["publication"]["requires_exact_artifact_member_verification"] is True
     assert receipt["publication"]["requires_strict_descendant_receipt_pr"] is True
+
+
+def test_junit_bindings_reject_missing_skipped_and_failed_nodes(tmp_path):
+    report = passing_junit(tmp_path / "proof.xml")
+    observation = MODULE.observed_proof(report)
+    assert observation.result == "PASS"
+    assert observation.claims == {claim: "PASS" for claim in MODULE.PROOF_BINDINGS}
+
+    report.write_text('<testsuites><testsuite tests="0" failures="0" errors="0" skipped="0" /></testsuites>')
+    with pytest.raises(ValueError, match="coverage|missing|at least|completely"):
+        MODULE.observed_proof(report)
+
+    node = sorted(MODULE.JUNIT_BOUND_NODES)[0]
+    raw = passing_junit(report).read_text()
+    raw = raw.replace(
+        f'name="{node.split("::", 1)[1]}" />',
+        f'name="{node.split("::", 1)[1]}"><skipped /></testcase>',
+        1,
+    ).replace('skipped="0"', 'skipped="1"', 1)
+    report.write_text(raw)
+    with pytest.raises(ValueError, match="did not pass completely") as skipped:
+        MODULE.observed_proof(report)
+    assert "'skipped': 1" in str(skipped.value)
+
+
+def test_base_receipt_path_binding_rejects_relocation(tmp_path):
+    source_subject, source_tree = current_subject()
+    with pytest.raises(ValueError, match="base receipt path"):
+        MODULE.build_receipt(
+            root=ROOT,
+            environment=environment(),
+            proof_suite_result="PASS",
+            base_receipt=current_base_receipt(),
+            proof_observation=MODULE.observed_proof(
+                passing_junit(tmp_path / "proof.xml")
+            ),
+            base_receipt_path="artifacts/bootstrap/relocated.json",
+            source_subject=source_subject,
+            expected_source_tree=source_tree,
+        )
 
 
 def test_protected_source_constants_are_exact():

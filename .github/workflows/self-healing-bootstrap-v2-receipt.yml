@@ -143,7 +143,8 @@ jobs:
           .bootstrap-proof-venv/bin/python -m pytest -q \
             tests/bootstrap/test_self_healing_bootstrap_v2.py \
             tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py \
-            tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py
+            tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py \
+            --junitxml=artifacts/bootstrap/hermes-self-healing-bootstrap-v2-proof.xml
 
       - name: Emit exact joined V2 candidate receipt
         shell: bash
@@ -153,7 +154,7 @@ jobs:
             scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py \
             --root . \
             --base-receipt artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json \
-            --proof-suite-result PASS \
+            --proof-junit artifacts/bootstrap/hermes-self-healing-bootstrap-v2-proof.xml \
             --output artifacts/bootstrap/hermes-self-healing-bootstrap-v2-candidate.json
           .bootstrap-proof-venv/bin/python - <<'PY'
           import json
@@ -165,6 +166,7 @@ jobs:
           )
           assert receipt['canonical'] is False
           assert receipt['state'] == 'HERMES_SELF_HEALING_BOOTSTRAP_V2_CANDIDATE'
+          assert receipt['schema_version'] == 'hermes.self-healing-bootstrap-receipt/3.0.0'
           assert receipt['source_subject'] == {
               'commit': '518c00b34eb2df7f550a0791bb9c5b657ec38071',
               'tree': '7975b8563ca7d3a58a237cab9bdfc8329c19c408',
@@ -175,6 +177,16 @@ jobs:
           assert receipt['base_closure']['dependency_count'] == 18
           assert receipt['recovery_proof']['result'] == 'PASS'
           assert receipt['recovery_proof']['base_v1_closure'] == 'PASS'
+          result_keys = {
+              key for key, value in receipt['recovery_proof'].items()
+              if value == 'PASS' and key != 'result'
+          }
+          assert set(receipt['recovery_proof']['proof_bindings']) == result_keys
+          assert receipt['recovery_proof']['proof_suites'] == [
+              'tests/bootstrap/test_self_healing_bootstrap_v2.py',
+              'tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py',
+              'tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py',
+          ]
           assert receipt['publication']['candidate_artifact_only'] is True
           assert receipt['publication']['requires_protected_commit_check_readback'] is True
           assert receipt['publication']['requires_exact_artifact_member_verification'] is True
@@ -190,5 +202,13 @@ jobs:
         with:
           name: hermes-self-healing-bootstrap-v2-candidate
           path: artifacts/bootstrap/hermes-self-healing-bootstrap-v2-candidate.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload one exact JUnit proof member
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-self-healing-bootstrap-v2-proof-junit
+          path: artifacts/bootstrap/hermes-self-healing-bootstrap-v2-proof.xml
           if-no-files-found: error
           retention-days: 30
