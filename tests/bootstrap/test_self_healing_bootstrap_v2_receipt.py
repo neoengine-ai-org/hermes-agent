@@ -10,6 +10,7 @@ import pytest  # ty: ignore[unresolved-import]
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py"
+WORKFLOW_PATH = ROOT / ".github/workflows/self-healing-bootstrap-v2-receipt.yml"
 SPEC = importlib.util.spec_from_file_location(
     "emit_hermes_self_healing_bootstrap_v2_receipt", MODULE_PATH
 )
@@ -40,17 +41,80 @@ def current_subject() -> tuple[str, str]:
     )
 
 
+def current_base_receipt() -> dict:
+    head, tree = current_subject()
+    dependencies = []
+    for dependency_id, relative in MODULE.BASE_DEPENDENCIES.items():
+        blob_sha, blob = MODULE.head_blob(ROOT, relative)
+        dependencies.append(
+            {
+                "dependency_id": dependency_id,
+                "dependency_class": "ORG_NATIVE_BOOTSTRAP",
+                "canonical_path_or_provider": relative,
+                "local_required": True,
+                "status": "READY",
+                "digest": MODULE.sha256(blob),
+                "version": "1",
+                "blob_sha": blob_sha,
+            }
+        )
+    manifest_blob_sha, manifest_blob = MODULE.head_blob(
+        ROOT, MODULE.BASE_MANIFEST_REL.as_posix()
+    )
+    validator_blob_sha, validator_blob = MODULE.head_blob(
+        ROOT, MODULE.BASE_VALIDATOR_REL.as_posix()
+    )
+    payload = {
+        "schema_version": "hermes.bootstrap-closure-receipt/1.0",
+        "emitter_repository": {
+            "full_name": MODULE.REPOSITORY,
+            "default_branch": "main",
+        },
+        "source": {
+            "head": head,
+            "tree": tree,
+            "lock_sha256": MODULE.sha256((ROOT / "uv.lock").read_bytes()),
+        },
+        "manifest": {
+            "path": MODULE.BASE_MANIFEST_REL.as_posix(),
+            "blob_sha": manifest_blob_sha,
+            "sha256": MODULE.sha256(manifest_blob),
+            "schema_version": "hermes.bootstrap-closure-manifest/1.0",
+        },
+        "validator": {
+            "path": MODULE.BASE_VALIDATOR_REL.as_posix(),
+            "blob_sha": validator_blob_sha,
+            "sha256": MODULE.sha256(validator_blob),
+            "version": "1.0.0",
+        },
+        "dependencies": dependencies,
+        "interpreter": {"classification": "ORG_NATIVE_BOOTSTRAP"},
+        "environment": {"network": "DISABLED_FOR_SMOKE"},
+        "proofs": {"clean_checkout": "required_by_ci_and_detached_proof"},
+        "result_state": "HERMES_BOOTSTRAP_CLOSURE_READY",
+        "coverage": "candidate_checkout",
+        "typed_omissions": sorted(MODULE.BASE_TYPED_OMISSIONS),
+        "rollback": "test fixture",
+        "non_claims": ["test fixture has no authority"],
+    }
+    digest = MODULE.canonical_digest(payload)
+    return {
+        **payload,
+        "receipt_id": f"hermes-bootstrap-{digest[:20]}",
+        "canonical_payload_digest": digest,
+    }
+
+
 def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
-    # Repository-wide test shards intentionally use a depth-1 PR merge checkout.
-    # Use the current exact commit as the unit-test source so this test validates
-    # receipt shape and policy binding without pretending the protected source
-    # object exists locally. The dedicated receipt workflow uses fetch-depth: 0
-    # and the compiler defaults, proving the real protected source and tree.
+    # Repository-wide shards use a depth-1 PR merge checkout. The unit proof uses
+    # the current exact commit as its synthetic source; the dedicated full-history
+    # workflow uses the protected source constants and is receipt-grade.
     source_subject, source_tree = current_subject()
     receipt = MODULE.build_receipt(
         root=ROOT,
         environment=environment(),
         proof_suite_result="PASS",
+        base_receipt=current_base_receipt(),
         source_subject=source_subject,
         expected_source_tree=source_tree,
     )
@@ -60,6 +124,12 @@ def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
         "commit": source_subject,
         "tree": source_tree,
     }
+    assert receipt["base_closure"]["result_state"] == (
+        "HERMES_BOOTSTRAP_CLOSURE_READY"
+    )
+    assert receipt["base_closure"]["dependency_count"] == len(
+        MODULE.BASE_DEPENDENCIES
+    )
     assert receipt["source_under_test"]["strict_descendant_or_subject"] is True
     assert receipt["policy"]["shared_home_authority_allowed"] is False
     assert receipt["policy"]["fixed_operation"] == {
@@ -67,8 +137,11 @@ def test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout():
         "timeout_seconds": 180,
     }
     assert receipt["recovery_proof"]["result"] == "PASS"
+    assert receipt["recovery_proof"]["base_v1_closure"] == "PASS"
     assert receipt["recovery_proof"]["exactly_one_retry"] == "PASS"
     assert receipt["publication"]["candidate_artifact_only"] is True
+    assert receipt["publication"]["requires_protected_commit_check_readback"] is True
+    assert receipt["publication"]["requires_exact_artifact_member_verification"] is True
     assert receipt["publication"]["requires_strict_descendant_receipt_pr"] is True
 
 
@@ -78,6 +151,23 @@ def test_protected_source_constants_are_exact():
     assert MODULE.WORKFLOW_PATH == (
         ".github/workflows/self-healing-bootstrap-v2-receipt.yml"
     )
+
+
+def test_receipt_workflow_tracks_complete_base_and_v2_surfaces():
+    workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+    for relative in (
+        *MODULE.BASE_DEPENDENCIES.values(),
+        MODULE.POLICY_REL.as_posix(),
+        MODULE.PIN_REL.as_posix(),
+        "scripts/bootstrap_stage0_v2.py",
+        "scripts/bootstrap_resolver_v2_hardened.py",
+        "scripts/bootstrap_resolver_v2_final.py",
+        "scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py",
+    ):
+        assert workflow.count(f"- '{relative}'") == 2, relative
 
 
 def test_policy_refuses_manifest_supplied_operation_command():
@@ -105,13 +195,73 @@ def test_policy_pin_mismatch_fails_closed():
         )
 
 
+def test_base_receipt_provenance_and_digest_fail_closed():
+    source_subject, source_tree = current_subject()
+    invalid = current_base_receipt()
+    invalid["manifest"]["blob_sha"] = "f" * 40
+    payload = {
+        key: value
+        for key, value in invalid.items()
+        if key not in {"receipt_id", "canonical_payload_digest"}
+    }
+    digest = MODULE.canonical_digest(payload)
+    invalid["canonical_payload_digest"] = digest
+    invalid["receipt_id"] = f"hermes-bootstrap-{digest[:20]}"
+    with pytest.raises(ValueError, match="manifest provenance"):
+        MODULE.build_receipt(
+            root=ROOT,
+            environment=environment(),
+            proof_suite_result="PASS",
+            base_receipt=invalid,
+            source_subject=source_subject,
+            expected_source_tree=source_tree,
+        )
+
+    invalid = current_base_receipt()
+    invalid["canonical_payload_digest"] = "f" * 64
+    with pytest.raises(ValueError, match="canonical digest"):
+        MODULE.build_receipt(
+            root=ROOT,
+            environment=environment(),
+            proof_suite_result="PASS",
+            base_receipt=invalid,
+            source_subject=source_subject,
+            expected_source_tree=source_tree,
+        )
+
+
+def test_base_receipt_dependency_surface_fails_closed():
+    source_subject, source_tree = current_subject()
+    invalid = current_base_receipt()
+    invalid["dependencies"].pop()
+    payload = {
+        key: value
+        for key, value in invalid.items()
+        if key not in {"receipt_id", "canonical_payload_digest"}
+    }
+    digest = MODULE.canonical_digest(payload)
+    invalid["canonical_payload_digest"] = digest
+    invalid["receipt_id"] = f"hermes-bootstrap-{digest[:20]}"
+    with pytest.raises(ValueError, match="dependency surface"):
+        MODULE.build_receipt(
+            root=ROOT,
+            environment=environment(),
+            proof_suite_result="PASS",
+            base_receipt=invalid,
+            source_subject=source_subject,
+            expected_source_tree=source_tree,
+        )
+
+
 def test_wrong_or_unavailable_source_subject_fails_closed():
     source_subject, source_tree = current_subject()
+    base_receipt = current_base_receipt()
     with pytest.raises(ValueError, match="source subject"):
         MODULE.build_receipt(
             root=ROOT,
             environment=environment(),
             proof_suite_result="PASS",
+            base_receipt=base_receipt,
             source_subject="not-a-commit",
             expected_source_tree=source_tree,
         )
@@ -120,6 +270,7 @@ def test_wrong_or_unavailable_source_subject_fails_closed():
             root=ROOT,
             environment=environment(),
             proof_suite_result="PASS",
+            base_receipt=base_receipt,
             source_subject="f" * 40,
             expected_source_tree=source_tree,
         )
@@ -128,6 +279,7 @@ def test_wrong_or_unavailable_source_subject_fails_closed():
             root=ROOT,
             environment=environment(),
             proof_suite_result="PASS",
+            base_receipt=base_receipt,
             source_subject=source_subject,
             expected_source_tree="f" * 40,
         )
@@ -135,6 +287,7 @@ def test_wrong_or_unavailable_source_subject_fails_closed():
 
 def test_workflow_identity_and_pass_result_are_mandatory_before_history_probe():
     source_subject, source_tree = current_subject()
+    base_receipt = current_base_receipt()
     invalid = environment()
     invalid["GITHUB_SHA"] = "a" * 40
     with pytest.raises(ValueError, match="workflow or proof-suite"):
@@ -142,6 +295,7 @@ def test_workflow_identity_and_pass_result_are_mandatory_before_history_probe():
             root=ROOT,
             environment=invalid,
             proof_suite_result="PASS",
+            base_receipt=base_receipt,
             source_subject=source_subject,
             expected_source_tree=source_tree,
         )
@@ -150,6 +304,7 @@ def test_workflow_identity_and_pass_result_are_mandatory_before_history_probe():
             root=ROOT,
             environment=environment(),
             proof_suite_result="FAIL",
+            base_receipt=base_receipt,
             source_subject=source_subject,
             expected_source_tree=source_tree,
         )
