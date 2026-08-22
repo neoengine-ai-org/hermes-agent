@@ -57,7 +57,7 @@ on:
       - 'config/hermes-bootstrap-acquisition-v2.sha256'
       - 'scripts/bootstrap_resolver_v2_hardened.py'
       - 'scripts/bootstrap_resolver_v2_final.py'
-      - 'scripts/emit_hermes_self-healing-bootstrap-v2-receipt.py'
+      - 'scripts/emit_hermes_self_healing_bootstrap_v2_receipt.py'
       - 'tests/bootstrap/test_self_healing_bootstrap_v2.py'
       - 'tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py'
       - 'tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py'
