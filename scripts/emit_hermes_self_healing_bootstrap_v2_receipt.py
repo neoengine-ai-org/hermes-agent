@@ -15,6 +15,7 @@ from typing import Any
 
 REPOSITORY = "neoengine-ai-org/hermes-agent"
 WORKFLOW_NAME = "Hermes self-healing bootstrap V2 receipt"
+WORKFLOW_PATH = ".github/workflows/self-healing-bootstrap-v2-receipt.yml"
 SOURCE_SUBJECT = "518c00b34eb2df7f550a0791bb9c5b657ec38071"
 SOURCE_TREE = "7975b8563ca7d3a58a237cab9bdfc8329c19c408"
 POLICY_REL = Path("config/hermes-bootstrap-acquisition-v2.json")
@@ -33,6 +34,15 @@ def git(root: Path, *arguments: str, check: bool = True) -> str:
     if check and completed.returncode != 0:
         raise ValueError(completed.stderr.strip() or "git command failed")
     return completed.stdout.strip()
+
+
+def git_returncode(root: Path, *arguments: str) -> int:
+    return subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode
 
 
 def sha256(value: bytes) -> str:
@@ -71,29 +81,78 @@ def validate_policy(
     return {"sha256": expected, "operation": operation}
 
 
+def validate_workflow_identity(
+    *,
+    environment: dict[str, str],
+    head: str,
+    proof_suite_result: str,
+) -> tuple[int, int]:
+    run_id = environment.get("GITHUB_RUN_ID", "")
+    run_attempt = environment.get("GITHUB_RUN_ATTEMPT", "")
+    if (
+        environment.get("GITHUB_REPOSITORY") != REPOSITORY
+        or environment.get("GITHUB_WORKFLOW") != WORKFLOW_NAME
+        or environment.get("GITHUB_SHA") != head
+        or environment.get("GITHUB_EVENT_NAME")
+        not in {"pull_request", "push", "workflow_dispatch"}
+        or not run_id.isdigit()
+        or int(run_id) <= 0
+        or not run_attempt.isdigit()
+        or int(run_attempt) <= 0
+        or proof_suite_result != "PASS"
+    ):
+        raise ValueError("workflow or proof-suite identity is incomplete")
+    return int(run_id), int(run_attempt)
+
+
+def validate_source_ancestry(
+    *,
+    root: Path,
+    head: str,
+    source_subject: str,
+    expected_source_tree: str,
+) -> str:
+    if not SHA40.fullmatch(source_subject):
+        raise ValueError("source subject is not an exact commit identity")
+    if not SHA40.fullmatch(expected_source_tree):
+        raise ValueError("expected source tree is not an exact tree identity")
+    if git_returncode(root, "cat-file", "-e", f"{source_subject}^{{commit}}") != 0:
+        raise ValueError("protected source subject commit is unavailable")
+    if git_returncode(root, "merge-base", "--is-ancestor", source_subject, head) != 0:
+        raise ValueError("protected source subject is not an ancestor")
+    subject_tree = git(root, "rev-parse", f"{source_subject}^{{tree}}")
+    if subject_tree != expected_source_tree:
+        raise ValueError("protected source subject tree differs")
+    return subject_tree
+
+
 def build_receipt(
     *,
     root: Path,
     environment: dict[str, str],
     proof_suite_result: str,
     source_subject: str = SOURCE_SUBJECT,
+    expected_source_tree: str = SOURCE_TREE,
 ) -> dict[str, Any]:
     root = root.resolve()
     head = git(root, "rev-parse", "HEAD")
     tree = git(root, "rev-parse", "HEAD^{tree}")
-    if not SHA40.fullmatch(source_subject):
-        raise ValueError("source subject is not an exact commit identity")
-    if git(root, "merge-base", "--is-ancestor", source_subject, head, check=False):
-        pass
-    ancestry = subprocess.run(
-        ["git", "-C", str(root), "merge-base", "--is-ancestor", source_subject, head],
-        check=False,
+
+    # Validate the workflow before Git-history inspection so a forged run identity
+    # cannot be obscured by a shallow checkout. Unit tests may use the current
+    # commit as their synthetic source; the dedicated full-history workflow uses
+    # the protected SOURCE_SUBJECT/SOURCE_TREE defaults and is receipt-grade.
+    run_id, run_attempt = validate_workflow_identity(
+        environment=environment,
+        head=head,
+        proof_suite_result=proof_suite_result,
     )
-    if ancestry.returncode != 0:
-        raise ValueError("protected source subject is not an ancestor")
-    subject_tree = git(root, "rev-parse", f"{source_subject}^{{tree}}")
-    if source_subject == SOURCE_SUBJECT and subject_tree != SOURCE_TREE:
-        raise ValueError("protected source subject tree differs")
+    subject_tree = validate_source_ancestry(
+        root=root,
+        head=head,
+        source_subject=source_subject,
+        expected_source_tree=expected_source_tree,
+    )
 
     policy_bytes = (root / POLICY_REL).read_bytes()
     pin_text = (root / PIN_REL).read_text(encoding="utf-8")
@@ -114,22 +173,6 @@ def build_receipt(
             "blob_sha": observed,
             "mode": git(root, "ls-tree", "HEAD", row["path"]).split()[0],
         }
-
-    run_id = environment.get("GITHUB_RUN_ID", "")
-    run_attempt = environment.get("GITHUB_RUN_ATTEMPT", "")
-    if (
-        environment.get("GITHUB_REPOSITORY") != REPOSITORY
-        or environment.get("GITHUB_WORKFLOW") != WORKFLOW_NAME
-        or environment.get("GITHUB_SHA") != head
-        or environment.get("GITHUB_EVENT_NAME")
-        not in {"pull_request", "push", "workflow_dispatch"}
-        or not run_id.isdigit()
-        or int(run_id) <= 0
-        or not run_attempt.isdigit()
-        or int(run_attempt) <= 0
-        or proof_suite_result != "PASS"
-    ):
-        raise ValueError("workflow or proof-suite identity is incomplete")
 
     return {
         "schema_version": "hermes.self-healing-bootstrap-receipt/2.0.0",
@@ -167,14 +210,15 @@ def build_receipt(
             "proof_suites": [
                 "tests/bootstrap/test_self_healing_bootstrap_v2.py",
                 "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py",
+                "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py",
             ],
         },
         "evidence": {
             "workflow_name": WORKFLOW_NAME,
-            "workflow_path": ".github/workflows/self-healing-bootstrap-v2-receipt.yml",
+            "workflow_path": WORKFLOW_PATH,
             "event": environment["GITHUB_EVENT_NAME"],
-            "run_id": int(run_id),
-            "run_attempt": int(run_attempt),
+            "run_id": run_id,
+            "run_attempt": run_attempt,
             "job": environment.get("GITHUB_JOB", ""),
             "ref_name": environment.get("GITHUB_REF_NAME", ""),
             "sha": environment["GITHUB_SHA"],
