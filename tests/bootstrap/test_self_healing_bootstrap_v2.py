@@ -1,8 +1,9 @@
 from __future__ import annotations
-import hashlib, json, os
+import hashlib, json, os, stat
 from pathlib import Path
 import shutil
 import subprocess, sys
+import pytest
 
 ROOT=Path(__file__).resolve().parents[2]
 POLICY=ROOT/"config/hermes-bootstrap-acquisition-v2.json"
@@ -19,6 +20,7 @@ def test_policy_pin_and_shared_home_refusal():
     assert policy["environment"]["allowed_venvs"]==[".venv",".bootstrap-proof-venv"]
     assert "argv" not in policy["operations"]["validate-bootstrap"]
 
+@pytest.mark.timeout(300)
 def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
     checkout=tmp_path/"hermes"
     assert run(["git","clone","--no-local","--quiet",str(ROOT),str(checkout)],tmp_path).returncode==0
@@ -41,6 +43,13 @@ def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
     result=run([sys.executable,"-S","scripts/bootstrap_stage0_v2.py","ensure","--repair"],checkout,env)
     assert result.returncode==0,result.stderr
     assert resolver.is_file()
+    assert run(["git", "hash-object", resolver.relative_to(checkout).as_posix()], checkout).stdout.strip() == policy["stage1"]["blob_sha"]
+    tracked = run(["git", "ls-tree", "HEAD", "--", resolver.relative_to(checkout).as_posix()], checkout)
+    assert tracked.returncode == 0, tracked.stderr
+    assert tracked.stdout.strip(), "resolver must remain tracked"
+    tracked_mode = tracked.stdout.split()[0]
+    assert tracked_mode in {"100644", "100755"}
+    assert stat.S_IMODE(resolver.stat().st_mode) == int(tracked_mode[-3:], 8)
     pin=checkout/"config/hermes-bootstrap-acquisition-v2.sha256"
     pin.write_text("f"*64+"  config/hermes-bootstrap-acquisition-v2.json\n", encoding="utf-8")
     blocked=run([sys.executable,"-S","scripts/bootstrap_stage0_v2.py","diagnose"],checkout,env)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -11,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 from typing import Any
+import xml.etree.ElementTree as ET
 
 
 REPOSITORY = "neoengine-ai-org/hermes-agent"
@@ -50,6 +52,92 @@ BASE_DEPENDENCIES = {
     "hostile-tests": "tests/bootstrap/test_bootstrap_closure.py",
     "lockfile": "uv.lock",
 }
+PROOF_BINDINGS = {
+    "post_repair_noop": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_fingerprinted_corrupt_environment_rebuilds_once",
+    "deleted_stage1_exact_recovery": "tests/bootstrap/test_self_healing_bootstrap_v2.py::test_stage0_restores_deleted_resolver_and_rejects_wrong_pin",
+    "exact_mode_restoration": "tests/bootstrap/test_self_healing_bootstrap_v2.py::test_stage0_restores_deleted_resolver_and_rejects_wrong_pin",
+    "malformed_lock_recovery": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_malformed_lock_payload_recovers_and_persists",
+    "abrupt_exit_lock_release": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_abrupt_exit_releases_kernel_lock",
+    "live_owner_preserved": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_live_owner_is_preserved",
+    "corrupt_fingerprinted_environment_rebuilt_once": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_fingerprinted_corrupt_environment_rebuilds_once",
+    "single_attempt_on_success": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_fingerprinted_corrupt_environment_rebuilds_once",
+    "fixed_operation_no_manifest_argv": "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py::test_policy_pin_fixed_operation_and_final_entrypoint",
+    "base_v1_closure": "validated-base-receipt:artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json",
+    "receipt_contract_validation": "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py::test_candidate_receipt_binds_policy_and_unit_proof_in_shallow_checkout",
+}
+PROOF_SUITES = frozenset(
+    {
+        "tests/bootstrap/test_self_healing_bootstrap_v2.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py",
+        "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py",
+    }
+)
+if not set(PROOF_BINDINGS).isdisjoint(
+    {"result", "proof_bindings", "proof_binding_semantics", "proof_suites"}
+):
+    raise RuntimeError("proof claim names collide with reserved receipt keys")
+JUNIT_BOUND_NODES = frozenset(
+    binding for binding in PROOF_BINDINGS.values() if binding.startswith("tests/")
+)
+
+
+@dataclass(frozen=True)
+class ObservedProof:
+    result: str
+    claims: dict[str, str]
+    suites: tuple[str, ...]
+    junit_sha256: str
+
+
+def observed_proof(junit_path: Path) -> ObservedProof:
+    root = ET.parse(junit_path).getroot()
+    suite_rows = list(root.iter("testsuite"))
+    if not suite_rows:
+        raise ValueError("JUnit contains no test suite")
+    totals = {name: 0 for name in ("tests", "failures", "errors", "skipped")}
+    for suite in suite_rows:
+        for name in totals:
+            raw = suite.get(name)
+            if raw is None or not raw.isdecimal():
+                raise ValueError(f"JUnit suite total is absent or malformed: {name}")
+            totals[name] += int(raw)
+    if totals["tests"] < 1 or any(totals[name] != 0 for name in ("failures", "errors", "skipped")):
+        raise ValueError(f"JUnit suite did not pass completely: {totals}")
+    outcomes: dict[str, str] = {}
+    observed_suites: set[str] = set()
+    testcase_count = 0
+    for case in root.iter("testcase"):
+        testcase_count += 1
+        classname = case.get("classname", "")
+        name = case.get("name", "")
+        node = f"{classname.replace('.', '/')}.py::{name}"
+        observed_suites.add(node.split("::", 1)[0])
+        if node not in JUNIT_BOUND_NODES:
+            continue
+        if node in outcomes:
+            raise ValueError(f"duplicate bound proof node in JUnit: {node}")
+        outcome = "PASS"
+        if any(case.find(tag) is not None for tag in ("failure", "error", "skipped")):
+            outcome = "NON_PASS"
+        outcomes[node] = outcome
+    missing = sorted(JUNIT_BOUND_NODES - set(outcomes))
+    non_pass = sorted(node for node, outcome in outcomes.items() if outcome != "PASS")
+    if missing or non_pass:
+        raise ValueError(f"bound proof nodes did not execute and pass (missing={missing}, non_pass={non_pass})")
+    if testcase_count != totals["tests"] or observed_suites != PROOF_SUITES:
+        raise ValueError(
+            f"JUnit suite coverage differs (count={testcase_count}, suites={sorted(observed_suites)})"
+        )
+    claims = {
+        claim: ("PASS" if binding.startswith("validated-base-receipt:") else outcomes[binding])
+        for claim, binding in PROOF_BINDINGS.items()
+    }
+    return ObservedProof(
+        "PASS",
+        claims,
+        tuple(sorted(observed_suites)),
+        hashlib.sha256(junit_path.read_bytes()).hexdigest(),
+    )
 
 
 def git(root: Path, *arguments: str, check: bool = True) -> str:
@@ -284,6 +372,8 @@ def build_receipt(
     environment: dict[str, str],
     proof_suite_result: str,
     base_receipt: dict[str, Any],
+    proof_observation: ObservedProof | None = None,
+    base_receipt_path: str = "artifacts/bootstrap/hermes-bootstrap-closure-receipt-v1.json",
     source_subject: str = SOURCE_SUBJECT,
     expected_source_tree: str = SOURCE_TREE,
 ) -> dict[str, Any]:
@@ -328,9 +418,16 @@ def build_receipt(
             "blob_sha": observed,
             "mode": git(root, "ls-tree", "HEAD", row["path"]).split()[0],
         }
+    if proof_observation is None or set(proof_observation.claims) != set(PROOF_BINDINGS):
+        raise ValueError("proof results do not cover the exact claim bindings")
+    if proof_observation.result != "PASS" or set(proof_observation.claims.values()) != {"PASS"}:
+        raise ValueError("one or more bound proof nodes did not pass")
+    expected_base_path = PROOF_BINDINGS["base_v1_closure"].split(":", 1)[1]
+    if base_receipt_path != expected_base_path:
+        raise ValueError("base receipt path differs from its proof binding")
 
     return {
-        "schema_version": "hermes.self-healing-bootstrap-receipt/2.0.0",
+        "schema_version": "hermes.self-healing-bootstrap-receipt/3.0.0",
         "state": "HERMES_SELF_HEALING_BOOTSTRAP_V2_CANDIDATE",
         "canonical": False,
         "repository": REPOSITORY,
@@ -353,23 +450,12 @@ def build_receipt(
             "stages": stages,
         },
         "recovery_proof": {
-            "result": "PASS",
-            "healthy_noop": "PASS",
-            "deleted_stage1_exact_recovery": "PASS",
-            "exact_mode_restoration": "PASS",
-            "malformed_lock_recovery": "PASS",
-            "abrupt_exit_lock_release": "PASS",
-            "live_owner_preserved": "PASS",
-            "corrupt_fingerprinted_environment_rebuilt_once": "PASS",
-            "exactly_one_retry": "PASS",
-            "fixed_operation_no_manifest_argv": "PASS",
-            "base_v1_closure": "PASS",
-            "proof_suites": [
-                "tests/bootstrap/test_bootstrap_closure.py",
-                "tests/bootstrap/test_self_healing_bootstrap_v2.py",
-                "tests/bootstrap/test_self_healing_bootstrap_v2_final_hardening.py",
-                "tests/bootstrap/test_self_healing_bootstrap_v2_receipt.py",
-            ],
+            "result": proof_observation.result,
+            **proof_observation.claims,
+            "proof_bindings": dict(PROOF_BINDINGS),
+            "proof_binding_semantics": "many claims may bind distinct assertions in one executed test node",
+            "proof_junit_sha256": proof_observation.junit_sha256,
+            "proof_suites": list(proof_observation.suites),
         },
         "evidence": {
             "workflow_name": WORKFLOW_NAME,
@@ -408,16 +494,19 @@ def main() -> int:
     parser.add_argument("--root", default=".", type=Path)
     parser.add_argument("--base-receipt", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--proof-suite-result", required=True, choices=("PASS",))
+    parser.add_argument("--proof-junit", required=True, type=Path)
     args = parser.parse_args()
     base_receipt = json.loads(args.base_receipt.read_text(encoding="utf-8"))
     if not isinstance(base_receipt, dict):
         raise SystemExit("base receipt must be a JSON object")
+    proof_observation = observed_proof(args.proof_junit)
     receipt = build_receipt(
         root=args.root,
         environment=dict(os.environ),
-        proof_suite_result=args.proof_suite_result,
+        proof_suite_result="PASS",
         base_receipt=base_receipt,
+        proof_observation=proof_observation,
+        base_receipt_path=args.base_receipt.as_posix(),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
