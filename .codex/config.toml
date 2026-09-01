@@ -1,0 +1,12 @@
+# Project-scoped Codex agent registration.
+# Runtime permissions remain owned by the active host and explicit launcher.
+# Protected semantic source: neoengine-ai-org/ai-org PR #555,
+# merge 7e68823504a6cc329ef4554362e1175e48cfae2b.
+
+[agents.custom]
+description = "Hermes tracked-thread runtime bootstrap role; never performs implementation work"
+config_file = "agents/custom.toml"
+
+[agents.hermes_worker]
+description = "Canonical execution role for conductor-assigned Hermes implementation or source-convergence WorkNodes. Select with agent_type=hermes_worker and an explicit admitted implementation model after runtime-parity checks; never use for review."
+config_file = "agents/hermes-worker.toml"
