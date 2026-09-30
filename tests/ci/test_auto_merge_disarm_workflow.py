@@ -7,6 +7,7 @@ asserts structural invariants across every workflow file.
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -40,20 +41,41 @@ def _script() -> str:
 
 class FakeGitHub:
     def __init__(self):
-        self.prs = {}  # number -> dict(state, armed, sha, node_id)
-        self.comments = {}  # number -> list
+        self.prs = {}  # number -> dict(state, armed, sha)
+        self.comments = {}  # number -> list (REST shape)
+        self.events = {}  # number -> list of {createdAt, actor}
         self.calls = []
+        self.clock = 0
         self.disarm_fails = set()
         self.disarm_noop = set()  # disarm "succeeds" but stays armed
         self.list_fail_page = None
-        self.user_login = None  # None => /user 403
+        self.list_pages = 0
+        self.user_login = None  # None => /user 403 (app token); else PAT user
+        self.post_fail_count = 0
+        self.arm_on_armed_list = None  # PR number armed when the second pass starts
+        self.after_first_page = None  # callback run after the first SweepList page
 
-    def pr_json(self, n):
+    def now(self):
+        self.clock += 1
+        return f"2026-01-01T{self.clock // 3600:02d}:{(self.clock // 60) % 60:02d}:{self.clock % 60:02d}Z"
+
+    def actor(self):
+        if self.user_login:
+            return {"login": self.user_login, "type": "User"}
+        return {"login": "steward[bot]", "type": "Bot"}
+
+    def pr_gql(self, n):
         p = self.prs[n]
         return {
-            "number": n, "state": p["state"], "node_id": f"PR_{n}",
-            "auto_merge": {"merge_method": "squash"} if p["armed"] else None,
-            "head": {"sha": p["sha"]},
+            "id": f"PR_{n}", "number": n, "state": p["state"].upper(), "headRefOid": p["sha"],
+            "autoMergeRequest": {"enabledAt": "t"} if p["armed"] else None,
+            "timelineItems": {"nodes": [
+                {"createdAt": e["createdAt"], "actor": {"login": e["actor"]["login"].replace("[bot]", ""), "__typename": e["actor"]["type"]}}
+                for e in self.events.get(n, [])[-5:]]},
+            "comments": {"nodes": [
+                {"body": c["body"], "createdAt": c["created_at"],
+                 "author": {"login": c["user"]["login"].replace("[bot]", ""), "__typename": c["user"]["type"]}}
+                for c in self.comments.get(n, [])[-30:]]},
         }
 
 
@@ -62,7 +84,7 @@ def _handler(fake: FakeGitHub):
         def log_message(self, *a):
             pass
 
-        def _send(self, code, body, headers=None):
+        def _send(self, code, body):
             data = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -78,16 +100,6 @@ def _handler(fake: FakeGitHub):
                 if fake.user_login:
                     return self._send(200, {"login": fake.user_login})
                 return self._send(403, {"message": "forbidden"})
-            if u.path == f"/repos/{REPO}/pulls":
-                page = int(q["page"][0])
-                per = int(q["per_page"][0])
-                if fake.list_fail_page == page:
-                    return self._send(500, {"message": "boom"})
-                opens = [fake.pr_json(n) for n in sorted(fake.prs) if fake.prs[n]["state"] == "open"]
-                return self._send(200, opens[(page - 1) * per: page * per])
-            m = re.fullmatch(rf"/repos/{REPO}/pulls/(\d+)", u.path)
-            if m:
-                return self._send(200, fake.pr_json(int(m.group(1))))
             m = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", u.path)
             if m:
                 cs = fake.comments.get(int(m.group(1)), [])
@@ -95,33 +107,63 @@ def _handler(fake: FakeGitHub):
                 return self._send(200, cs[(page - 1) * per: page * per])
             self._send(404, {"message": "nf"})
 
+        def _graphql(self, body):
+            query = body["query"]
+            v = body["variables"]
+            assert "enablePullRequestAutoMerge" not in query and "mergePullRequest" not in query
+            if "mutation Disarm" in query:
+                n = int(v["id"].split("_")[1])
+                fake.calls.append(("GQL", "Disarm"))
+                if n in fake.disarm_fails:
+                    return self._send(200, {"errors": [{"message": "denied"}], "data": None})
+                if n not in fake.disarm_noop:
+                    fake.prs[n]["armed"] = False
+                    fake.events.setdefault(n, []).append({"createdAt": fake.now(), "actor": fake.actor()})
+                return self._send(200, {"data": {"disablePullRequestAutoMerge": {"pullRequest": {"number": n}}}})
+            if "query PrByNumber" in query:
+                fake.calls.append(("GQL", "PrByNumber"))
+                n = v["number"]
+                pr = fake.pr_gql(n) if n in fake.prs else None
+                return self._send(200, {"data": {"repository": {"pullRequest": pr}}})
+            if "query SweepList" in query or "query ArmedList" in query:
+                name = "SweepList" if "SweepList" in query else "ArmedList"
+                fake.calls.append(("GQL", name))
+                if name == "ArmedList" and fake.arm_on_armed_list is not None:
+                    fake.prs[fake.arm_on_armed_list]["armed"] = True
+                    fake.arm_on_armed_list = None
+                fake.list_pages += 1
+                if fake.list_fail_page == fake.list_pages:
+                    return self._send(200, {"errors": [{"message": "boom"}], "data": None})
+                after = int(v["cursor"]) if v["cursor"] else 0  # keyset cursor = last PR number
+                opens = [n for n in sorted(fake.prs) if fake.prs[n]["state"] == "open" and n > after]
+                page, more = opens[:100], len(opens) > 100
+                nodes = [fake.pr_gql(n) for n in page]
+                if name == "ArmedList":
+                    nodes = [{k: x[k] for k in ("id", "number", "state", "headRefOid", "autoMergeRequest")} for x in nodes]
+                resp = {"data": {"repository": {"pullRequests": {
+                    "pageInfo": {"hasNextPage": more, "endCursor": str(page[-1]) if page else None},
+                    "nodes": nodes}}}}
+                if name == "SweepList" and fake.after_first_page:
+                    cb, fake.after_first_page = fake.after_first_page, None
+                    cb()
+                return self._send(200, resp)
+            self._send(400, {"errors": [{"message": "unknown query"}]})
+
         def do_POST(self):
             u = urlparse(self.path)
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])) or b"{}")
+            if u.path == "/graphql":
+                return self._graphql(body)
             fake.calls.append(("POST", u.path))
             m = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", u.path)
             if m:
+                if fake.post_fail_count > 0:
+                    fake.post_fail_count -= 1
+                    return self._send(502, {"message": "transient"})
                 n = int(m.group(1))
                 fake.comments.setdefault(n, []).append(
-                    {"body": body["body"], "user": {"type": "Bot", "login": "steward[bot]"}})
+                    {"body": body["body"], "user": fake.actor(), "created_at": fake.now()})
                 return self._send(201, {"id": 1})
-            if u.path == "/graphql":
-                query = body["query"]
-                fake.calls.append(("GQL", query.split("(")[0].split("{")[0].strip()))
-                pid = body["variables"]["id"]
-                n = int(pid.split("_")[1])
-                if "enablePullRequestAutoMerge" in query or "mergePullRequest" in query:
-                    raise AssertionError("arm/merge mutation attempted")
-                if "disablePullRequestAutoMerge" in query:
-                    if n in fake.disarm_fails:
-                        return self._send(200, {"errors": [{"message": "denied"}], "data": None})
-                    if n not in fake.disarm_noop:
-                        fake.prs[n]["armed"] = False
-                    return self._send(200, {"data": {"disablePullRequestAutoMerge": {"pullRequest": {"number": n}}}})
-                p = fake.prs[n]
-                return self._send(200, {"data": {"node": {
-                    "number": n, "headRefOid": p["sha"],
-                    "autoMergeRequest": {"enabledAt": "t"} if p["armed"] else None}}})
             self._send(404, {"message": "nf"})
 
     return H
@@ -148,7 +190,7 @@ def run(fake, event="schedule", pr_event=None, pr_number=""):
     ev = fake.tmp / "event.json"
     ev.write_text(json.dumps(pr_event or {}))
     env = {
-        "PATH": __import__("os").environ["PATH"], "GH_TOKEN": "t", "REPOSITORY": REPO,
+        "PATH": os.environ["PATH"], "GH_TOKEN": "t", "REPOSITORY": REPO,
         "EVENT_NAME": event, "GITHUB_EVENT_PATH": str(ev), "PR_NUMBER": pr_number,
         "GITHUB_API_URL": fake.url, "GITHUB_GRAPHQL_URL": fake.url + "/graphql",
     }
@@ -168,7 +210,11 @@ def test_sweep_disarms_armed_and_comments_once(gh):
     assert len(gh.comments[1]) == 1 and len(gh.comments[3]) == 1 and 2 not in gh.comments
     assert gh.prs[1]["sha"] in gh.comments[1][0]["body"]
     assert "founder merge decision" in gh.comments[1][0]["body"]
-    # re-arm same head, rerun: no duplicate receipt
+    # no per-PR REST GET of pulls, no duplicate receipts on an idle re-sweep
+    assert not any(c[0] == "GET" and "/pulls" in c[1] for c in gh.calls)
+    assert run(gh).returncode == 0
+    assert len(gh.comments[1]) == 1
+    # re-arm same head, rerun: still one receipt for that head
     gh.prs[1]["armed"] = True
     assert run(gh).returncode == 0
     assert len(gh.comments[1]) == 1
@@ -183,7 +229,7 @@ def test_never_arms_or_merges(gh):
     add_pr(gh, 1, armed=False)
     add_pr(gh, 2, armed=True)
     assert run(gh).returncode == 0
-    assert not any(c[0] == "GQL" and ("enable" in c[1].lower() or "merge" in c[1].lower() and "Disarm" not in c[1]) for c in gh.calls)
+    assert all(c[0] != "GQL" or c[1] in {"SweepList", "ArmedList", "PrByNumber", "Disarm"} for c in gh.calls)
 
 
 @needs_node
@@ -231,29 +277,83 @@ def test_incomplete_listing_fails_closed(gh):
 
 
 @needs_node
-def test_pagination_covers_more_than_one_page(gh):
-    for n in range(1, 131):
-        add_pr(gh, n, armed=(n == 130))
+def test_cursor_pagination_covers_more_than_one_page(gh):
+    for n in range(1, 231):
+        add_pr(gh, n, armed=(n == 230))
     r = run(gh)
     assert r.returncode == 0, r.stderr
-    assert not gh.prs[130]["armed"]
+    assert not gh.prs[230]["armed"]
+
+
+@needs_node
+def test_churn_during_listing_does_not_skip_prs(gh):
+    # Removing an already-listed PR between pages must not shift later PRs out of view.
+    for n in range(1, 131):
+        add_pr(gh, n, armed=(n == 120))
+    gh.after_first_page = lambda: gh.prs[1].update(state="closed")
+    assert run(gh).returncode == 0
+    assert not gh.prs[120]["armed"]
+
+
+@needs_node
+def test_second_pass_catches_pr_armed_after_first_scan(gh):
+    add_pr(gh, 1, armed=False)
+    add_pr(gh, 2, armed=False)
+    gh.arm_on_armed_list = 1
+    r = run(gh)
+    assert r.returncode == 0, r.stderr
+    assert not gh.prs[1]["armed"]
+    assert len(gh.comments[1]) == 1
+
+
+@needs_node
+def test_receipt_post_failure_then_next_sweep_repairs_exactly_once(gh):
+    add_pr(gh, 1, armed=True)
+    gh.post_fail_count = 1
+    assert run(gh).returncode != 0          # disarmed, receipt POST failed -> nonzero
+    assert not gh.prs[1]["armed"] and 1 not in gh.comments
+    assert run(gh).returncode == 0           # not armed, repair posts the receipt
+    assert len(gh.comments[1]) == 1
+    assert run(gh).returncode == 0           # and never again
+    assert run(gh, event="pull_request_target", pr_event={"pull_request": {"number": 1}}).returncode == 0
+    assert len(gh.comments[1]) == 1
+
+
+@needs_node
+def test_repair_ignores_disarms_by_other_actors(gh):
+    add_pr(gh, 1, armed=False)
+    gh.user_login = "steward-pat"
+    gh.events[1] = [{"createdAt": gh.now(), "actor": {"login": "someone-else", "type": "User"}}]
+    assert run(gh).returncode == 0
+    assert 1 not in gh.comments
+
+
+@needs_node
+def test_pat_user_receipt_is_deduped(gh):
+    gh.user_login = "steward-pat"  # PAT path: comments are authored by a User
+    add_pr(gh, 1, armed=True)
+    assert run(gh).returncode == 0
+    assert gh.comments[1][0]["user"]["type"] == "User"
+    gh.prs[1]["armed"] = True
+    assert run(gh).returncode == 0
+    assert len(gh.comments[1]) == 1
 
 
 @needs_node
 def test_spoofed_human_marker_does_not_suppress_receipt(gh):
     add_pr(gh, 1, armed=True)
     marker = f"<!-- hermes-auto-merge-disarm:head={gh.prs[1]['sha']} -->"
-    gh.comments[1] = [{"body": marker, "user": {"type": "User", "login": "mallory"}}]
+    gh.comments[1] = [{"body": marker, "user": {"type": "User", "login": "mallory"}, "created_at": gh.now()}]
     assert run(gh).returncode == 0
     assert len(gh.comments[1]) == 2
 
 
 @needs_node
-def test_login_mismatch_bot_does_not_suppress_receipt(gh):
+def test_login_mismatch_does_not_suppress_receipt(gh):
     add_pr(gh, 1, armed=True)
     gh.user_login = "steward[bot]"
     marker = f"<!-- hermes-auto-merge-disarm:head={gh.prs[1]['sha']} -->"
-    gh.comments[1] = [{"body": marker, "user": {"type": "Bot", "login": "other[bot]"}}]
+    gh.comments[1] = [{"body": marker, "user": {"type": "Bot", "login": "other[bot]"}, "created_at": gh.now()}]
     assert run(gh).returncode == 0
     assert len(gh.comments[1]) == 2
 
@@ -269,16 +369,67 @@ def test_triggers_and_concurrency():
     assert on["schedule"][0]["cron"] == "*/15 * * * *"
     assert "workflow_dispatch" in on
     assert wf["concurrency"]["cancel-in-progress"] is False
-    assert "pull_request.number" in wf["concurrency"]["group"]
-    assert wf["permissions"] == {"contents": "read", "pull-requests": "write", "issues": "write"}
+    # one repository-wide group: sweep and event runs are serialized
+    assert wf["concurrency"]["group"] == "hermes-auto-merge-disarm"
+    # contents: write is needed by disablePullRequestAutoMerge with the github.token fallback
+    assert wf["permissions"] == {"contents": "write", "pull-requests": "write", "issues": "write"}
 
 
-def test_no_arm_or_merge_in_any_workflow():
-    pat = re.compile(r"enablePullRequestAutoMerge|mergePullRequest|gh\s+pr\s+merge|pulls\.merge|--auto\b|auto-arm")
-    for f in WORKFLOWS.glob("*.y*ml"):
-        text = f.read_text()
-        assert not pat.search(text), f"{f.name} contains an arm/merge path"
+ARM_MERGE_PATTERNS = [
+    r"enablePullRequestAutoMerge",
+    r"mergePullRequest",
+    r"gh\s+pr\s+merge",
+    r"pulls\.merge",
+    r"pulls/\S*/merge\b",
+    r"gh\s+api\b[^\n]*/merge\b",
+    r"\"?/merge\"?\s*[,)]",
+    r"pascalgn/automerge-action",
+    r"peter-evans/enable-pull-request-automerge",
+    r"ahmadnassri/action-dependabot-auto-merge",
+    r"reitermarkus/automerge",
+    r"auto-arm",
+]
+
+
+def _scan_files():
+    files = list(WORKFLOWS.glob("*.y*ml"))
+    actions = ROOT / ".github" / "actions"
+    files += [p for p in actions.rglob("*") if p.is_file()]
+    return files
+
+
+def test_no_arm_or_merge_in_any_workflow_or_local_action():
+    pats = [re.compile(p) for p in ARM_MERGE_PATTERNS]
+    files = _scan_files()
+    assert len(files) > 5
+    for f in files:
+        text = f.read_text(errors="replace")
+        for pat in pats:
+            assert not pat.search(text), f"{f.relative_to(ROOT)} matches {pat.pattern}"
     assert not (WORKFLOWS / "auto-arm-auto-merge.yml").exists()
+
+
+def test_arm_merge_patterns_detect_known_bad_forms():
+    samples = [
+        "gh pr merge 1 --auto", "gh api -X PUT repos/o/r/pulls/1/merge",
+        "github.rest.pulls.merge({})", "mergePullRequest(input:{})",
+        "uses: pascalgn/automerge-action@v0", "enablePullRequestAutoMerge(",
+        "peter-evans/enable-pull-request-automerge@v3",
+        "ahmadnassri/action-dependabot-auto-merge@v2",
+        "request('PUT /repos/o/r/pulls/1/merge')",
+    ]
+    for sample in samples:
+        assert any(re.search(p, sample) for p in ARM_MERGE_PATTERNS), sample
+
+
+def test_every_uses_is_pinned_to_a_full_sha():
+    text = WORKFLOW.read_text()
+    uses = re.findall(r"^\s*(?:-\s*)?uses:\s*(\S+)", text, re.M)
+    assert uses, "expected at least the app-token action"
+    for ref in uses:
+        if ref.startswith("./"):
+            continue
+        assert re.fullmatch(r"[\w./-]+@[0-9a-f]{40}", ref), f"unpinned action: {ref}"
 
 
 def test_no_pr_head_checkout_and_no_untrusted_interpolation():

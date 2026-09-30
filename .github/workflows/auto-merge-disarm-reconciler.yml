@@ -29,12 +29,22 @@ on:
         required: false
         type: string
 
+# One repository-wide group: event runs and sweeps are serialized, so they can
+# never race on the same PR (including the list-then-POST receipt dedupe).
+# cancel-in-progress is false so a running disarm is never cancelled. GitHub
+# keeps at most one pending run per group and may replace an older pending run
+# with a newer one; that is safe because every run re-reads live state (event
+# runs re-read the PR, sweeps list all open PRs) and a disarm is idempotent,
+# so no disarm is lost. actionlint rejects `queue: max`, so it is not used.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr_number || 'sweep' }}
+  group: hermes-auto-merge-disarm
   cancel-in-progress: false
 
+# contents: write is required by the GraphQL disablePullRequestAutoMerge
+# mutation when the github.token fallback is used. The job has no checkout
+# step and runs no PR-controlled code, so the broader scope is not reachable.
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -49,7 +59,7 @@ jobs:
       - name: Create merge steward app token
         id: merge-steward-token
         if: env.HAS_MERGE_STEWARD_APP == 'true'
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         with:
           app-id: ${{ secrets.NEOENGINE_MERGE_STEWARD_APP_ID }}
           private-key: ${{ secrets.NEOENGINE_MERGE_STEWARD_PRIVATE_KEY }}
@@ -71,7 +81,6 @@ jobs:
           const tokenSource = process.env.TOKEN_SOURCE || 'github.token';
           const repository = process.env.REPOSITORY;
           const eventName = process.env.EVENT_NAME;
-          const eventPath = process.env.GITHUB_EVENT_PATH;
           const manualPrNumber = (process.env.PR_NUMBER || '').trim();
           const apiBase = (process.env.GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
           const graphqlUrl = process.env.GITHUB_GRAPHQL_URL || `${apiBase}/graphql`;
@@ -82,6 +91,7 @@ jobs:
           if (!token || !repository || !eventName) {
             throw new Error('missing GH_TOKEN, REPOSITORY, or EVENT_NAME');
           }
+          const [owner, repoName] = repository.split('/');
 
           const headers = {
             Authorization: `Bearer ${token}`,
@@ -116,12 +126,11 @@ jobs:
             return body.data;
           }
 
-          // Complete pagination or throw: an incomplete listing must fail the run.
-          async function paginate(basePath) {
+          // REST page pagination, used only for one PR's comment list. Completes or throws.
+          async function paginateRest(basePath) {
             const items = [];
             for (let page = 1; page <= MAX_PAGES; page += 1) {
-              const sep = basePath.includes('?') ? '&' : '?';
-              const batch = await rest('GET', `${basePath}${sep}per_page=${PAGE_SIZE}&page=${page}`);
+              const batch = await rest('GET', `${basePath}?per_page=${PAGE_SIZE}&page=${page}`);
               if (!Array.isArray(batch)) throw new Error(`unexpected non-array listing for ${basePath}`);
               items.push(...batch);
               if (batch.length < PAGE_SIZE) return items;
@@ -129,99 +138,165 @@ jobs:
             throw new Error(`pagination incomplete for ${basePath}: exceeded ${MAX_PAGES} pages`);
           }
 
-          async function tokenLogin() {
+          let ownLogin = null;
+          async function resolveIdentity() {
             try {
-              const me = await rest('GET', '/user');
-              return me?.login || null;
+              ownLogin = (await rest('GET', '/user'))?.login || null;
             } catch {
-              return null; // app installation tokens cannot read /user
+              ownLogin = null; // app installation tokens cannot read /user
             }
           }
 
-          function isOwnReceipt(comment, marker, login) {
-            if (typeof comment.body !== 'string' || !comment.body.includes(marker)) return false;
-            if (comment.user?.type !== 'Bot') return false;
-            if (login && comment.user?.login !== login) return false;
-            return true;
+          // Identity: exact login match when /user is known (PAT path, any account
+          // type); otherwise fall back to "is a Bot account".
+          function isOwn(login, type) {
+            if (ownLogin) return login === ownLogin;
+            return type === 'Bot';
           }
 
-          async function postReceipt(pr, headSha, login) {
-            const marker = `<!-- ${MARKER_PREFIX}${headSha} -->`;
-            const comments = await paginate(`/repos/${repository}/issues/${pr.number}/comments`);
-            if (comments.some((c) => isOwnReceipt(c, marker, login))) return 'exists';
-            const body = [
-              marker,
-              `Native GitHub auto-merge was disarmed on this PR at head \`${headSha}\`.`,
-              '',
-              'Reason: hermes-agent has no merge-grant model. No PR may gain or retain native auto-merge without an explicit, live, PR-specific, exact-head merge grant.',
-              '',
-              'Re-arming requires an exact-head founder merge decision for this head SHA. This workflow only disarms; it never arms or merges.',
-            ].join('\n');
-            await rest('POST', `/repos/${repository}/issues/${pr.number}/comments`, { body });
-            return 'posted';
-          }
+          const PR_FIELDS = `id number state headRefOid
+            autoMergeRequest { enabledAt }
+            timelineItems(last: 5, itemTypes: [AUTO_MERGE_DISABLED_EVENT]) {
+              nodes { ... on AutoMergeDisabledEvent { createdAt actor { login __typename } } }
+            }
+            comments(last: 30) { nodes { body createdAt author { login __typename } } }`;
 
-          const READ_BACK = `query ReadBack($id: ID!) {
-            node(id: $id) { ... on PullRequest { number headRefOid autoMergeRequest { enabledAt } } }
+          const SWEEP_LIST = `query SweepList($owner: String!, $name: String!, $cursor: String) {
+            repository(owner: $owner, name: $name) {
+              pullRequests(states: OPEN, first: ${PAGE_SIZE}, after: $cursor, orderBy: { field: CREATED_AT, direction: ASC }) {
+                pageInfo { hasNextPage endCursor }
+                nodes { ${PR_FIELDS} }
+              }
+            }
+          }`;
+          const ARMED_LIST = `query ArmedList($owner: String!, $name: String!, $cursor: String) {
+            repository(owner: $owner, name: $name) {
+              pullRequests(states: OPEN, first: ${PAGE_SIZE}, after: $cursor, orderBy: { field: CREATED_AT, direction: ASC }) {
+                pageInfo { hasNextPage endCursor }
+                nodes { id number state headRefOid autoMergeRequest { enabledAt } }
+              }
+            }
+          }`;
+          const PR_BY_NUMBER = `query PrByNumber($owner: String!, $name: String!, $number: Int!) {
+            repository(owner: $owner, name: $name) { pullRequest(number: $number) { ${PR_FIELDS} } }
           }`;
           const DISARM = `mutation Disarm($id: ID!) {
             disablePullRequestAutoMerge(input: { pullRequestId: $id }) { pullRequest { number } }
           }`;
 
-          async function reconcile(listed, login) {
-            // Always re-read live state; event payloads can be stale.
-            const pr = await rest('GET', `/repos/${repository}/pulls/${listed.number}`);
-            if (pr.state !== 'open') return { number: pr.number, action: 'skip-not-open' };
-            if (!pr.auto_merge) return { number: pr.number, action: 'not-armed' };
-
-            await graphql(DISARM, { id: pr.node_id });
-            const data = await graphql(READ_BACK, { id: pr.node_id });
-            const node = data.node;
-            if (!node) throw new Error(`PR #${pr.number}: read-back returned no node`);
-            if (node.autoMergeRequest) {
-              throw new Error(`PR #${pr.number}: auto-merge still armed after disarm`);
+          // Cursor pagination (snapshot-safe against a changing open-PR set).
+          // Any incomplete page throws, which fails the run.
+          async function listOpen(query) {
+            const out = [];
+            let cursor = null;
+            for (let page = 1; page <= MAX_PAGES; page += 1) {
+              const data = await graphql(query, { owner, name: repoName, cursor });
+              const conn = data.repository?.pullRequests;
+              if (!conn || !Array.isArray(conn.nodes) || !conn.pageInfo) throw new Error('incomplete pullRequests page');
+              out.push(...conn.nodes);
+              if (!conn.pageInfo.hasNextPage) return out;
+              if (!conn.pageInfo.endCursor) throw new Error('hasNextPage without endCursor: incomplete listing');
+              cursor = conn.pageInfo.endCursor;
             }
-            const headSha = node.headRefOid || pr.head?.sha;
-            if (!headSha) throw new Error(`PR #${pr.number}: cannot determine head SHA for receipt`);
-            const receipt = await postReceipt(pr, headSha, login);
-            console.log(`ok: disarmed auto-merge for PR #${pr.number} at ${headSha}; receipt ${receipt}; token source: ${tokenSource}`);
-            return { number: pr.number, action: 'disarmed', receipt };
+            throw new Error(`open PR listing incomplete: exceeded ${MAX_PAGES} pages`);
           }
 
-          async function targets() {
-            if (eventName === 'workflow_dispatch' && manualPrNumber) {
-              if (!/^\d+$/.test(manualPrNumber)) throw new Error('workflow_dispatch pr_number must be numeric');
-              return [{ number: Number(manualPrNumber) }];
-            }
-            if (eventName === 'pull_request_target') {
-              const eventPath = process.env.GITHUB_EVENT_PATH;
-              if (!eventPath) throw new Error('missing GITHUB_EVENT_PATH');
-              const event = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
-              const number = event.pull_request?.number;
-              if (!Number.isInteger(number)) throw new Error('pull_request_target event without pull_request.number');
-              return [{ number }];
-            }
-            if (eventName === 'schedule' || eventName === 'workflow_dispatch') {
-              const prs = await paginate(`/repos/${repository}/pulls?state=open`);
-              return prs.map((p) => ({ number: p.number }));
-            }
-            throw new Error(`unsupported event ${eventName}`);
+          async function fetchPr(number) {
+            const data = await graphql(PR_BY_NUMBER, { owner, name: repoName, number });
+            const pr = data.repository?.pullRequest;
+            if (!pr) throw new Error(`PR #${number} not found`);
+            return pr;
           }
 
-          async function main() {
-            const login = await tokenLogin();
-            const list = await targets();
-            const failures = [];
-            for (const target of list) {
+          async function ensureReceipt(number, headSha, minCreatedAt, reason) {
+            const marker = `<!-- ${MARKER_PREFIX}${headSha} -->`;
+            const comments = await paginateRest(`/repos/${repository}/issues/${number}/comments`);
+            const own = comments.filter((c) => typeof c.body === 'string' && c.body.includes(`<!-- ${MARKER_PREFIX}`) && isOwn(c.user?.login, c.user?.type));
+            if (own.some((c) => c.body.includes(marker))) return 'exists';
+            if (minCreatedAt && own.some((c) => (c.created_at || '') >= minCreatedAt)) return 'covered';
+            const body = [
+              marker,
+              `Native GitHub auto-merge was disarmed on this PR; head at receipt time: \`${headSha}\`${reason ? ` (${reason})` : ''}.`,
+              '',
+              'Reason: hermes-agent has no merge-grant model. No PR may gain or retain native auto-merge without an explicit, live, PR-specific, exact-head merge grant.',
+              '',
+              'Re-arming requires an exact-head founder merge decision for this head SHA. This workflow only disarms; it never arms or merges.',
+            ].join('\n');
+            await rest('POST', `/repos/${repository}/issues/${number}/comments`, { body });
+            return 'posted';
+          }
+
+          // Receipt repair, independent of armed state: if we disarmed (durable
+          // auto_merge_disabled timeline event by our identity) and no own receipt
+          // was created at or after that event, post it. Bounded: newest 5 disable
+          // events and newest 30 comments per PR from the listing; a full comment
+          // read happens only when the snapshot shows no covering receipt.
+          async function repairReceipt(pr) {
+            const events = (pr.timelineItems?.nodes || []).filter((e) => e && e.createdAt && isOwn(e.actor?.login, e.actor?.__typename));
+            if (!events.length) return 'no-own-disarm';
+            const latest = events.map((e) => e.createdAt).sort().pop();
+            const covered = (pr.comments?.nodes || []).some((c) =>
+              typeof c.body === 'string' && c.body.includes(`<!-- ${MARKER_PREFIX}`) && c.createdAt >= latest && isOwn(c.author?.login, c.author?.__typename));
+            if (covered) return 'covered';
+            const result = await ensureReceipt(pr.number, pr.headRefOid, latest, 'repair');
+            if (result === 'posted') console.log(`ok: repaired missing receipt for PR #${pr.number}`);
+            return result;
+          }
+
+          async function reconcile(snapshot, isLive) {
+            let pr = snapshot;
+            if (pr.autoMergeRequest && !isLive) pr = await fetchPr(pr.number); // live re-read before acting
+            if (pr.state !== 'OPEN') return 'skip-not-open';
+            if (!pr.autoMergeRequest) return repairReceipt(pr);
+
+            await graphql(DISARM, { id: pr.id });
+            const after = await fetchPr(pr.number);
+            if (after.autoMergeRequest) throw new Error(`PR #${pr.number}: auto-merge still armed after disarm`);
+            const receipt = await ensureReceipt(pr.number, after.headRefOid || pr.headRefOid, null, null);
+            console.log(`ok: disarmed auto-merge for PR #${pr.number} at ${after.headRefOid}; receipt ${receipt}; token source: ${tokenSource}`);
+            return 'disarmed';
+          }
+
+          async function runAll(prs, isLive, failures) {
+            for (const pr of prs) {
               try {
-                await reconcile(target, login);
+                await reconcile(pr, isLive);
               } catch (error) {
-                failures.push(`PR #${target.number}: ${error.message}`);
+                failures.push(`PR #${pr.number}: ${error.message}`);
                 console.error(`error: ${error.message}`);
               }
             }
+          }
+
+          async function main() {
+            await resolveIdentity();
+            const failures = [];
+            let count = 0;
+            if (eventName === 'workflow_dispatch' && manualPrNumber && !/^\d+$/.test(manualPrNumber)) {
+              throw new Error('workflow_dispatch pr_number must be numeric');
+            }
+            if (eventName === 'pull_request_target' || (eventName === 'workflow_dispatch' && manualPrNumber)) {
+              let number = Number(manualPrNumber);
+              if (eventName === 'pull_request_target') {
+                const eventPath = process.env.GITHUB_EVENT_PATH;
+                if (!eventPath) throw new Error('missing GITHUB_EVENT_PATH');
+                number = JSON.parse(fs.readFileSync(eventPath, 'utf8')).pull_request?.number;
+                if (!Number.isInteger(number)) throw new Error('pull_request_target event without pull_request.number');
+              }
+              await runAll([await fetchPr(number)], true, failures);
+              count = 1;
+            } else if (eventName === 'schedule' || eventName === 'workflow_dispatch') {
+              const first = await listOpen(SWEEP_LIST);
+              await runAll(first, false, failures);
+              // Second pass: re-list armed state to catch any PR skipped or armed by churn.
+              const second = (await listOpen(ARMED_LIST)).filter((p) => p.autoMergeRequest);
+              await runAll(second, false, failures);
+              count = first.length;
+            } else {
+              throw new Error(`unsupported event ${eventName}`);
+            }
             if (failures.length) throw new Error(`${failures.length} PR(s) failed:\n${failures.join('\n')}`);
-            console.log(`ok: reconciled ${list.length} PR(s)`);
+            console.log(`ok: reconciled ${count} PR(s)`);
           }
 
           main().catch((error) => {
