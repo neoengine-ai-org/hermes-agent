@@ -10,6 +10,11 @@ name: auto-merge-disarm-reconciler
 # each live, and disarms it. The triggering PR number (event or dispatch input)
 # is only processed first. Any surviving run therefore converges the whole repo.
 #
+# Convergence: up to 3 list-and-disarm passes, then a final list that must be
+# empty; the run exits 0 only then, otherwise it emits ::error:: naming the PRs
+# still armed. Irreducible residual: arming after the run's final list is caught
+# by the auto_merge_enabled event run and the 15-minute sweep.
+#
 # Evidence rule: GitHub's own AutoMergeDisabledEvent in the PR timeline (actor
 # and time) is the authoritative durable record of a disarm. The PR comment is a
 # best-effort human-readable notice, posted once after a successful disarm plus
@@ -49,8 +54,8 @@ on:
 # is never cancelled. GitHub keeps at most one pending run per group and may
 # replace an older pending run with a newer one. That is safe because every run
 # is repository-complete (it disarms every armed open PR, not just the one that
-# triggered it), so the surviving run covers whatever the replaced run would
-# have. actionlint rejects `queue: max`, so it is not used.
+# triggered it, and a malformed trigger still performs the full sweep), so the
+# surviving run covers whatever the replaced run would have. actionlint rejects `queue: max`, so it is not used.
 concurrency:
   group: hermes-auto-merge-disarm
   cancel-in-progress: false
@@ -242,10 +247,20 @@ jobs:
             throw new Error(`unsupported event ${eventName}`);
           }
 
+          const MAX_PASSES = 3;
+
           async function main() {
-            const first = triggeringNumber();
-            await resolveIdentity();
             const failures = [];
+            // Trigger parsing is defensive: a bad input is recorded and the run
+            // still performs the full repository sweep, then exits nonzero.
+            let first = null;
+            try {
+              first = triggeringNumber();
+            } catch (error) {
+              failures.push(`trigger: ${error.message}`);
+              console.error(`error: ${error.message}`);
+            }
+            await resolveIdentity();
             const attempt = async (number) => {
               try {
                 await disarm({ number });
@@ -255,13 +270,24 @@ jobs:
               }
             };
             if (first !== null) await attempt(first);
-            // Repository-complete: listing failure is fatal (fail closed).
-            const armed = await listArmed();
-            for (const pr of armed) {
-              await attempt(pr.number);
+
+            // Up to MAX_PASSES list-and-disarm passes, then a final list that must
+            // be empty. A listing failure is fatal (fail closed).
+            let remaining = null;
+            for (let pass = 1; pass <= MAX_PASSES; pass += 1) {
+              const armed = await listArmed();
+              if (!armed.length) { remaining = []; break; }
+              console.log(`pass ${pass}: ${armed.length} armed PR(s)`);
+              for (const pr of armed) await attempt(pr.number);
             }
-            if (failures.length) throw new Error(`${failures.length} PR(s) failed:\n${failures.join('\n')}`);
-            console.log(`ok: repository-complete pass; ${armed.length} armed PR(s) found`);
+            if (remaining === null) remaining = await listArmed();
+            if (remaining.length) {
+              const names = remaining.map((p) => `#${p.number}`).join(', ');
+              console.log(`::error::auto-merge still armed after ${MAX_PASSES} passes: ${names}`);
+              failures.push(`still armed after ${MAX_PASSES} passes: ${names}`);
+            }
+            if (failures.length) throw new Error(`${failures.length} failure(s):\n${failures.join('\n')}`);
+            console.log('ok: repository-complete; final armed-list is empty');
           }
 
           main().catch((error) => {

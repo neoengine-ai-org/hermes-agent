@@ -52,6 +52,7 @@ class FakeGitHub:
         self.post_fail_count = 0
         self.merge_on_reread = set()  # armed in the list, MERGED by the time it is re-read
         self.after_first_page = None
+        self.rearm_each_list = set()  # re-armed every time a listing starts
 
     def actor(self):
         if self.user_login:
@@ -113,6 +114,8 @@ def _handler(fake: FakeGitHub):
             if "query ArmedList" in query:
                 fake.calls.append(("GQL", "ArmedList"))
                 fake.list_pages += 1
+                for n in fake.rearm_each_list:
+                    fake.prs[n]["armed"] = True
                 if fake.list_fail_page == fake.list_pages:
                     return self._send(200, {"errors": [{"message": "boom"}], "data": None})
                 after = int(v["cursor"]) if v["cursor"] else 0  # keyset cursor = last PR number
@@ -223,7 +226,6 @@ def test_dispatch_with_number_is_also_repository_complete(gh):
     add_pr(gh, 5, armed=True)
     assert run(gh, event="workflow_dispatch", pr_number="5").returncode == 0
     assert not gh.prs[1]["armed"] and not gh.prs[5]["armed"]
-    assert run(gh, event="workflow_dispatch", pr_number="5; rm -rf").returncode != 0
 
 
 @needs_node
@@ -427,3 +429,33 @@ def test_repair_machinery_is_gone():
     script = _script()
     for gone in ("repairReceipt", "timelineItems", "AutoMergeDisabledEvent", "paginateRest"):
         assert gone not in script
+
+
+@needs_node
+def test_pr_armed_after_listing_is_caught_by_next_pass(gh):
+    add_pr(gh, 1, armed=True)
+    add_pr(gh, 2, armed=False)
+    gh.after_first_page = lambda: gh.prs[2].update(armed=True)  # arms after pass-1 snapshot
+    r = run(gh)
+    assert r.returncode == 0, r.stderr
+    assert not gh.prs[1]["armed"] and not gh.prs[2]["armed"]
+
+
+@needs_node
+def test_pr_rearmed_every_pass_fails_after_three_passes(gh):
+    add_pr(gh, 1, armed=True)
+    gh.rearm_each_list.add(1)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::auto-merge still armed after 3 passes: #1" in r.stdout
+    assert sum(1 for c in gh.calls if c == ("GQL", "Disarm")) == 3
+
+
+@needs_node
+def test_invalid_dispatch_input_still_sweeps_then_fails(gh):
+    add_pr(gh, 1, armed=True)
+    for bad in ("abc", "5; rm -rf"):
+        gh.prs[1]["armed"] = True
+        r = run(gh, event="workflow_dispatch", pr_number=bad)
+        assert r.returncode != 0
+        assert not gh.prs[1]["armed"]
