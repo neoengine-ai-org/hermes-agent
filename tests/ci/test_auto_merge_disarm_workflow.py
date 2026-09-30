@@ -116,6 +116,13 @@ def _handler(fake: FakeGitHub):
                 return self._send(200, {"data": {"repository": {"pullRequest": pr}}})
             if "query RecentMerged" in query:
                 fake.calls.append(("GQL", "RecentMerged"))
+                compact = re.sub(r"\s+", " ", query)
+                for needle in (
+                    "pullRequests(states: MERGED, first: 50, orderBy: { field: UPDATED_AT, direction: DESC })",
+                    "timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20)",
+                    "mergeCommit { oid }",
+                ):
+                    assert needle in compact, f"audit query shape changed: {needle}"
                 if fake.audit_fail:
                     return self._send(200, {"errors": [{"message": "audit boom"}], "data": None})
                 nodes = [{

@@ -20,7 +20,9 @@ name: auto-merge-disarm-reconciler
 # mergedAt is within the last 2 hours and raises an ::error:: (nonzero, no
 # comment, no mutation) for any whose latest auto-merge event before the merge
 # was an enable, i.e. it merged via native auto-merge. A PR that merged via
-# native auto-merge more than 2 hours before any run executes is NOT alarmed.
+# native auto-merge more than 2 hours before any run executes is NOT alarmed, nor
+# is one pushed out of the 50 most recently updated merged PRs. The alarm names
+# the PR's mergeCommit oid (falling back to headRefOid).
 #
 # Evidence rule: GitHub's own AutoMergeDisabledEvent in the PR timeline (actor
 # and time) is the authoritative durable record of a disarm. The PR comment is a
@@ -64,7 +66,8 @@ on:
 # triggered it, and a malformed trigger still performs the full sweep), so the
 # surviving run covers whatever the replaced run would have. That argument
 # covers DISARMING only. Detecting a PR that merged before any run got to it is
-# best-effort: the recent-merge audit (2h window, 50 PRs) catches it on any run;
+# best-effort: the recent-merge audit detects it on any run while the PR remains
+# among the 50 most recently updated merged PRs and within the 2h window;
 # older merges are not alarmed. actionlint rejects `queue: max`, so it is not used.
 concurrency:
   group: hermes-auto-merge-disarm
