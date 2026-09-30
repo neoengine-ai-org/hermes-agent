@@ -15,6 +15,13 @@ name: auto-merge-disarm-reconciler
 # still armed. Irreducible residual: arming after the run's final list is caught
 # by the auto_merge_enabled event run and the 15-minute sweep.
 #
+# Merge DETECTION is best-effort, separate from disarming: after the armed
+# passes, every run audits the 50 most recently updated MERGED PRs whose
+# mergedAt is within the last 2 hours and raises an ::error:: (nonzero, no
+# comment, no mutation) for any whose latest auto-merge event before the merge
+# was an enable, i.e. it merged via native auto-merge. A PR that merged via
+# native auto-merge more than 2 hours before any run executes is NOT alarmed.
+#
 # Evidence rule: GitHub's own AutoMergeDisabledEvent in the PR timeline (actor
 # and time) is the authoritative durable record of a disarm. The PR comment is a
 # best-effort human-readable notice, posted once after a successful disarm plus
@@ -55,7 +62,10 @@ on:
 # replace an older pending run with a newer one. That is safe because every run
 # is repository-complete (it disarms every armed open PR, not just the one that
 # triggered it, and a malformed trigger still performs the full sweep), so the
-# surviving run covers whatever the replaced run would have. actionlint rejects `queue: max`, so it is not used.
+# surviving run covers whatever the replaced run would have. That argument
+# covers DISARMING only. Detecting a PR that merged before any run got to it is
+# best-effort: the recent-merge audit (2h window, 50 PRs) catches it on any run;
+# older merges are not alarmed. actionlint rejects `queue: max`, so it is not used.
 concurrency:
   group: hermes-auto-merge-disarm
   cancel-in-progress: false
@@ -247,6 +257,43 @@ jobs:
             throw new Error(`unsupported event ${eventName}`);
           }
 
+          const AUDIT_WINDOW_MS = 2 * 60 * 60 * 1000;
+          const RECENT_MERGED = `query RecentMerged($owner: String!, $name: String!) {
+            repository(owner: $owner, name: $name) {
+              pullRequests(states: MERGED, first: 50, orderBy: { field: UPDATED_AT, direction: DESC }) {
+                nodes {
+                  number mergedAt headRefOid mergeCommit { oid }
+                  timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20) {
+                    nodes { __typename ... on AutoMergeEnabledEvent { createdAt } ... on AutoMergeDisabledEvent { createdAt } ... on MergedEvent { createdAt } }
+                  }
+                }
+              }
+            }
+          }`;
+
+          // Detection only: no comment, no mutation. One list query carries the
+          // timeline reads (at most 50 PRs x 20 items).
+          async function auditRecentMerges(failures) {
+            const data = await graphql(RECENT_MERGED, { owner, name: repoName });
+            const nodes = data.repository?.pullRequests?.nodes;
+            if (!Array.isArray(nodes)) throw new Error('recent-merge audit: incomplete response');
+            const cutoff = Date.now() - AUDIT_WINDOW_MS;
+            for (const pr of nodes) {
+              if (!pr.mergedAt || Date.parse(pr.mergedAt) < cutoff) continue;
+              const items = pr.timelineItems?.nodes || [];
+              const mergedAt = items.filter((i) => i.__typename === 'MergedEvent').map((i) => i.createdAt).sort().pop();
+              const before = items
+                .filter((i) => (i.__typename === 'AutoMergeEnabledEvent' || i.__typename === 'AutoMergeDisabledEvent') && (!mergedAt || i.createdAt <= mergedAt))
+                .sort((x, y) => (x.createdAt < y.createdAt ? -1 : x.createdAt > y.createdAt ? 1 : 0));
+              const last = before[before.length - 1];
+              if (last && last.__typename === 'AutoMergeEnabledEvent') {
+                const sha = pr.mergeCommit?.oid || pr.headRefOid;
+                console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
+                failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
+              }
+            }
+          }
+
           const MAX_PASSES = 3;
 
           async function main() {
@@ -271,23 +318,34 @@ jobs:
             };
             if (first !== null) await attempt(first);
 
-            // Up to MAX_PASSES list-and-disarm passes, then a final list that must
-            // be empty. A listing failure is fatal (fail closed).
-            let remaining = null;
-            for (let pass = 1; pass <= MAX_PASSES; pass += 1) {
-              const armed = await listArmed();
-              if (!armed.length) { remaining = []; break; }
-              console.log(`pass ${pass}: ${armed.length} armed PR(s)`);
-              for (const pr of armed) await attempt(pr.number);
+            try {
+              // Up to MAX_PASSES list-and-disarm passes, then a final list that must
+              // be empty. A listing failure is fatal (fail closed).
+              let remaining = null;
+              for (let pass = 1; pass <= MAX_PASSES; pass += 1) {
+                const armed = await listArmed();
+                if (!armed.length) { remaining = []; break; }
+                console.log(`pass ${pass}: ${armed.length} armed PR(s)`);
+                for (const pr of armed) await attempt(pr.number);
+              }
+              if (remaining === null) remaining = await listArmed();
+              if (remaining.length) {
+                const names = remaining.map((p) => `#${p.number}`).join(', ');
+                console.log(`::error::auto-merge still armed after ${MAX_PASSES} passes: ${names}`);
+                failures.push(`still armed after ${MAX_PASSES} passes: ${names}`);
+              }
+            } catch (error) {
+              failures.push(`sweep: ${error.message}`);
+              console.error(`error: ${error.message}`);
             }
-            if (remaining === null) remaining = await listArmed();
-            if (remaining.length) {
-              const names = remaining.map((p) => `#${p.number}`).join(', ');
-              console.log(`::error::auto-merge still armed after ${MAX_PASSES} passes: ${names}`);
-              failures.push(`still armed after ${MAX_PASSES} passes: ${names}`);
+            try {
+              await auditRecentMerges(failures);
+            } catch (error) {
+              failures.push(`recent-merge audit: ${error.message}`);
+              console.error(`error: ${error.message}`);
             }
             if (failures.length) throw new Error(`${failures.length} failure(s):\n${failures.join('\n')}`);
-            console.log('ok: repository-complete; final armed-list is empty');
+            console.log('ok: repository-complete; final armed-list is empty; recent-merge audit clean');
           }
 
           main().catch((error) => {

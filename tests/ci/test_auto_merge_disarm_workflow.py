@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -52,6 +53,8 @@ class FakeGitHub:
         self.post_fail_count = 0
         self.merge_on_reread = set()  # armed in the list, MERGED by the time it is re-read
         self.after_first_page = None
+        self.merged = []  # dicts: number, mergedAt, sha, events[(type, time)]
+        self.audit_fail = False
         self.rearm_each_list = set()  # re-armed every time a listing starts
 
     def actor(self):
@@ -111,6 +114,16 @@ def _handler(fake: FakeGitHub):
                     fake.prs[n]["state"] = "merged"
                 pr = fake.pr_gql(n) if n in fake.prs else None
                 return self._send(200, {"data": {"repository": {"pullRequest": pr}}})
+            if "query RecentMerged" in query:
+                fake.calls.append(("GQL", "RecentMerged"))
+                if fake.audit_fail:
+                    return self._send(200, {"errors": [{"message": "audit boom"}], "data": None})
+                nodes = [{
+                    "number": m["number"], "mergedAt": m["mergedAt"], "headRefOid": m["sha"],
+                    "mergeCommit": {"oid": m["sha"]},
+                    "timelineItems": {"nodes": [{"__typename": t, "createdAt": c} for t, c in m["events"]]},
+                } for m in fake.merged]
+                return self._send(200, {"data": {"repository": {"pullRequests": {"nodes": nodes}}}})
             if "query ArmedList" in query:
                 fake.calls.append(("GQL", "ArmedList"))
                 fake.list_pages += 1
@@ -427,7 +440,7 @@ def test_script_never_references_arm_mutation():
 
 def test_repair_machinery_is_gone():
     script = _script()
-    for gone in ("repairReceipt", "timelineItems", "AutoMergeDisabledEvent", "paginateRest"):
+    for gone in ("repairReceipt", "paginateRest", "minCreatedAt"):
         assert gone not in script
 
 
@@ -459,3 +472,65 @@ def test_invalid_dispatch_input_still_sweeps_then_fails(gh):
         r = run(gh, event="workflow_dispatch", pr_number=bad)
         assert r.returncode != 0
         assert not gh.prs[1]["armed"]
+
+
+def _iso(delta):
+    return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def add_merged(fake, n, ago, events):
+    """events: list of (type, minutes-before-merge); merge itself is the MergedEvent."""
+    merged = datetime.now(timezone.utc) - ago
+    evs = [(t, (merged - timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")) for t, m in events]
+    evs.append(("MergedEvent", merged.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    fake.merged.append({"number": n, "mergedAt": merged.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "sha": f"{n:040x}", "events": evs})
+
+
+@needs_node
+def test_recent_native_auto_merge_raises_alarm_without_trigger(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [("AutoMergeEnabledEvent", 5)])
+    r = run(gh)  # scheduled sweep, nothing armed
+    assert r.returncode != 0
+    assert f"::error::PR #9 merged via native auto-merge at {9:040x}; hermes grants no merge authority" in r.stdout
+    assert not any(c[0] == "POST" for c in gh.calls)            # no comment
+    assert not any(c == ("GQL", "Disarm") for c in gh.calls)    # no mutation
+
+
+@needs_node
+def test_enabled_then_disabled_before_manual_merge_is_not_alarmed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [("AutoMergeEnabledEvent", 8), ("AutoMergeDisabledEvent", 6)])
+    r = run(gh)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "::error::" not in r.stdout
+
+
+@needs_node
+def test_merged_pr_without_auto_merge_events_is_not_alarmed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    assert run(gh).returncode == 0
+
+
+@needs_node
+def test_merge_older_than_window_is_ignored(gh):
+    add_merged(gh, 9, timedelta(hours=3), [("AutoMergeEnabledEvent", 5)])
+    r = run(gh)
+    assert r.returncode == 0 and "::error::" not in r.stdout
+
+
+@needs_node
+def test_failed_audit_query_is_nonzero_after_sweep_still_disarmed(gh):
+    add_pr(gh, 1, armed=True)
+    gh.audit_fail = True
+    r = run(gh)
+    assert r.returncode != 0
+    assert not gh.prs[1]["armed"]
+    assert any(c == ("GQL", "RecentMerged") for c in gh.calls)
+
+
+@needs_node
+def test_audit_runs_on_event_runs_too(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [("AutoMergeEnabledEvent", 5)])
+    add_pr(gh, 1, armed=False)
+    r = run(gh, event="pull_request_target", pr_event=pr_event(1))
+    assert r.returncode != 0 and "::error::PR #9" in r.stdout
