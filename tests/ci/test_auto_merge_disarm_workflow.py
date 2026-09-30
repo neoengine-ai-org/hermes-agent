@@ -42,39 +42,29 @@ def _script() -> str:
 class FakeGitHub:
     def __init__(self):
         self.prs = {}  # number -> dict(state, armed, sha)
-        self.comments = {}  # number -> list (REST shape)
-        self.events = {}  # number -> list of {createdAt, actor}
+        self.comments = {}  # number -> list of {body, user:{login,type}}
         self.calls = []
-        self.clock = 0
         self.disarm_fails = set()
         self.disarm_noop = set()  # disarm "succeeds" but stays armed
         self.list_fail_page = None
         self.list_pages = 0
         self.user_login = None  # None => /user 403 (app token); else PAT user
         self.post_fail_count = 0
-        self.arm_on_armed_list = None  # PR number armed when the second pass starts
-        self.after_first_page = None  # callback run after the first SweepList page
-
-    def now(self):
-        self.clock += 1
-        return f"2026-01-01T{self.clock // 3600:02d}:{(self.clock // 60) % 60:02d}:{self.clock % 60:02d}Z"
+        self.merge_on_reread = set()  # armed in the list, MERGED by the time it is re-read
+        self.after_first_page = None
 
     def actor(self):
         if self.user_login:
             return {"login": self.user_login, "type": "User"}
-        return {"login": "steward[bot]", "type": "Bot"}
+        return {"login": "steward", "type": "Bot"}
 
     def pr_gql(self, n):
         p = self.prs[n]
         return {
             "id": f"PR_{n}", "number": n, "state": p["state"].upper(), "headRefOid": p["sha"],
             "autoMergeRequest": {"enabledAt": "t"} if p["armed"] else None,
-            "timelineItems": {"nodes": [
-                {"createdAt": e["createdAt"], "actor": {"login": e["actor"]["login"].replace("[bot]", ""), "__typename": e["actor"]["type"]}}
-                for e in self.events.get(n, [])[-5:]]},
             "comments": {"nodes": [
-                {"body": c["body"], "createdAt": c["created_at"],
-                 "author": {"login": c["user"]["login"].replace("[bot]", ""), "__typename": c["user"]["type"]}}
+                {"body": c["body"], "author": {"login": c["user"]["login"]}}
                 for c in self.comments.get(n, [])[-30:]]},
         }
 
@@ -94,17 +84,11 @@ def _handler(fake: FakeGitHub):
 
         def do_GET(self):
             u = urlparse(self.path)
-            q = parse_qs(u.query)
             fake.calls.append(("GET", u.path))
             if u.path == "/user":
                 if fake.user_login:
                     return self._send(200, {"login": fake.user_login})
                 return self._send(403, {"message": "forbidden"})
-            m = re.fullmatch(rf"/repos/{REPO}/issues/(\d+)/comments", u.path)
-            if m:
-                cs = fake.comments.get(int(m.group(1)), [])
-                page = int(q["page"][0]); per = int(q["per_page"][0])
-                return self._send(200, cs[(page - 1) * per: page * per])
             self._send(404, {"message": "nf"})
 
         def _graphql(self, body):
@@ -118,32 +102,27 @@ def _handler(fake: FakeGitHub):
                     return self._send(200, {"errors": [{"message": "denied"}], "data": None})
                 if n not in fake.disarm_noop:
                     fake.prs[n]["armed"] = False
-                    fake.events.setdefault(n, []).append({"createdAt": fake.now(), "actor": fake.actor()})
                 return self._send(200, {"data": {"disablePullRequestAutoMerge": {"pullRequest": {"number": n}}}})
             if "query PrByNumber" in query:
                 fake.calls.append(("GQL", "PrByNumber"))
                 n = v["number"]
+                if n in fake.merge_on_reread:
+                    fake.prs[n]["state"] = "merged"
                 pr = fake.pr_gql(n) if n in fake.prs else None
                 return self._send(200, {"data": {"repository": {"pullRequest": pr}}})
-            if "query SweepList" in query or "query ArmedList" in query:
-                name = "SweepList" if "SweepList" in query else "ArmedList"
-                fake.calls.append(("GQL", name))
-                if name == "ArmedList" and fake.arm_on_armed_list is not None:
-                    fake.prs[fake.arm_on_armed_list]["armed"] = True
-                    fake.arm_on_armed_list = None
+            if "query ArmedList" in query:
+                fake.calls.append(("GQL", "ArmedList"))
                 fake.list_pages += 1
                 if fake.list_fail_page == fake.list_pages:
                     return self._send(200, {"errors": [{"message": "boom"}], "data": None})
                 after = int(v["cursor"]) if v["cursor"] else 0  # keyset cursor = last PR number
                 opens = [n for n in sorted(fake.prs) if fake.prs[n]["state"] == "open" and n > after]
                 page, more = opens[:100], len(opens) > 100
-                nodes = [fake.pr_gql(n) for n in page]
-                if name == "ArmedList":
-                    nodes = [{k: x[k] for k in ("id", "number", "state", "headRefOid", "autoMergeRequest")} for x in nodes]
+                nodes = [{k: fake.pr_gql(n)[k] for k in ("id", "number", "autoMergeRequest")} for n in page]
                 resp = {"data": {"repository": {"pullRequests": {
                     "pageInfo": {"hasNextPage": more, "endCursor": str(page[-1]) if page else None},
                     "nodes": nodes}}}}
-                if name == "SweepList" and fake.after_first_page:
+                if fake.after_first_page:
                     cb, fake.after_first_page = fake.after_first_page, None
                     cb()
                 return self._send(200, resp)
@@ -161,8 +140,7 @@ def _handler(fake: FakeGitHub):
                     fake.post_fail_count -= 1
                     return self._send(502, {"message": "transient"})
                 n = int(m.group(1))
-                fake.comments.setdefault(n, []).append(
-                    {"body": body["body"], "user": fake.actor(), "created_at": fake.now()})
+                fake.comments.setdefault(n, []).append({"body": body["body"], "user": fake.actor()})
                 return self._send(201, {"id": 1})
             self._send(404, {"message": "nf"})
 
@@ -197,10 +175,14 @@ def run(fake, event="schedule", pr_event=None, pr_number=""):
     return subprocess.run(["node", str(script)], env=env, capture_output=True, text=True, timeout=60)
 
 
+def pr_event(n):
+    return {"pull_request": {"number": n}}
+
+
 # ---- behavior ----
 
 @needs_node
-def test_sweep_disarms_armed_and_comments_once(gh):
+def test_sweep_disarms_armed_and_posts_one_receipt(gh):
     add_pr(gh, 1, armed=True)
     add_pr(gh, 2, armed=False)
     add_pr(gh, 3, armed=True)
@@ -210,43 +192,58 @@ def test_sweep_disarms_armed_and_comments_once(gh):
     assert len(gh.comments[1]) == 1 and len(gh.comments[3]) == 1 and 2 not in gh.comments
     assert gh.prs[1]["sha"] in gh.comments[1][0]["body"]
     assert "founder merge decision" in gh.comments[1][0]["body"]
-    # no per-PR REST GET of pulls, no duplicate receipts on an idle re-sweep
     assert not any(c[0] == "GET" and "/pulls" in c[1] for c in gh.calls)
-    assert run(gh).returncode == 0
+    assert run(gh).returncode == 0           # idle re-run posts nothing
     assert len(gh.comments[1]) == 1
-    # re-arm same head, rerun: still one receipt for that head
-    gh.prs[1]["armed"] = True
-    assert run(gh).returncode == 0
-    assert len(gh.comments[1]) == 1
-    # new head gets a new receipt
-    gh.prs[1].update(armed=True, sha="f" * 40)
-    assert run(gh).returncode == 0
-    assert len(gh.comments[1]) == 2
 
 
 @needs_node
-def test_never_arms_or_merges(gh):
-    add_pr(gh, 1, armed=False)
-    add_pr(gh, 2, armed=True)
-    assert run(gh).returncode == 0
-    assert all(c[0] != "GQL" or c[1] in {"SweepList", "ArmedList", "PrByNumber", "Disarm"} for c in gh.calls)
-
-
-@needs_node
-def test_event_run_handles_single_pr_using_live_state(gh):
+def test_every_run_is_repository_complete_event_names_other_pr(gh):
+    # Event payload names PR 2 while PR 1 is armed: both must be disarmed.
     add_pr(gh, 1, armed=True)
     add_pr(gh, 2, armed=True)
-    r = run(gh, event="pull_request_target", pr_event={"pull_request": {"number": 2, "auto_merge": None}})
+    r = run(gh, event="pull_request_target", pr_event=pr_event(2))
     assert r.returncode == 0, r.stderr
-    assert gh.prs[1]["armed"] and not gh.prs[2]["armed"]
+    assert not gh.prs[1]["armed"] and not gh.prs[2]["armed"]
 
 
 @needs_node
-def test_dispatch_with_number_and_closed_pr(gh):
+def test_event_pr_is_processed_first(gh):
+    add_pr(gh, 1, armed=True)
+    add_pr(gh, 2, armed=True)
+    assert run(gh, event="pull_request_target", pr_event=pr_event(2)).returncode == 0
+    order = [c for c in gh.calls if c[0] == "GQL" and c[1] == "Disarm"]
+    assert len(order) == 2
+    assert "PrByNumber" == [c[1] for c in gh.calls if c[0] == "GQL"][0]
+
+
+@needs_node
+def test_dispatch_with_number_is_also_repository_complete(gh):
+    add_pr(gh, 1, armed=True)
+    add_pr(gh, 5, armed=True)
+    assert run(gh, event="workflow_dispatch", pr_number="5").returncode == 0
+    assert not gh.prs[1]["armed"] and not gh.prs[5]["armed"]
+    assert run(gh, event="workflow_dispatch", pr_number="5; rm -rf").returncode != 0
+
+
+@needs_node
+def test_closed_unmerged_pr_is_skipped_silently(gh):
     add_pr(gh, 5, armed=True, state="closed")
     r = run(gh, event="workflow_dispatch", pr_number="5")
     assert r.returncode == 0 and gh.prs[5]["armed"] and 5 not in gh.comments
-    assert run(gh, event="workflow_dispatch", pr_number="5; rm -rf").returncode != 0
+    assert "::error::" not in r.stdout + r.stderr
+
+
+@needs_node
+def test_merged_before_disarm_raises_drift_alarm(gh):
+    add_pr(gh, 1, armed=True)
+    gh.merge_on_reread.add(1)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #1 head " + gh.prs[1]["sha"] in r.stdout
+    assert "native auto-merge merged before disarm" in r.stdout
+    assert 1 not in gh.comments
+    assert not any(c == ("GQL", "Disarm") for c in gh.calls)
 
 
 @needs_node
@@ -254,18 +251,15 @@ def test_failed_disarm_exits_nonzero_but_continues(gh):
     add_pr(gh, 1, armed=True)
     add_pr(gh, 2, armed=True)
     gh.disarm_fails.add(1)
-    r = run(gh)
-    assert r.returncode != 0
-    assert not gh.prs[2]["armed"]
-    assert 1 not in gh.comments
+    assert run(gh).returncode != 0
+    assert not gh.prs[2]["armed"] and 1 not in gh.comments
 
 
 @needs_node
 def test_readback_still_armed_is_failure_and_no_receipt(gh):
     add_pr(gh, 1, armed=True)
     gh.disarm_noop.add(1)
-    r = run(gh)
-    assert r.returncode != 0 and 1 not in gh.comments
+    assert run(gh).returncode != 0 and 1 not in gh.comments
 
 
 @needs_node
@@ -287,7 +281,6 @@ def test_cursor_pagination_covers_more_than_one_page(gh):
 
 @needs_node
 def test_churn_during_listing_does_not_skip_prs(gh):
-    # Removing an already-listed PR between pages must not shift later PRs out of view.
     for n in range(1, 131):
         add_pr(gh, n, armed=(n == 120))
     gh.after_first_page = lambda: gh.prs[1].update(state="closed")
@@ -296,41 +289,18 @@ def test_churn_during_listing_does_not_skip_prs(gh):
 
 
 @needs_node
-def test_second_pass_catches_pr_armed_after_first_scan(gh):
-    add_pr(gh, 1, armed=False)
-    add_pr(gh, 2, armed=False)
-    gh.arm_on_armed_list = 1
-    r = run(gh)
-    assert r.returncode == 0, r.stderr
-    assert not gh.prs[1]["armed"]
-    assert len(gh.comments[1]) == 1
-
-
-@needs_node
-def test_receipt_post_failure_then_next_sweep_repairs_exactly_once(gh):
+def test_receipt_post_failure_fails_run_and_is_not_retried_later(gh):
     add_pr(gh, 1, armed=True)
     gh.post_fail_count = 1
-    assert run(gh).returncode != 0          # disarmed, receipt POST failed -> nonzero
+    assert run(gh).returncode != 0            # disarmed, notice failed -> nonzero
     assert not gh.prs[1]["armed"] and 1 not in gh.comments
-    assert run(gh).returncode == 0           # not armed, repair posts the receipt
-    assert len(gh.comments[1]) == 1
-    assert run(gh).returncode == 0           # and never again
-    assert run(gh, event="pull_request_target", pr_event={"pull_request": {"number": 1}}).returncode == 0
-    assert len(gh.comments[1]) == 1
-
-
-@needs_node
-def test_repair_ignores_disarms_by_other_actors(gh):
-    add_pr(gh, 1, armed=False)
-    gh.user_login = "steward-pat"
-    gh.events[1] = [{"createdAt": gh.now(), "actor": {"login": "someone-else", "type": "User"}}]
-    assert run(gh).returncode == 0
+    assert run(gh).returncode == 0            # nothing retries the notice later
     assert 1 not in gh.comments
 
 
 @needs_node
-def test_pat_user_receipt_is_deduped(gh):
-    gh.user_login = "steward-pat"  # PAT path: comments are authored by a User
+def test_pat_user_receipt_is_deduped_by_exact_login(gh):
+    gh.user_login = "steward-pat"
     add_pr(gh, 1, armed=True)
     assert run(gh).returncode == 0
     assert gh.comments[1][0]["user"]["type"] == "User"
@@ -340,20 +310,23 @@ def test_pat_user_receipt_is_deduped(gh):
 
 
 @needs_node
-def test_spoofed_human_marker_does_not_suppress_receipt(gh):
+def test_user_unavailable_posts_without_dedupe_even_for_other_bots(gh):
     add_pr(gh, 1, armed=True)
     marker = f"<!-- hermes-auto-merge-disarm:head={gh.prs[1]['sha']} -->"
-    gh.comments[1] = [{"body": marker, "user": {"type": "User", "login": "mallory"}, "created_at": gh.now()}]
+    gh.comments[1] = [{"body": marker, "user": {"type": "Bot", "login": "other"}}]
     assert run(gh).returncode == 0
     assert len(gh.comments[1]) == 2
+    gh.prs[1]["armed"] = True
+    assert run(gh).returncode == 0            # /user unavailable: no dedupe, duplicate is harmless
+    assert len(gh.comments[1]) == 3
 
 
 @needs_node
-def test_login_mismatch_does_not_suppress_receipt(gh):
+def test_spoofed_marker_from_other_login_does_not_suppress(gh):
+    gh.user_login = "steward-pat"
     add_pr(gh, 1, armed=True)
-    gh.user_login = "steward[bot]"
     marker = f"<!-- hermes-auto-merge-disarm:head={gh.prs[1]['sha']} -->"
-    gh.comments[1] = [{"body": marker, "user": {"type": "Bot", "login": "other[bot]"}, "created_at": gh.now()}]
+    gh.comments[1] = [{"body": marker, "user": {"type": "User", "login": "mallory"}}]
     assert run(gh).returncode == 0
     assert len(gh.comments[1]) == 2
 
@@ -371,6 +344,7 @@ def test_triggers_and_concurrency():
     assert wf["concurrency"]["cancel-in-progress"] is False
     # one repository-wide group: sweep and event runs are serialized
     assert wf["concurrency"]["group"] == "hermes-auto-merge-disarm"
+    assert "pull_request" not in wf["concurrency"]["group"]
     # contents: write is needed by disablePullRequestAutoMerge with the github.token fallback
     assert wf["permissions"] == {"contents": "write", "pull-requests": "write", "issues": "write"}
 
@@ -447,3 +421,9 @@ def test_no_pr_head_checkout_and_no_untrusted_interpolation():
 def test_script_never_references_arm_mutation():
     assert "enablePullRequestAutoMerge" not in _script()
     assert "disablePullRequestAutoMerge" in _script()
+
+
+def test_repair_machinery_is_gone():
+    script = _script()
+    for gone in ("repairReceipt", "timelineItems", "AutoMergeDisabledEvent", "paginateRest"):
+        assert gone not in script
