@@ -18,6 +18,7 @@ the tag named in its comment; that is a review obligation.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 from typing import NamedTuple
 
@@ -26,15 +27,27 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = ROOT / ".github/workflows"
-_SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".tox"}
+
+
+def _tracked_action_manifests() -> list[Path]:
+    # Enumerate tracked files rather than pruning by directory name: a local
+    # `uses: ./node_modules/x` is just as executable as `./.github/actions/x`.
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*action.yml", "*action.yaml"],
+            check=True,
+            capture_output=True,
+        ).stdout.decode()
+    except (OSError, subprocess.CalledProcessError):
+        return sorted(
+            p for pattern in ("action.yml", "action.yaml") for p in ROOT.rglob(pattern)
+            if ".git" not in p.relative_to(ROOT).parts
+        )
+    return sorted(ROOT / rel for rel in out.split("\0") if Path(rel).name in {"action.yml", "action.yaml"})
+
 
 WORKFLOWS = sorted([*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")])
-COMPOSITE_ACTIONS = sorted(
-    path
-    for pattern in ("action.yml", "action.yaml")
-    for path in ROOT.rglob(pattern)
-    if not _SKIP_DIRS.intersection(path.relative_to(ROOT).parts)
-)
+COMPOSITE_ACTIONS = _tracked_action_manifests()
 
 _SEGMENT = r"(?!\.{1,2}(?:/|@))[A-Za-z0-9_.-]+"
 PINNED_REMOTE = re.compile(rf"^{_SEGMENT}/{_SEGMENT}(?:/{_SEGMENT})*@[0-9a-f]{{40}}$")
@@ -161,6 +174,34 @@ def test_every_remote_action_is_sha_pinned(path: Path) -> None:
     assert not offenders, (
         "remote actions must be pinned to a 40-hex SHA with a version comment:\n" + "\n".join(offenders)
     )
+
+
+def _local_target_errors(refs: list[UsesRef]) -> list[str]:
+    scanned = {path.parent.resolve() for path in COMPOSITE_ACTIONS}
+    errors = []
+    for ref in refs:
+        if not ref.ref.startswith("./") or ref.ref.startswith("./.github/workflows/"):
+            continue  # remote refs are pattern-checked; local reusable workflows are scanned as WORKFLOWS
+        target = (ROOT / ref.ref).resolve()
+        if target not in scanned:
+            errors.append(f"{ref.where()} (local action is not a scanned tracked action.yml)")
+    return errors
+
+
+@pytest.mark.parametrize("path", [*WORKFLOWS, *COMPOSITE_ACTIONS], ids=lambda p: str(p.relative_to(ROOT)))
+def test_local_actions_resolve_to_scanned_manifests(path: Path) -> None:
+    # allow_local only defers trust to the target, so the target must be pin-checked too.
+    errors = _local_target_errors(_collect_uses(path)[0])
+    assert not errors, "\n".join(errors)
+
+
+def test_local_target_outside_scan_is_rejected() -> None:
+    refs, _ = _collect_uses(
+        ROOT / "synthetic.yml",
+        "jobs:\n  j:\n    steps:\n      - uses: ./node_modules/bridge\n      - uses: ./.github/actions/nix-setup\n",
+    )
+    errors = _local_target_errors(refs)
+    assert len(errors) == 1 and "node_modules/bridge" in errors[0]
 
 
 @pytest.mark.parametrize(
