@@ -145,11 +145,11 @@ jobs:
               echo "::error::base or head commit unavailable; refusing ambiguous change selection"
               exit 2
             fi
-            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
             # The candidate run executes its workflow definition from the PR
             # merge ref; it is only base-defined while the PR's own commits
             # (merge-base diff) leave it alone.
-            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
+            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
             if grep -qxF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
               echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
             else
@@ -161,7 +161,9 @@ jobs:
           fi
           python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
           printf '%s' "$PR_BODY" > pr-body.md
-          python3 .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
+          # -I: isolated mode drops the script directory from sys.path, so a
+          # new module beside the pinned script cannot shadow a stdlib import.
+          python3 -I .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
             --changed-files-json "$(cat changed-files.json)" \
             --event-name "$EVENT_NAME" \
             --ref "$EVENT_REF" \
@@ -664,7 +666,7 @@ jobs:
             *) exit 1 ;;
           esac
           printf '%s' "$REVIEW_CLASSIFICATION" > review-classification.json
-          python3 trusted/scripts/review_receipt_validator.py \
+          python3 -I trusted/scripts/review_receipt_validator.py \
             --classification review-classification.json \
             --pr-body authenticated-reviews.md \
             --head-sha "$HEAD_SHA" \

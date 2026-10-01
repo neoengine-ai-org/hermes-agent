@@ -307,3 +307,20 @@ def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_pat
     monkeypatch.setattr(os, "scandir", vanishing_scandir)
     assert adapter.discover_tests() == ["tests/test_kept.py"]
     assert adapter.discover_python_sources() == ["pkg/mod.py"]
+
+
+
+def test_discovery_still_raises_on_non_vanish_errors(monkeypatch, tmp_path) -> None:
+    (tmp_path / "tests/locked").mkdir(parents=True)
+    (tmp_path / "tests/test_a.py").write_text("", encoding="utf-8")
+    real_scandir = os.scandir
+
+    def denied_scandir(path="."):
+        if Path(path).name == "locked":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    monkeypatch.setattr(os, "scandir", denied_scandir)
+    with pytest.raises(PermissionError):
+        adapter.discover_tests()

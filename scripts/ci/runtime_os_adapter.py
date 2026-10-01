@@ -111,8 +111,14 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     ``__pycache__`` directories while this runs, and rglob raises
     FileNotFoundError on a directory that vanishes mid-walk; os.walk skips it.
     """
+    def vanished_only(error: OSError) -> None:
+        # Only a directory that disappeared mid-walk is skipped; any other
+        # traversal error must not silently drop sources or tests.
+        if not isinstance(error, (FileNotFoundError, NotADirectoryError)):
+            raise error
+
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(start):
+    for dirpath, dirnames, filenames in os.walk(start, onerror=vanished_only):
         relative = Path(dirpath).relative_to(CANDIDATE_ROOT).parts
         dirnames[:] = [name for name in dirnames if not prune(relative + (name,))]
         found.extend(Path(dirpath) / name for name in filenames if name.endswith(".py"))
@@ -204,7 +210,9 @@ def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
 
     Breadth-first over a prefix -> importer index; the same least fixpoint the
     pairwise rescan computed, in time linear in the references. Also returns
-    sources that could not be parsed.
+    sources that could not be parsed; any such source outside the closure
+    marks the plan unknown (unlike the old order-dependent rescan, a parse
+    failure that shares its module name with an impacted source does not).
     """
     importers: dict[str, list[str]] = {}
     parse_failures: list[str] = []

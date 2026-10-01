@@ -113,6 +113,12 @@ NETWORK_TOOL = re.compile(
 CHECKSUM_LINE = re.compile(
     r'^\s*echo\s+"(?:\$\{?(?P<var>\w+)\}?|(?P<hex>[0-9a-f]{64}))\s+(?P<target>[^"\s]+)"\s*\|\s*sha256sum\s+-c\s+-\s*$'
 )
+# A script run from a trusted checkout must use isolated mode (-I): otherwise
+# Python puts its directory first on sys.path and a new sibling module could
+# shadow a stdlib import without changing any pinned file.
+TRUSTED_SCRIPT_RUN = re.compile(
+    r"(?<![\w./-])python3?(?P<flags>(?:\s+-\w+)*)\s+(?P<script>(?:\.runtime-os-[\w-]+|trusted)/\S+\.py)\b"
+)
 # Scripts the privileged jobs execute from trusted checkouts; pinned too.
 PRIVILEGED_SCRIPTS = (
     "scripts/ci/runtime_os_adapter.py",
@@ -554,6 +560,9 @@ def _job_violations(
             violations.append(f"{label} pipes command output into an interpreter")
         if URL_INSTALL.search(script):
             violations.append(f"{label} installs packages from a URL")
+        for match in TRUSTED_SCRIPT_RUN.finditer(script):
+            if "-I" not in match["flags"].split():
+                violations.append(f"{label} runs {match['script']} without python -I")
         if FOREIGN_DOWNLOAD.search(script):
             violations.append(
                 f"{label} downloads artifacts or repositories from outside this run"
@@ -1524,3 +1533,71 @@ def test_detector_rejects_round_95e282b1_bypasses(
 ) -> None:
     violations = pull_request_target_violations(workflow, "synthetic", root=None)
     assert any(reason in violation for violation in violations), violations
+
+
+def test_trusted_script_runs_require_isolated_mode() -> None:
+    violations = pull_request_target_violations(
+        _prt([
+            {"run": "python3 .runtime-os-trusted/scripts/ci/runtime_os_adapter.py --x"}
+        ]),
+        "synthetic",
+        root=None,
+    )
+    assert any("without python -I" in violation for violation in violations), violations
+    assert not [
+        v
+        for v in pull_request_target_violations(
+            _prt([
+                {"run": "python3 -I trusted/scripts/review_receipt_validator.py --x"}
+            ]),
+            "synthetic",
+            root=None,
+        )
+        if "without python -I" in v
+    ]
+
+
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["scripts/ci/runtime_os_adapter.py", "scripts/review_receipt_validator.py"],
+)
+def test_isolated_mode_blocks_sibling_stdlib_shadowing(
+    tmp_path: Path, entrypoint: str
+) -> None:
+    """Behavioural: a new module beside a pinned privileged script (no pinned
+    file changes) runs under plain python3 but not under python3 -I, which is
+    how the advisory invokes it."""
+    import shutil
+    import subprocess
+    import sys
+
+    for relative in PRIVILEGED_SCRIPTS:
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, tmp_path / relative)
+    for shadow in ("scripts/ci/argparse.py", "scripts/argparse.py", "scripts/hmac.py"):
+        (tmp_path / shadow).write_text(
+            "raise SystemExit('SHADOWED')\n", encoding="utf-8"
+        )
+    plain = subprocess.run(
+        [sys.executable, entrypoint, "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert "SHADOWED" in plain.stderr  # negative control: the attack is real
+    isolated = subprocess.run(
+        [sys.executable, "-I", entrypoint, "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert (
+        isolated.returncode == 0 and "SHADOWED" not in isolated.stderr + isolated.stdout
+    )
+    workflow_text = (WORKFLOWS / "ci-runtime-os-advisory.yml").read_text(
+        encoding="utf-8"
+    )
+    assert (
+        f"python3 -I {'.runtime-os-trusted/' if 'ci/' in entrypoint else 'trusted/'}{entrypoint}"
+        in workflow_text
+    )

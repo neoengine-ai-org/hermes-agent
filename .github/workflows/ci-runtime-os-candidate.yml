@@ -106,10 +106,10 @@ jobs:
           if ! git -C candidate cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
             git -C candidate fetch --no-tags origin "$BASE_SHA"
           fi
-          git -C candidate diff --name-only "$BASE_SHA" HEAD > changed-files.txt
+          git -C candidate diff --no-renames --name-only "$BASE_SHA" HEAD > changed-files.txt
           python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
           printf '%s' "$PR_BODY" > pr-body.md
-          python3 .runtime-os-base/scripts/ci/runtime_os_adapter.py \
+          python3 -I .runtime-os-base/scripts/ci/runtime_os_adapter.py \
             --changed-files-json "$(cat changed-files.json)" \
             --event-name pull_request \
             --ref "$EVENT_REF" \
