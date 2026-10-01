@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
@@ -179,3 +182,112 @@ def test_plan_emits_complete_workflow_output_contract(tmp_path, monkeypatch) -> 
         "has_tests",
         "telemetry_write_allowed",
     }
+
+
+def _write_tree(root: Path, files: list[str]) -> None:
+    for relative in files:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("import agent.core\n", encoding="utf-8")
+
+
+def test_discovery_prunes_excluded_dirs_without_descending(tmp_path, monkeypatch) -> None:
+    _write_tree(
+        tmp_path,
+        [
+            "agent/core.py",
+            ".venv/lib/site-packages/pkg/mod.py",
+            ".git/hooks/hook.py",
+            "nested/venv/lib/x.py",
+            "tests/test_core.py",
+            "tests/integration/test_live.py",
+        ],
+    )
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+    forbidden = {".venv", ".git", "venv", "integration"}
+
+    def guarded_scandir(path=".", *args, **kwargs):
+        assert not (set(Path(os.fspath(path)).relative_to(tmp_path).parts) & forbidden), path
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+    assert adapter.discover_tests() == ["tests/test_core.py"]
+
+
+def test_discovery_never_scans_bytecode_caches(tmp_path, monkeypatch) -> None:
+    # Parallel test files share the checkout; ``hermes update`` tests and
+    # fresh interpreters delete/recreate ``__pycache__`` concurrently, which
+    # made Python 3.11 rglob raise FileNotFoundError on tests/__pycache__.
+    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
+    (tmp_path / "tests/__pycache__").mkdir()
+    (tmp_path / "agent/__pycache__").mkdir()
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+
+    def racing_scandir(path=".", *args, **kwargs):
+        if Path(os.fspath(path)).name == "__pycache__":
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", racing_scandir)
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+    assert adapter.discover_tests() == ["tests/test_core.py"]
+
+
+def test_discovery_fails_closed_when_a_source_dir_vanishes(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "gateway/run.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+
+    def vanishing_scandir(path=".", *args, **kwargs):
+        if Path(os.fspath(path)).name == "gateway":
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", vanishing_scandir)
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_python_sources()
+
+
+def test_discovery_skips_unreadable_dirs_like_rglob(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "locked/hidden.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+
+    def denied_scandir(path=".", *args, **kwargs):
+        if Path(os.fspath(path)).name == "locked":
+            raise PermissionError(13, "Permission denied", os.fspath(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", denied_scandir)
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+
+
+def test_prefix_index_matches_reference_import_semantics() -> None:
+    sources = adapter.discover_python_sources()[:200] + adapter.discover_tests()[:200]
+    modules = sorted({adapter._module_name(path) for path in sources})
+    for path in sources:
+        try:
+            adapter._module_references(path)
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        for module in modules:
+            assert adapter._imports_any_module(path, {module}) is adapter._imports_module(
+                path, module
+            ), (path, module)
+
+
+def test_node_iteration_visits_exactly_the_ast_walk_node_set() -> None:
+    import ast
+
+    paths = [
+        "scripts/ci/runtime_os_adapter.py",
+        "scripts/ci_risk_classifier.py",
+        "tests/ci/test_runtime_os_adapter.py",
+    ]
+    for relative in paths:
+        tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+        walked = sorted(map(id, ast.walk(tree)))
+        assert sorted(map(id, adapter._iter_nodes(tree))) == walked, relative

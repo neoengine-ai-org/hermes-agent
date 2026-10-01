@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import fnmatch
 import functools
 import hashlib
 import importlib.util
@@ -104,11 +105,42 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
+# Bytecode caches never hold ``*.py`` sources, and other processes sharing
+# the checkout (parallel test files, ``hermes update``) create and delete them
+# at any moment, so they are never descended into.
+_ALWAYS_PRUNED = {"__pycache__"}
+
+
+def _raise_walk_error(error: OSError) -> None:
+    # Parity with Python 3.11 ``Path.rglob``: unreadable directories are
+    # skipped; any other walk failure (vanished source dir, ELOOP, EIO) still
+    # raises so selection fails closed instead of silently narrowing.
+    if not isinstance(error, PermissionError):
+        raise error
+
+
+def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
+    """List files under ``top`` matching ``pattern``, pruning excluded dirs.
+
+    Unlike ``Path.rglob``, excluded directories (virtualenvs, ``.git``,
+    ``__pycache__``) are never descended into.
+    """
+    if not top.is_dir():
+        return []
+    skip = pruned | _ALWAYS_PRUNED
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(top, onerror=_raise_walk_error):
+        dirnames[:] = sorted(name for name in dirnames if name not in skip)
+        base = Path(dirpath)
+        found.extend(base / name for name in filenames if fnmatch.fnmatchcase(name, pattern))
+    return found
+
+
 def discover_tests() -> list[str]:
     skip_parts = {"integration", "e2e", "docker"}
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in (CANDIDATE_ROOT / "tests").rglob("test_*.py")
+        for path in _walk_files(CANDIDATE_ROOT / "tests", skip_parts, "test_*.py")
         if path.is_file() and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
     )
 
@@ -117,7 +149,7 @@ def discover_python_sources() -> list[str]:
     excluded = {".git", ".venv", "tests", "venv"}
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in CANDIDATE_ROOT.rglob("*.py")
+        for path in _walk_files(CANDIDATE_ROOT, excluded, "*.py")
         if path.is_file()
         and not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
     )
@@ -128,12 +160,30 @@ def _module_name(path: str) -> str:
     return module.removesuffix(".__init__")
 
 
+def _iter_nodes(tree: ast.AST):
+    """Yield every node of ``tree`` (same node set as ``ast.walk``).
+
+    A plain stack walk avoids ``ast.walk``'s per-node ``iter_child_nodes`` /
+    ``iter_fields`` generator overhead, which dominated selection time.
+    """
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        yield node
+        for field in node._fields:
+            value = getattr(node, field, None)
+            if isinstance(value, list):
+                stack.extend(item for item in value if isinstance(item, ast.AST))
+            elif isinstance(value, ast.AST):
+                stack.append(value)
+
+
 @functools.lru_cache(maxsize=None)
 def _module_references(path: str) -> frozenset[str]:
     source = (CANDIDATE_ROOT / path).read_text(encoding="utf-8")
     tree = ast.parse(source, filename=path)
     references: set[str] = set()
-    for node in ast.walk(tree):
+    for node in _iter_nodes(tree):
         if isinstance(node, ast.Import):
             references.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -163,12 +213,32 @@ def _imports_module(path: str, module_name: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _reference_prefixes(path: str) -> frozenset[str]:
+    """Every dotted-boundary prefix of every reference in ``path``.
+
+    ``module in _reference_prefixes(path)`` is exactly
+    ``_imports_module(path, module)``: a reference equals ``module`` or starts
+    with ``module + "."`` iff ``module`` is one of its dot-boundary prefixes.
+    """
+    prefixes: set[str] = set()
+    for reference in _module_references(path):
+        parts = reference.split(".")
+        prefixes.update(".".join(parts[:index]) for index in range(1, len(parts) + 1))
+    return frozenset(prefixes)
+
+
+def _imports_any_module(path: str, module_names: set[str]) -> bool:
+    return not _reference_prefixes(path).isdisjoint(module_names)
+
+
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
     classifier = load_classifier()
     executable_suffixes = set(classifier.EXECUTABLE_SUFFIXES)
     selected: set[str] = set()
     unknown_executable = False
+    source_paths: list[str] | None = None
     for raw in files:
         path = raw.replace("\\", "/").removeprefix("./")
         candidate = CANDIDATE_ROOT / path
@@ -183,7 +253,8 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
         if suffix == ".py" and not path.startswith("tests/"):
             stem = candidate.stem.removeprefix("test_")
             impacted_modules = {_module_name(path)}
-            source_paths = discover_python_sources()
+            if source_paths is None:
+                source_paths = discover_python_sources()
             changed = True
             while changed:
                 changed = False
@@ -192,10 +263,7 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
                     if source_module in impacted_modules:
                         continue
                     try:
-                        if any(
-                            _imports_module(source_path, module)
-                            for module in impacted_modules
-                        ):
+                        if _imports_any_module(source_path, impacted_modules):
                             impacted_modules.add(source_module)
                             changed = True
                     except (OSError, SyntaxError, UnicodeError):
@@ -206,10 +274,7 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
                     matches.append(test)
                     continue
                 try:
-                    if any(
-                        _imports_module(test, module)
-                        for module in impacted_modules
-                    ):
+                    if _imports_any_module(test, impacted_modules):
                         matches.append(test)
                 except (OSError, SyntaxError, UnicodeError):
                     unknown_executable = True

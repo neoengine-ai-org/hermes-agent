@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -44,3 +46,31 @@ def _suppress_concurrent_hermes_gate(request, monkeypatch):
     monkeypatch.setattr(
         _cli_main, "_detect_concurrent_hermes_instances", lambda *_a, **_k: []
     )
+
+
+@pytest.fixture(autouse=True)
+def _protect_checkout_bytecode_cache(monkeypatch):
+    """Keep ``cmd_update`` tests from wiping the shared checkout's ``__pycache__``.
+
+    ``cmd_update`` calls ``_clear_bytecode_cache(PROJECT_ROOT)``, which
+    ``rmtree``s every ``__pycache__`` under the real repository.
+    ``scripts/run_tests_parallel.py`` runs other test files concurrently
+    against that same checkout, so the deletion races their tree walks
+    (e.g. ``scripts/ci/runtime_os_adapter.py`` discovery hit
+    ``FileNotFoundError: .../tests/__pycache__``). Calls aimed at the live
+    checkout become a no-op; any other root (``tmp_path``) still runs the
+    real implementation.
+    """
+    try:
+        from hermes_cli import main as _cli_main
+    except Exception:
+        return
+    real_clear = _cli_main._clear_bytecode_cache
+    checkout = _cli_main.PROJECT_ROOT.resolve()
+
+    def _guarded_clear(root):
+        if Path(root).resolve() == checkout:
+            return 0
+        return real_clear(root)
+
+    monkeypatch.setattr(_cli_main, "_clear_bytecode_cache", _guarded_clear)
