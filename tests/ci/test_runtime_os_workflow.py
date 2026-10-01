@@ -177,7 +177,14 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
         for theirs_step, ours_step in zip(trusted_steps, ours_steps, strict=True):
 
             if str(ours_step.get("uses", "")).startswith("actions/checkout"):
+                # Only the ref differs: every other checkout input must match.
                 assert ours_step["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+                theirs_inputs = {k: v for k, v in (theirs_step.get("with") or {}).items() if k != "ref"}
+                ours_inputs = {k: v for k, v in ours_step["with"].items() if k != "ref"}
+                assert ours_inputs == theirs_inputs, (job_id, ours_step.get("name"))
+                assert {k: v for k, v in ours_step.items() if k != "with"} == {
+                    k: v for k, v in theirs_step.items() if k != "with"
+                }, (job_id, ours_step.get("name"))
                 continue
             assert ours_step == as_candidate(theirs_step), (job_id, ours_step.get("name"))
 
@@ -341,6 +348,7 @@ const github = {
     poll += 1;
     if (runs === 'error') { const e = new Error('API rate limit exceeded'); e.status = 403; throw e; }
     if (runs === 'notfound') { const e = new Error('Not Found'); e.status = 404; throw e; }
+    if (runs === 'forbidden') { const e = new Error('Resource not accessible by integration'); e.status = 403; throw e; }
     return runs;
   },
 };
@@ -457,3 +465,8 @@ def test_waiter_retries_transient_api_failures(tmp_path: Path) -> None:
 def test_waiter_fails_fast_on_non_transient_client_errors(tmp_path: Path) -> None:
     out = _waiter(tmp_path, ["notfound", [_run(1, "success")]])
     assert out["failed"] and "HTTP 404" in out["failed"] and out["polls"] == 1
+
+
+def test_waiter_fails_fast_on_non_rate_limit_403(tmp_path: Path) -> None:
+    out = _waiter(tmp_path, ["forbidden", [_run(1, "success")]])
+    assert out["failed"] and "HTTP 403" in out["failed"] and out["polls"] == 1

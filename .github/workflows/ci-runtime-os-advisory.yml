@@ -423,7 +423,14 @@ jobs:
                 // Only rate limits, server errors, and network failures are
                 // transient; any other client error fails fast.
                 const status = Number(error.status || 0);
-                if (status >= 400 && status < 500 && status !== 403 && status !== 429) {
+                const headers = (error.response && error.response.headers) || {};
+                const rateLimited =
+                  status === 429 ||
+                  (status === 403 &&
+                    (String(headers['x-ratelimit-remaining']) === '0' ||
+                      headers['retry-after'] !== undefined ||
+                      /rate limit/i.test(String(error.message))));
+                if (status >= 400 && status < 500 && !rateLimited) {
                   core.setFailed(`Candidate proof lookup failed with HTTP ${status}: ${error.message}`);
                   return;
                 }
