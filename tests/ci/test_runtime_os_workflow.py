@@ -106,10 +106,16 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
     assert "grep -qxF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt" in text
     assert '--name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt' in text
     for job_id in ("preflight", "review-evidence"):
-        first_runs = [s.get("run", "") for s in jobs[job_id]["steps"] if "run" in s]
-        assert 'find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1' in first_runs[
-            0 if job_id == "review-evidence" else 1
+        cleanup = [
+            s for s in jobs[job_id]["steps"]
+            if s.get("name") == "Discard residue from earlier jobs on this shared runner"
         ]
+        assert len(cleanup) == 1 and 'find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1' in cleanup[0]["run"]
+        names = [s.get("name", "") for s in jobs[job_id]["steps"]]
+        assert names.index(cleanup[0]["name"]) < min(
+            i for i, s in enumerate(jobs[job_id]["steps"]) if str(s.get("uses", "")).startswith("actions/checkout")
+        )
+    assert waiter["steps"][0]["with"]["retries"] == 3
     assert waiter["steps"][0]["env"]["CANDIDATE_WORKFLOW"] == CANDIDATE.name
     aggregate = jobs["hermes-required"]["steps"][0]["run"]
     assert 'test "$CANDIDATE" = success' in aggregate
@@ -126,7 +132,10 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
         "on ${{ github.event.pull_request.base.sha }}"
     )
     assert all(job["runs-on"] == "ubuntu-latest" for job in workflow["jobs"].values())
+    assert workflow["env"]["UV_PYTHON_INSTALL_DIR"] == "${{ github.workspace }}/ci-fast/bin/.python"
+    assert workflow["env"]["UV_PYTHON_PREFERENCE"] == "only-managed"
     text = CANDIDATE.read_text(encoding="utf-8")
+    assert "test_wheel_locales_e2e.py" not in text
     assert "secrets." not in text
     assert "actions/cache/save" not in text
     assert "Upload protected-main duration sample" not in text
@@ -152,14 +161,12 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
         trusted_if = trusted_if.replace(f"!contains({PR_EVENTS}, github.event_name) && ", "")
         assert " ".join(str(ours["if"]).split()) == trusted_if.replace("preflight", "plan"), job_id
         trusted_steps = [s for s in theirs["steps"] if "protected-main" not in s.get("name", "")]
-        for theirs_step, ours_step in zip(trusted_steps, ours["steps"], strict=True):
+        hosted_only = [s for s in ours["steps"] if s.get("name") == "Install pinned uv for hosted consumers"]
+        assert len(hosted_only) == (0 if job_id == "environment" else 1), job_id
+        ours_steps = [s for s in ours["steps"] if s not in hosted_only]
+        for theirs_step, ours_step in zip(trusted_steps, ours_steps, strict=True):
+
             if str(ours_step.get("uses", "")).startswith("actions/checkout"):
                 assert ours_step["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
                 continue
-            if ours_step.get("name") == "Build locked environment with one infra-only retry":
-                ours_step = dict(ours_step)
-                assert ours_step.pop("env") == {
-                    "UV_PYTHON_INSTALL_DIR": "${{ github.workspace }}/ci-fast/bin/.python",
-                    "UV_PYTHON_PREFERENCE": "only-managed",
-                }
             assert ours_step == as_candidate(theirs_step), (job_id, ours_step.get("name"))

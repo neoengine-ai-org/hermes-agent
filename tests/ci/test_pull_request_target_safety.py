@@ -42,7 +42,22 @@ CONTEXT_PATH = re.compile(
 )
 SHELL_SEPARATOR = re.compile(r"[;&|()\n`]|\$\(")
 GH_CHECKOUT = re.compile(r"(?<![\w./-])gh\s+pr\s+(?:checkout|diff)\b")
-SHELL_COMMENT = re.compile(r"(?m)(?:^|(?<=\s))#.*$")
+# Step actions a pull_request_target job may use. Anything else could act on
+# PR-head refs it receives through inherited env or the event payload, so an
+# unlisted remote action fails closed; local actions are inspected instead.
+ALLOWED_ACTIONS = (
+    "actions/checkout@",
+    "actions/github-script@",
+    "actions/cache/restore@",
+    "actions/cache/save@",
+    "actions/upload-artifact@",
+    "actions/download-artifact@",
+    "actions/create-github-app-token@",
+    "astral-sh/setup-uv@",
+)
+SCRIPT_PROCESS = re.compile(
+    r"child_process|\bexec\.(?:exec|getExecOutput)\b|\bspawn(?:Sync)?\("
+)
 NETWORK_TOOL = re.compile(r"(?<![\w./-])(?:curl|wget|gh\s+api)\b")
 
 
@@ -212,15 +227,24 @@ def _job_violations(
                     )
         return violations
     steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
-    # Composite actions run their steps inside this job; inline local ones.
+    # Composite actions run their steps inside this job; inline local ones
+    # recursively (A -> B -> checkout is as dangerous as a direct checkout).
     expanded: list[tuple[str, dict[str, Any]]] = []
-    for index, step in enumerate(steps):
-        label = (
-            f"{where}:step[{index}] {step.get('name', step.get('uses', ''))}".rstrip()
-        )
-        expanded.append((label, step))
-        action_dir = _local_path(root, str(step.get("uses") or ""))
-        if action_dir is not None and str(action_dir) not in seen:
+
+    def expand(prefix: str, items: list[Any]) -> None:
+        for index, step in enumerate(items):
+            if not isinstance(step, dict):
+                continue
+            label = f"{prefix}:step[{index}] {step.get('name', step.get('uses', ''))}".rstrip()
+            expanded.append((label, step))
+            action_uses = str(step.get("uses") or "")
+            action_dir = _local_path(root, action_uses)
+            if action_uses.startswith("./") and action_dir is None:
+                violations.append(
+                    f"{label} uses uninspectable local action {action_uses}"
+                )
+            if action_dir is None or str(action_dir) in seen:
+                continue
             seen.add(str(action_dir))
             manifest = next(
                 (
@@ -231,27 +255,35 @@ def _job_violations(
                 None,
             )
             if manifest is None:
-                violations.append(f"{label} uses missing local action {step['uses']}")
+                violations.append(f"{label} uses missing local action {action_uses}")
                 continue
-            runs = (_load(manifest).get("runs") or {}) if manifest else {}
+            runs = _load(manifest).get("runs") or {}
             if runs.get("using") != "composite":
                 violations.append(
-                    f"{label} uses non-composite local action {step['uses']}"
+                    f"{label} uses non-composite local action {action_uses}"
                 )
-            for inner_index, inner in enumerate(runs.get("steps") or []):
-                if isinstance(inner, dict):
-                    expanded.append((f"{label}->step[{inner_index}]", inner))
+            expand(f"{label}->", list(runs.get("steps") or []))
+
+    expand(where, steps)
     tainted = job_tainted | _tainted_env(*(step for _, step in expanded))
-    # Job-wide: one step can fetch the head and a later step can use
-    # FETCH_HEAD or a ref recorded on disk without naming it again.
-    reads_pr_refs = bool(tainted) or any(
-        FORBIDDEN_REF.search(str(step.get("run") or "")) for _, step in expanded
-    )
+    # The git allowlist applies to every job in a pull_request_target
+    # workflow: the head SHA is always reachable through GITHUB_EVENT_PATH,
+    # FETCH_HEAD, or job outputs without naming it in this job.
     for label, step in expanded:
         step_uses = str(step.get("uses") or "")
         for field, value in (step.get("with") or {}).items():
             if _names_pr_ref(value, tainted):
                 violations.append(f"{label} passes {field}={value!r} to {step_uses}")
+        if (
+            step_uses
+            and not step_uses.startswith("./")
+            and not step_uses.startswith(ALLOWED_ACTIONS)
+        ):
+            violations.append(f"{label} uses unlisted action {step_uses}")
+        if step_uses.startswith("actions/github-script@") and SCRIPT_PROCESS.search(
+            str((step.get("with") or {}).get("script", ""))
+        ):
+            violations.append(f"{label} spawns processes from github-script")
         if step_uses.startswith("actions/checkout"):
             for field in ("ref", "repository"):
                 if field in (step.get("with") or {}) and _untrusted_checkout_value(
@@ -260,19 +292,17 @@ def _job_violations(
                     violations.append(
                         f"{label} checks out untrusted {field}={step['with'][field]!r}"
                     )
-        script = SHELL_COMMENT.sub("", str(step.get("run") or "").replace("\\\n", " "))
+        # Comments are scanned too: stripping them is not quote-aware, and a
+        # false positive is cheaper than a hidden command.
+        script = str(step.get("run") or "").replace("\\\n", " ")
         if not script:
             continue
         if GH_CHECKOUT.search(script):
             violations.append(f"{label} runs gh pr checkout/diff")
-        if not reads_pr_refs:
-            continue
         if INDIRECT_GIT.search(script):
-            violations.append(
-                f"{label} reaches git indirectly in a job that reads PR refs"
-            )
+            violations.append(f"{label} reaches git indirectly")
         for problem in _git_violations(script):
-            violations.append(f"{label} runs `{problem}` in a job that reads PR refs")
+            violations.append(f"{label} runs `{problem}`")
         for line in script.splitlines():
             if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
                 violations.append(f"{label} downloads PR-head content: {line.strip()}")
@@ -285,10 +315,13 @@ def pull_request_target_violations(
     """Return every place a pull_request_target workflow may materialize PR-head code.
 
     Fail-closed allowlists rather than a deny-list: checkouts may only name
-    trusted contexts, a job that reads PR refs may only run inert git plumbing
-    with allowlisted options, and local reusable workflows and composite
-    actions are scanned transitively (remote reusable workflows fail closed).
-    This is a regression guard, not a proof of shell semantics.
+    trusted contexts; every shell ``run:`` may only invoke git as inert
+    plumbing with allowlisted options; step actions come from a fixed
+    allowlist and github-script may not spawn processes; local reusable
+    workflows and composite actions are scanned recursively and remote
+    reusable workflows fail closed. It inspects workflow text only, so it is a
+    regression guard rather than a proof of shell or interpreter semantics
+    (for example ``python -c`` or ``eval`` that assemble git at run time).
     """
     if "pull_request_target" not in _triggers(workflow):
         return []
@@ -593,3 +626,54 @@ def test_detector_scans_local_reusable_workflows_and_composite_actions(
     }
     for workflow in (reusable, composite, remote):
         assert pull_request_target_violations(workflow, "synthetic", root=tmp_path)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        # Final-head review bypasses: no PR-ref expression appears anywhere.
+        _prt([
+            {
+                "run": 'H=$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")\ngit fetch origin "$H"'
+            },
+            {"run": "git checkout FETCH_HEAD && make"},
+        ]),
+        _prt(
+            [{"uses": "org/checkout-pr@0123456789abcdef0123456789abcdef01234567"}],
+            env={"HEAD_SHA": "${{ github.event.pull_request.head.sha }}"},
+        ),
+        _prt([{"run": 'echo " #"; git checkout "$HEAD"'}]),
+        _prt([
+            {
+                "uses": "actions/github-script@v7",
+                "with": {
+                    "script": "await exec.exec('git', ['checkout', process.env.H])"
+                },
+            }
+        ]),
+    ],
+)
+def test_detector_fails_closed_without_explicit_pr_refs(
+    workflow: dict[Any, Any],
+) -> None:
+    assert pull_request_target_violations(workflow, "synthetic", root=None)
+
+
+def test_detector_expands_nested_composite_actions(tmp_path: Path) -> None:
+    for name, body in {
+        "a": "    - uses: ./.github/actions/b\n",
+        "b": (
+            "    - uses: actions/checkout@v6\n"
+            "      with:\n"
+            "        ref: ${{ github.event.pull_request.head.sha }}\n"
+        ),
+    }.items():
+        action = tmp_path / ".github/actions" / name
+        action.mkdir(parents=True)
+        (action / "action.yml").write_text(
+            f"runs:\n  using: composite\n  steps:\n{body}", encoding="utf-8"
+        )
+    violations = pull_request_target_violations(
+        _prt([{"uses": "./.github/actions/a"}]), "synthetic", root=tmp_path
+    )
+    assert any("checks out untrusted ref" in v for v in violations)

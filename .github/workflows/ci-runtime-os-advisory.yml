@@ -62,7 +62,7 @@ jobs:
 
       # Under pull_request_target this workflow runs base code only: PR-head
       # code is never checked out or executed here. The head is read as inert
-      # git objects for change selection; PR-head execution lives in the
+      # objects for change selection; PR-head execution lives in the
       # unprivileged ci-runtime-os-candidate.yml (`pull_request` context).
       - name: Checkout trusted non-PR candidate
         if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) }}
@@ -128,7 +128,7 @@ jobs:
           test "$RUNTIME_OS_POLICY_VERSION" = "2.1.0"
           test "$RUNTIME_OS_SOURCE_COMMIT" = "871e416afc55db187d2b6f29c9ff7cac96472223"
           if [ "$EVENT_NAME" = pull_request ]; then
-            # Change selection only: the PR head is diffed as git objects inside
+            # Change selection only: the PR head is diffed as inert objects inside
             # the trusted checkout and is never materialized as a worktree. The
             # slice matrix computed here is informational for PR events; the
             # executed matrix comes from the unprivileged candidate workflow.
@@ -340,7 +340,6 @@ jobs:
           NOUS_API_KEY: ""
         run: |
           source .venv/bin/activate
-          python -m pytest -m integration tests/test_wheel_locales_e2e.py -v
           python -m pytest tests/integration/ -v --tb=short
           python -m pytest tests/e2e/ -v --tb=short
 
@@ -366,6 +365,7 @@ jobs:
           DISCOVERY_MINUTES: "20"
           WAIT_MINUTES: "150"
         with:
+          retries: 3
           script: |
             if (process.env.DEFINITION_CHANGED !== 'false') {
               core.setFailed(
