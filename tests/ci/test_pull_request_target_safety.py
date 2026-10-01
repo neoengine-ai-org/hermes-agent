@@ -583,14 +583,10 @@ def _workflow_files() -> list[Path]:
 
 
 REVIEWED_FILES = Path(__file__).with_name("pull_request_target_reviewed_files.json")
-# Pre-existing finding tracked outside this guard's PR: auto-arm-auto-merge.yml
-# runs the tag-pinned actions/create-github-app-token@v2 with the merge-steward
-# App key (follow-up: SHA-pin it). Exact text; once fixed this entry goes stale
-# and the test fails until it is removed, so the exception cannot outlive it.
-KNOWN_VIOLATIONS = {
-    "auto-arm-auto-merge.yml:arm-auto-merge:step[0] Create merge steward app token "
-    "uses action not pinned to a full commit SHA: actions/create-github-app-token@v2",
-}
+# Exact text of violations knowingly tolerated while a tracked fix lands
+# elsewhere; an entry fails as stale once fixed, so it cannot outlive its
+# reason. Empty: the auto-arm create-github-app-token tag pin was fixed by #102.
+KNOWN_VIOLATIONS: set[str] = set()
 
 
 def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:

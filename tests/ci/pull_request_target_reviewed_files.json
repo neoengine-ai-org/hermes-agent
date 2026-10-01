@@ -2,7 +2,7 @@
   "version": 1,
   "description": "Reviewed sha256 of every pull_request_target workflow file and every local reusable workflow / composite action it reaches. Re-pin a file only after reviewing the whole file for PR-head materialization and privilege escalation.",
   "files": {
-    ".github/workflows/auto-arm-auto-merge.yml": "4ef4d89873145c62330abf435c489a3ee002f4e42b8eef63754255e1f0a6898a",
+    ".github/workflows/auto-arm-auto-merge.yml": "397e1554eed3a7190654df3a50f11c385842e1d690317430b70c6e48b8ff3443",
     ".github/workflows/ci-runtime-os-advisory.yml": "fed758e64ee159708451040169c7fe79725f4157093bd5408569e33d49ae9c20"
   }
 }
