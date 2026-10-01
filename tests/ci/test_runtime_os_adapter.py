@@ -179,3 +179,18 @@ def test_plan_emits_complete_workflow_output_contract(tmp_path, monkeypatch) -> 
         "has_tests",
         "telemetry_write_allowed",
     }
+
+
+def test_python_source_discovery_skips_generated_environment_trees(monkeypatch, tmp_path) -> None:
+    for relative in (
+        "pkg/module.py",
+        ".venv/lib/python3.11/site-packages/dep.py",
+        ".bootstrap-proof-venv/lib/python3.11/site-packages/dep.py",
+        "ci-fast/bin/.python/cpython-3.11.16-linux-x86_64-gnu/lib/python3.11/ast.py",
+        "tests/test_module.py",
+    ):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("import os\n", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    assert adapter.discover_python_sources() == ["pkg/module.py"]

@@ -114,7 +114,10 @@ def discover_tests() -> list[str]:
 
 
 def discover_python_sources() -> list[str]:
-    excluded = {".git", ".venv", "tests", "venv"}
+    # Generated interpreter/environment trees are not repository source: the
+    # bootstrap proof venv and the restored CI environment (which carries a
+    # whole CPython stdlib under ci-fast/) would otherwise be AST-parsed.
+    excluded = {".git", ".venv", "tests", "venv", ".bootstrap-proof-venv", "ci-fast"}
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
         for path in CANDIDATE_ROOT.rglob("*.py")
