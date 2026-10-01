@@ -38,3 +38,10 @@ def test_guard_covers_checkout_subtrees_and_ignores_redirected_project_root(monk
     checkout = cli_main.Path(__file__).resolve().parents[2]
     assert cli_main._clear_bytecode_cache(checkout) == 0
     assert cli_main._clear_bytecode_cache(checkout / "tests") == 0
+
+
+def test_guard_still_clears_a_redirected_temporary_project_root(monkeypatch, tmp_path) -> None:
+    (tmp_path / "pkg" / "__pycache__").mkdir(parents=True)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    assert cli_main._clear_bytecode_cache(cli_main.PROJECT_ROOT) == 1
+    assert not (tmp_path / "pkg" / "__pycache__").exists()

@@ -305,21 +305,20 @@ def test_indexed_closure_matches_pairwise_fixpoint(monkeypatch, tmp_path) -> Non
 
 def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_path) -> None:
     # Parallel test processes create and delete tests/__pycache__ while the
-    # adapter walks the tree; bytecode caches are never descended into, so
-    # their disappearance cannot break discovery. Any other vanished directory
-    # fails closed (test_discovery_fails_closed_when_a_source_dir_vanishes).
+    # adapter walks the tree; a bytecode cache vanishing mid-walk is skipped.
+    # Any other vanished directory fails closed
+    # (test_discovery_fails_closed_when_a_source_dir_vanishes).
     for relative in ("tests/test_kept.py", "tests/__pycache__/x.pyc", "pkg/mod.py", "pkg/__pycache__/y.pyc"):
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / relative).write_text("", encoding="utf-8")
-    real_scandir = os.scandir
 
-    def vanishing_scandir(path="."):
+    def vanished(path, dir_fd):
         if Path(path).name == "__pycache__":
-            raise FileNotFoundError(2, "No such file or directory", str(path))
-        return real_scandir(path)
+            return FileNotFoundError(2, "No such file or directory", path)
+        return None
 
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    monkeypatch.setattr(os, "scandir", vanishing_scandir)
+    _fail_directory_open(monkeypatch, vanished)
     assert adapter.discover_tests() == ["tests/test_kept.py"]
     assert adapter.discover_python_sources() == ["pkg/mod.py"]
 
@@ -328,17 +327,29 @@ def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_pat
 def test_discovery_still_raises_on_non_vanish_errors(monkeypatch, tmp_path) -> None:
     (tmp_path / "tests/locked").mkdir(parents=True)
     (tmp_path / "tests/test_a.py").write_text("", encoding="utf-8")
-    real_scandir = os.scandir
 
-    def denied_scandir(path="."):
+    def denied(path, dir_fd):
         if Path(path).name == "locked":
-            raise PermissionError(13, "Permission denied", str(path))
-        return real_scandir(path)
+            return PermissionError(13, "Permission denied", path)
+        return None
 
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    monkeypatch.setattr(os, "scandir", denied_scandir)
+    _fail_directory_open(monkeypatch, denied)
     with pytest.raises(PermissionError):
         adapter.discover_tests()
+
+
+def _fail_directory_open(monkeypatch, fail) -> None:
+    """Inject errors where the walker opens each directory (``os.open``)."""
+    real_open = os.open
+
+    def failing_open(path, flags, *args, dir_fd=None, **kwargs):
+        error = fail(os.fspath(path), dir_fd)
+        if error is not None:
+            raise error
+        return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "open", failing_open)
 
 
 def _write_tree(root: Path, files: list[str]) -> None:
@@ -361,14 +372,13 @@ def test_discovery_prunes_excluded_dirs_without_descending(tmp_path, monkeypatch
         ],
     )
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
     forbidden = {".venv", ".git", "venv", "integration"}
 
-    def guarded_scandir(path=".", *args, **kwargs):
-        assert not (set(Path(os.fspath(path)).relative_to(tmp_path).parts) & forbidden), path
-        return real_scandir(path, *args, **kwargs)
+    def never_opened(path, dir_fd):
+        assert Path(path).name not in forbidden, path
+        return None
 
-    monkeypatch.setattr(os, "scandir", guarded_scandir)
+    _fail_directory_open(monkeypatch, never_opened)
     assert adapter.discover_python_sources() == ["agent/core.py"]
     assert adapter.discover_tests() == ["tests/test_core.py"]
 
@@ -376,14 +386,13 @@ def test_discovery_prunes_excluded_dirs_without_descending(tmp_path, monkeypatch
 def test_discovery_fails_closed_when_a_source_dir_vanishes(tmp_path, monkeypatch) -> None:
     _write_tree(tmp_path, ["agent/core.py", "gateway/run.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
 
-    def vanishing_scandir(path=".", *args, **kwargs):
-        if Path(os.fspath(path)).name == "gateway":
-            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
-        return real_scandir(path, *args, **kwargs)
+    def vanished(path, dir_fd):
+        if Path(path).name == "gateway":
+            return FileNotFoundError(2, "No such file or directory", path)
+        return None
 
-    monkeypatch.setattr(os, "scandir", vanishing_scandir)
+    _fail_directory_open(monkeypatch, vanished)
     with pytest.raises(FileNotFoundError):
         adapter.discover_python_sources()
 
@@ -394,16 +403,12 @@ def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, err
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     roots = {os.fspath(tmp_path), os.fspath(tmp_path / "tests")}
 
-    def failing(real):
-        def fail_on_roots(path, *args, **kwargs):
-            if os.fspath(path) in roots:
-                raise OSError(error, os.strerror(error), os.fspath(path))
-            return real(path, *args, **kwargs)
+    def failing_root(path, dir_fd):
+        if dir_fd is None and path in roots:
+            return OSError(error, os.strerror(error), path)
+        return None
 
-        return fail_on_roots
-
-    monkeypatch.setattr(os, "stat", failing(os.stat))
-    monkeypatch.setattr(os, "lstat", failing(os.lstat))
+    _fail_directory_open(monkeypatch, failing_root)
     with pytest.raises(OSError):
         adapter.discover_python_sources()
     with pytest.raises(OSError):
@@ -413,6 +418,39 @@ def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, err
 def test_discovery_of_missing_root_is_empty(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     assert adapter.discover_tests() == []
+
+
+def test_discovery_fails_closed_when_root_is_not_a_directory(tmp_path, monkeypatch) -> None:
+    (tmp_path / "tests").write_text("not a directory", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    with pytest.raises(NotADirectoryError):
+        adapter.discover_tests()
+
+
+@pytest.mark.parametrize("target", ["tests", "agent"])
+def test_discovery_never_traverses_a_directory_swapped_for_a_symlink(
+    tmp_path, monkeypatch, target
+) -> None:
+    # Swap a classified directory for a symlink to a decoy between the check
+    # and its use: the descriptor-based walk must refuse it, not follow it.
+    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py", "decoy/test_only.py", "decoy/evil.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_open = os.open
+    swapped = []
+
+    def swapping_open(path, flags, *args, dir_fd=None, **kwargs):
+        if os.fspath(path).endswith(target) and not swapped:
+            victim = tmp_path / target
+            victim.rename(tmp_path / f"{target}.moved")
+            victim.symlink_to(tmp_path / "decoy", target_is_directory=True)
+            swapped.append(victim)
+        return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "open", swapping_open)
+    discover = adapter.discover_tests if target == "tests" else adapter.discover_python_sources
+    with pytest.raises(ValueError, match="symlink"):
+        discover()
+    assert swapped
 
 
 @pytest.mark.parametrize("error", [errno.EIO, errno.EACCES, errno.ELOOP])

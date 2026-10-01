@@ -146,6 +146,29 @@ def _is_regular_file(path: Path) -> bool:
         raise
 
 
+def _open_directory(name: str | Path, parts: tuple[str, ...], dir_fd: int | None = None) -> int | None:
+    """Open a directory without following a symlink at its last component.
+
+    Returns ``None`` only for a bytecode cache (or an entry inside one) that
+    vanished. A symlink raises ``ValueError``; every other error propagates.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(name, flags, dir_fd=dir_fd)
+    except FileNotFoundError:
+        if _vanished_cache_entry(parts):
+            return None
+        raise
+    except OSError as error:
+        try:
+            is_link = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
+        except OSError:
+            is_link = False
+        if is_link:
+            raise ValueError(f"discovery must not traverse a symlinked directory: {'/'.join(parts) or name}") from error
+        raise
+
+
 def _walk_py_files(start: Path, prune) -> list[Path]:
     """Regular ``*.py`` files under ``start``, failing closed.
 
@@ -154,35 +177,28 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     (or an entry inside one) that disappears mid-walk is skipped. Any other
     error listing or classifying an entry (PermissionError, a non-cache
     entry that vanished, EIO, ...) raises: it could hold sources or tests,
-    and skipping it would silently narrow selection. ``os.walk`` is not used
-    because it swallows ``DirEntry.is_dir()`` errors and treats the entry as
-    a file.
+    and skipping it would silently narrow selection.
+
+    Every directory, the root included, is opened with ``O_NOFOLLOW`` relative
+    to its parent's descriptor and listed through that descriptor, so a
+    directory swapped for a symlink (e.g. ``tests -> decoy``) after it was
+    classified can never be traversed. Only a missing root yields nothing; a
+    root that exists but is not a directory, or is a symlink, raises.
+    ``os.walk`` is not used because it swallows ``DirEntry.is_dir()`` errors
+    and treats the entry as a file.
     """
-    # Stat the root explicitly: ``Path.is_dir()`` swallows OSError (every
-    # errno on 3.12+), which would turn e.g. EIO into an empty, fail-open
-    # selection. Only a root that does not exist yields nothing. A symlinked
-    # root is refused rather than followed: ``tests -> decoy`` would otherwise
-    # let a candidate replace the full-proof test set with its own.
+    root_parts = start.relative_to(CANDIDATE_ROOT).parts
     try:
-        root_mode = os.lstat(start).st_mode
-    except (FileNotFoundError, NotADirectoryError):
+        root_fd = _open_directory(start, root_parts)
+    except FileNotFoundError:
         return []
-    if stat.S_ISLNK(root_mode):
-        raise ValueError(f"discovery root must not be a symlink: {start}")
-    if not stat.S_ISDIR(root_mode):
+    if root_fd is None:
         return []
     found: list[Path] = []
-    pending = [start]
-    while pending:
-        directory = pending.pop()
-        relative = directory.relative_to(CANDIDATE_ROOT).parts
-        try:
-            with os.scandir(directory) as scanner:
-                entries = sorted(scanner, key=lambda entry: entry.name)
-        except FileNotFoundError:
-            if _vanished_cache_entry(relative):
-                continue
-            raise
+
+    def walk(directory_fd: int, directory: Path, relative: tuple[str, ...]) -> None:
+        with os.scandir(directory_fd) as scanner:
+            entries = sorted(scanner, key=lambda entry: entry.name)
         for entry in entries:
             parts = relative + (entry.name,)
             if fnmatch.fnmatchcase(entry.name, "*.py"):
@@ -197,8 +213,20 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
                 if _vanished_cache_entry(parts):
                     continue
                 raise
-            if is_directory:
-                pending.append(directory / entry.name)
+            if not is_directory:
+                continue
+            child_fd = _open_directory(entry.name, parts, dir_fd=directory_fd)
+            if child_fd is None:
+                continue
+            try:
+                walk(child_fd, directory / entry.name, parts)
+            finally:
+                os.close(child_fd)
+
+    try:
+        walk(root_fd, start, root_parts)
+    finally:
+        os.close(root_fd)
     return [path for path in found if _is_regular_file(path)]
 
 

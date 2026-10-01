@@ -66,15 +66,15 @@ def _protect_checkout_bytecode_cache(monkeypatch):
     except Exception:
         return
     real_clear = _cli_main._clear_bytecode_cache
-    # Derive the checkout independently of the PROJECT_ROOT the guarded code
-    # uses (at call time, from this file's location), so a wrong or patched
-    # PROJECT_ROOT cannot steer the real rmtree back at the shared tree.
-    own_checkout = Path(__file__).resolve().parents[2]
+    # The protected tree is derived from this file's location, not from the
+    # PROJECT_ROOT the guarded code uses: a patched PROJECT_ROOT can neither
+    # steer the real rmtree back at the shared checkout nor suppress clearing
+    # of a redirected temporary root that a test sets up on purpose.
+    checkout = Path(__file__).resolve().parents[2]
 
     def _guarded_clear(root):
         resolved = Path(root).resolve()
-        checkouts = {own_checkout, Path(_cli_main.PROJECT_ROOT).resolve()}
-        if any(resolved == checkout or checkout in resolved.parents for checkout in checkouts):
+        if resolved == checkout or checkout in resolved.parents:
             return 0
         return real_clear(root)
 
