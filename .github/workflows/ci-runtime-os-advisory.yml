@@ -420,6 +420,13 @@ jobs:
                   per_page: 100,
                 });
               } catch (error) {
+                // Only rate limits, server errors, and network failures are
+                // transient; any other client error fails fast.
+                const status = Number(error.status || 0);
+                if (status >= 400 && status < 500 && status !== 403 && status !== 429) {
+                  core.setFailed(`Candidate proof lookup failed with HTTP ${status}: ${error.message}`);
+                  return;
+                }
                 if (Date.now() > deadline) {
                   core.setFailed(`Candidate proof lookup kept failing: ${error.message}`);
                   return;
@@ -521,6 +528,9 @@ jobs:
         run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
       - name: Checkout trusted review validator
+        # Only after preflight admitted this event: preflight is skipped for
+        # forks and non-default bases, so base.sha is never checked out there.
+        if: needs.preflight.result == 'success'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false

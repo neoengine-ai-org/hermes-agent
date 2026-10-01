@@ -340,6 +340,7 @@ const github = {
     const runs = scenario.polls[Math.min(poll, scenario.polls.length - 1)];
     poll += 1;
     if (runs === 'error') { const e = new Error('API rate limit exceeded'); e.status = 403; throw e; }
+    if (runs === 'notfound') { const e = new Error('Not Found'); e.status = 404; throw e; }
     return runs;
   },
 };
@@ -451,3 +452,8 @@ def test_waiter_times_out_an_unfinished_run(tmp_path: Path) -> None:
 def test_waiter_retries_transient_api_failures(tmp_path: Path) -> None:
     out = _waiter(tmp_path, ["error", "error", [_run(1, "success")]])
     assert out["failed"] is None and out["polls"] == 3
+
+
+def test_waiter_fails_fast_on_non_transient_client_errors(tmp_path: Path) -> None:
+    out = _waiter(tmp_path, ["notfound", [_run(1, "success")]])
+    assert out["failed"] and "HTTP 404" in out["failed"] and out["polls"] == 1
