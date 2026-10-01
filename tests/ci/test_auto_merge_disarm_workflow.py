@@ -121,8 +121,10 @@ def _handler(fake: FakeGitHub):
                 compact = re.sub(r"\s+", " ", query)
                 for needle in (
                     "pullRequests(states: MERGED, first: 50, orderBy: { field: UPDATED_AT, direction: DESC })",
-                    "timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20)",
+                    "timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20)",
                     "mergeCommit { oid }",
+                    "... on AutoSquashEnabledEvent { createdAt }",
+                    "... on AutoRebaseEnabledEvent { createdAt }",
                 ):
                     assert needle in compact, f"audit query shape changed: {needle}"
                 if fake.audit_fail:
@@ -543,3 +545,26 @@ def test_audit_runs_on_event_runs_too(gh):
     add_pr(gh, 1, armed=False)
     r = run(gh, event="pull_request_target", pr_event=pr_event(1))
     assert r.returncode != 0 and "::error::PR #9" in r.stdout
+
+
+@needs_node
+@pytest.mark.parametrize("enable_type", ["AutoSquashEnabledEvent", "AutoRebaseEnabledEvent"])
+def test_squash_and_rebase_native_auto_merge_raise_alarm(gh, enable_type):
+    add_merged(gh, 9, timedelta(minutes=10), [(enable_type, 5)])
+    r = run(gh)
+    assert r.returncode != 0
+    assert f"::error::PR #9 merged via native auto-merge at {9:040x}" in r.stdout
+
+
+@needs_node
+def test_squash_enabled_then_disabled_before_manual_merge_is_not_alarmed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [("AutoSquashEnabledEvent", 8), ("AutoMergeDisabledEvent", 6)])
+    r = run(gh)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "::error::" not in r.stdout
+
+
+@needs_node
+def test_latest_enable_after_disable_alarms_for_squash(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [("AutoMergeDisabledEvent", 8), ("AutoSquashEnabledEvent", 6)])
+    assert run(gh).returncode != 0

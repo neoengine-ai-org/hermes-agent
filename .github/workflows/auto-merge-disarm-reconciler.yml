@@ -260,14 +260,17 @@ jobs:
             throw new Error(`unsupported event ${eventName}`);
           }
 
+          // Merge-commit auto-merge records AutoMergeEnabledEvent; SQUASH records
+          // AutoSquashEnabledEvent and REBASE records AutoRebaseEnabledEvent.
+          const ENABLE_TYPES = new Set(['AutoMergeEnabledEvent', 'AutoSquashEnabledEvent', 'AutoRebaseEnabledEvent']);
           const AUDIT_WINDOW_MS = 2 * 60 * 60 * 1000;
           const RECENT_MERGED = `query RecentMerged($owner: String!, $name: String!) {
             repository(owner: $owner, name: $name) {
               pullRequests(states: MERGED, first: 50, orderBy: { field: UPDATED_AT, direction: DESC }) {
                 nodes {
                   number mergedAt headRefOid mergeCommit { oid }
-                  timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20) {
-                    nodes { __typename ... on AutoMergeEnabledEvent { createdAt } ... on AutoMergeDisabledEvent { createdAt } ... on MergedEvent { createdAt } }
+                  timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20) {
+                    nodes { __typename ... on AutoMergeEnabledEvent { createdAt } ... on AutoSquashEnabledEvent { createdAt } ... on AutoRebaseEnabledEvent { createdAt } ... on AutoMergeDisabledEvent { createdAt } ... on MergedEvent { createdAt } }
                   }
                 }
               }
@@ -286,10 +289,10 @@ jobs:
               const items = pr.timelineItems?.nodes || [];
               const mergedAt = items.filter((i) => i.__typename === 'MergedEvent').map((i) => i.createdAt).sort().pop();
               const before = items
-                .filter((i) => (i.__typename === 'AutoMergeEnabledEvent' || i.__typename === 'AutoMergeDisabledEvent') && (!mergedAt || i.createdAt <= mergedAt))
+                .filter((i) => (ENABLE_TYPES.has(i.__typename) || i.__typename === 'AutoMergeDisabledEvent') && (!mergedAt || i.createdAt <= mergedAt))
                 .sort((x, y) => (x.createdAt < y.createdAt ? -1 : x.createdAt > y.createdAt ? 1 : 0));
               const last = before[before.length - 1];
-              if (last && last.__typename === 'AutoMergeEnabledEvent') {
+              if (last && ENABLE_TYPES.has(last.__typename)) {
                 const sha = pr.mergeCommit?.oid || pr.headRefOid;
                 console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
                 failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
