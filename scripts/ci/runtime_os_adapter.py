@@ -13,7 +13,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-TRUST_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPT = Path(os.path.abspath(__file__))
+# Refuse to run through a symlink inside the repository (the script, scripts/ci
+# or scripts): resolve() would follow it and load the classifier and policy
+# from an unpinned location.
+if any(part.is_symlink() for part in (_SCRIPT, _SCRIPT.parent, _SCRIPT.parent.parent)):
+    raise SystemExit("runtime_os_adapter must not run through a symlinked path")
+TRUST_ROOT = _SCRIPT.parents[2].resolve()
 CANDIDATE_ROOT = Path(os.environ.get("RUNTIME_OS_CANDIDATE_ROOT", TRUST_ROOT)).resolve()
 LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-bundle.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"

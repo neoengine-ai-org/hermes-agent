@@ -46,7 +46,7 @@ jobs:
       review_classification: ${{ steps.plan.outputs.review_classification }}
       run_e2e: ${{ steps.plan.outputs.run_e2e }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
-      candidate_definition_changed: ${{ steps.plan.outputs.candidate_definition_changed }}
+      candidate_definition_changed: ${{ steps.definition.outputs.candidate_definition_changed }}
       telemetry_write_allowed: ${{ steps.plan.outputs.telemetry_write_allowed }}
       environment_digest: ${{ steps.environment.outputs.environment_digest }}
       duration_cache_key: ${{ steps.environment.outputs.duration_cache_key }}
@@ -87,6 +87,26 @@ jobs:
           set -euo pipefail
           git -C .runtime-os-trusted fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"
           git -C .runtime-os-trusted cat-file -e "${HEAD_SHA}^{commit}"
+
+      - name: Detect candidate-definition changes in the PR's own commits
+        id: definition
+        if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # The candidate run executes its workflow definition from the PR
+          # merge ref; it is only base-defined while the PR's own commits leave
+          # it alone. With several merge bases (criss-cross history) a
+          # three-dot diff picks one arbitrarily, so fail closed instead.
+          bases="$(git -C .runtime-os-trusted merge-base --all "$BASE_SHA" "$HEAD_SHA" | wc -l)"
+          git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
+          if [ "$bases" -ne 1 ] || grep -qxzF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
+            echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "candidate_definition_changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compute immutable environment and duration identities
         id: environment
@@ -146,15 +166,6 @@ jobs:
               exit 2
             fi
             git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
-            # The candidate run executes its workflow definition from the PR
-            # merge ref; it is only base-defined while the PR's own commits
-            # (merge-base diff) leave it alone.
-            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
-            if grep -qxzF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
-              echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "candidate_definition_changed=false" >> "$GITHUB_OUTPUT"
-            fi
           else
             export RUNTIME_OS_CANDIDATE_ROOT="$GITHUB_WORKSPACE/candidate"
             git -C candidate ls-files -z > changed-files.txt

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -260,6 +261,7 @@ GIT_ALLOWED_OPTIONS = {
     },
     "ls-files": {"-z"},
     "rev-parse": {"--verify", "-q", "--quiet"},
+    "merge-base": {"--all"},
     # The exact read-only cleanliness query the receipt validator uses.
     "status": {"--porcelain=v1", "--untracked-files=all"},
 }
@@ -315,6 +317,7 @@ def _git_violations(script: str) -> list[str]:
                 "ls-files": 0,
                 "rev-parse": 1,
                 "status": 0,
+                "merge-base": 2,
             }
             if verb in limits and (len(operands) > limits[verb] or "--" in args):
                 problems.append(f"git {verb} with extra operands: {' '.join(args)}")
@@ -587,7 +590,9 @@ def _job_violations(
             ]
             # The prefix must be fresh per-job temp space, never the workspace.
             if not prefixes or not all(
-                re.match(r"^\$\{?RUNNER_TEMP\}?/", prefix) for prefix in prefixes
+                re.match(r"^\$\{?RUNNER_TEMP\}?/", prefix)
+                and ".." not in prefix.split("/")
+                for prefix in prefixes
             ):
                 violations.append(
                     f"{label} runs {match['script']} without -X pycache_prefix under $RUNNER_TEMP"
@@ -719,13 +724,32 @@ def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:
             *PRIVILEGED_SCRIPTS,
             "tests/ci/test_pull_request_target_safety.py",
         ):
-            if (ROOT / relative).is_symlink():
+            if _symlinked_component(ROOT / relative):
                 violations.append(f"privileged set contains a symlink: {relative}")
             files[relative] = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
     return scanned, violations, files
 
 
-def _privileged_file_set(reached: set[Any]) -> tuple[set[Path], list[str]]:
+def _symlinked_component(path: Path, base: Path = ROOT) -> bool:
+    """True when the path or any directory between ``base`` and it is a
+    symlink: reading through a symlinked parent would hash and run bytes from
+    an unpinned location. Paths outside ``base`` count as symlinked."""
+    path = Path(os.path.abspath(path))
+    try:
+        parts = path.relative_to(base).parts
+    except ValueError:
+        return True
+    current = base
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def _privileged_file_set(
+    reached: set[Any], base: Path = ROOT
+) -> tuple[set[Path], list[str]]:
     """Expand reached files with every entry of each composite action's
     directory. Symlinks are reported, never followed or hashed: a link's
     target could change without changing any pinned byte."""
@@ -737,7 +761,7 @@ def _privileged_file_set(reached: set[Any]) -> tuple[set[Path], list[str]]:
             # Files beside a composite action run via $GITHUB_ACTION_PATH.
             candidates.extend(item.parent.rglob("*"))
         for candidate in candidates:
-            if candidate.is_symlink():
+            if _symlinked_component(candidate, base):
                 symlinks.append(candidate.as_posix())
             elif candidate.is_file():
                 paths.add(candidate)
@@ -1789,7 +1813,7 @@ def test_symlinks_in_the_privileged_set_are_reported(tmp_path: Path) -> None:
     (shared / "helper.sh").write_text("echo changed\n", encoding="utf-8")
     (action / "link").symlink_to(shared, target_is_directory=True)
     (action / "file-link.sh").symlink_to(shared / "helper.sh")
-    paths, symlinks = _privileged_file_set({action / "action.yml"})
+    paths, symlinks = _privileged_file_set({action / "action.yml"}, base=tmp_path)
     assert {p.relative_to(action).as_posix() for p in paths} == {
         "action.yml",
         "real/helper.sh",
@@ -1820,3 +1844,121 @@ def test_runner_temp_pycache_prefix_is_accepted() -> None:
     assert not [v for v in violations if "pycache_prefix" in v or "python -I" in v], (
         violations
     )
+
+
+def test_symlinked_parent_directory_is_reported(tmp_path: Path) -> None:
+    # Moving scripts/ci elsewhere and symlinking it back keeps every pinned
+    # byte identical; the component check must still flag it.
+    real = tmp_path / "a/b/c/ci"
+    real.mkdir(parents=True)
+    (real / "runtime_os_adapter.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts/ci").symlink_to(real, target_is_directory=True)
+    assert _symlinked_component(tmp_path / "scripts/ci/runtime_os_adapter.py", tmp_path)
+    assert not _symlinked_component(real / "runtime_os_adapter.py", tmp_path)
+
+
+def test_adapter_refuses_to_run_through_a_symlinked_directory(tmp_path: Path) -> None:
+    import shutil
+    import subprocess
+    import sys
+
+    real = tmp_path / "elsewhere/ci"
+    real.mkdir(parents=True)
+    shutil.copy2(
+        ROOT / "scripts/ci/runtime_os_adapter.py", real / "runtime_os_adapter.py"
+    )
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "scripts/ci").symlink_to(real, target_is_directory=True)
+    result = subprocess.run(
+        [sys.executable, "-I", "scripts/ci/runtime_os_adapter.py", "--help"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0 and "symlinked path" in result.stderr
+
+
+def test_definition_guard_fails_closed_on_criss_cross_history(tmp_path: Path) -> None:
+    """Execute the workflow's own guard step against a criss-cross history in
+    which a three-dot diff picks a merge base that hides the candidate change."""
+    import subprocess
+
+    repo = tmp_path / ".runtime-os-trusted"
+    repo.mkdir()
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@x",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@x",
+    }
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        ).stdout.strip()
+
+    candidate = repo / ".github/workflows/ci-runtime-os-candidate.yml"
+    candidate.parent.mkdir(parents=True)
+    git("init", "-q", "-b", "main")
+    candidate.write_text("OLD\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "mb0")
+    git("branch", "feature")
+    candidate.write_text("NEW\n", encoding="utf-8")
+    git("commit", "-qam", "mb2 on main")
+    mb2 = git("rev-parse", "HEAD")
+    git("checkout", "-q", "feature")
+    (repo / "f.txt").write_text("f\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-qm", "mb1 on feature")
+    mb1 = git("rev-parse", "HEAD")
+    git("checkout", "-q", "main")
+    git("merge", "-q", "--no-ff", "-m", "B", mb1)
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "attacker", mb1)
+    git("merge", "-q", "--no-ff", "-m", "H", mb2, "-X", "theirs")
+    candidate.write_text("OLD\n", encoding="utf-8")
+    git("commit", "-qam", "resolve to OLD")
+    head = git("rev-parse", "HEAD")
+    assert len(git("merge-base", "--all", base, head).splitlines()) > 1
+    step = next(
+        s
+        for s in _load(WORKFLOWS / "ci-runtime-os-advisory.yml")["jobs"]["preflight"][
+            "steps"
+        ]
+        if s.get("id") == "definition"
+    )
+    output = tmp_path / "out"
+    output.write_text("", encoding="utf-8")
+    subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        check=True,
+        env={**env, "BASE_SHA": base, "HEAD_SHA": head, "GITHUB_OUTPUT": str(output)},
+    )
+    assert (
+        output.read_text(encoding="utf-8").strip()
+        == "candidate_definition_changed=true"
+    )
+
+
+def test_symlinked_composite_action_directory_is_reported(tmp_path: Path) -> None:
+    real = tmp_path / "variants/a"
+    real.mkdir(parents=True)
+    (real / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps: []\n", encoding="utf-8"
+    )
+    (real / "payload.sh").write_text("echo a\n", encoding="utf-8")
+    (tmp_path / ".github/actions").mkdir(parents=True)
+    (tmp_path / ".github/actions/co").symlink_to(real, target_is_directory=True)
+    paths, symlinks = _privileged_file_set(
+        {tmp_path / ".github/actions/co/action.yml"}, base=tmp_path
+    )
+    assert paths == set()
+    assert any(link.endswith(".github/actions/co/action.yml") for link in symlinks)

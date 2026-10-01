@@ -470,3 +470,13 @@ def test_waiter_fails_fast_on_non_transient_client_errors(tmp_path: Path) -> Non
 def test_waiter_fails_fast_on_non_rate_limit_403(tmp_path: Path) -> None:
     out = _waiter(tmp_path, ["forbidden", [_run(1, "success")]])
     assert out["failed"] and "HTTP 403" in out["failed"] and out["polls"] == 1
+
+
+def test_every_run_script_parses_as_bash() -> None:
+    # A broken if/else in a step script must fail here, not first on a runner.
+    for workflow in (WORKFLOW, CANDIDATE):
+        for job_id, job in _jobs(workflow).items():
+            for step in job.get("steps", []):
+                if "run" in step:
+                    result = subprocess.run(["bash", "-n", "-c", step["run"]], capture_output=True, text=True)
+                    assert result.returncode == 0, (workflow.name, job_id, step.get("name"), result.stderr)
