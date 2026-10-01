@@ -5,7 +5,7 @@ import argparse
 import ast
 import contextlib
 import fnmatch
-import functools
+import errno
 import hashlib
 import importlib.util
 import io
@@ -114,30 +114,33 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
-# Parallel test processes (and ``hermes update``) create and delete bytecode
-# caches in the shared checkout at any moment. A ``__pycache__`` directory is
-# still walked (a tracked ``*.py`` inside one is discovered), but if it or an
-# entry inside it changes mid-walk the whole walk restarts, so a successful
-# discovery always describes one complete, consistent listing of the tree.
+# Bytecode caches: other processes sharing the checkout create ``__pycache__``
+# directories and atomically replace ``*.pyc`` files in them (temporary files
+# appear and vanish) while discovery runs. Only that churn is tolerated: a
+# non-Python, non-directory entry inside a cache may vanish mid-walk. Anything
+# that could be a tracked source or test -- a ``*.py`` entry, any directory,
+# the cache directory itself -- vanishing fails closed, because the execution
+# checkout would still contain it. Bytecode churn is also excluded from the
+# end-of-plan consistency check, so concurrent imports cannot trip it.
 _BYTECODE_CACHE = "__pycache__"
-_WALK_ATTEMPTS = 5
 _DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
 _FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
-# Candidate root -> (st_dev, st_ino) bound the first time it is opened; every
-# later open must reach that same directory.
+_Signature = tuple[int, int, int, int, int]  # st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns
+
+# Candidate root -> (st_dev, st_ino): bound at import for the configured root
+# (right after it is resolved), otherwise on first use; every later open must
+# reach that same directory.
 _ROOT_IDENTITY: dict[Path, tuple[int, int]] = {}
-# (root, relative path) -> (st_dev, st_ino) of every regular file the latest
-# successful discovery returned; reads verify they open that same file.
-_DISCOVERED_IDENTITY: dict[tuple[Path, str], tuple[int, int]] = {}
+# (root, relative path) -> signature of every regular ``*.py`` file, and
+# (root, relative path) -> identity of every non-cache directory, as the latest
+# discovery observed them. Reads must find exactly these objects.
+_DISCOVERED_FILES: dict[tuple[Path, str], _Signature] = {}
+_DISCOVERED_DIRECTORIES: dict[tuple[Path, str], tuple[int, int]] = {}
 
 
-class _CacheChurn(Exception):
-    """A bytecode cache changed during the walk; the walk restarts."""
-
-
-def _in_bytecode_cache(parts: tuple[str, ...]) -> bool:
-    return _BYTECODE_CACHE in parts
+def _signature(info: os.stat_result) -> _Signature:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
 def _open_nofollow(name: str, flags: int, dir_fd: int | None, label: str) -> int:
@@ -157,12 +160,12 @@ def _open_nofollow(name: str, flags: int, dir_fd: int | None, label: str) -> int
 
 
 def _open_root(root: Path) -> int:
-    """Open the candidate root through every component, binding its identity.
+    """Open the candidate root through every component, checking its identity.
 
     Each component from ``/`` is opened with ``O_NOFOLLOW`` relative to its
     parent's descriptor, so an ancestor replaced by a symlink raises; the
-    opened root must also be the directory bound on first use, so an ancestor
-    replaced by a different real directory raises too.
+    opened root must also be the directory bound for this root, so an
+    ancestor replaced by a different real directory raises too.
     """
     if not root.is_absolute():
         raise ValueError(f"candidate root must be absolute: {root}")
@@ -182,15 +185,44 @@ def _open_root(root: Path) -> int:
     return directory_fd
 
 
-def _open_relative(root_fd: int, parts: tuple[str, ...]) -> int:
-    """Open the directory ``parts`` below an open root without following symlinks.
+def _bind_configured_root() -> None:
+    try:
+        os.close(_open_root(CANDIDATE_ROOT))
+    except FileNotFoundError:
+        pass  # bound on first use if it appears later
 
-    Consumes ``root_fd``; the caller owns the returned descriptor.
+
+_bind_configured_root()
+
+
+def _open_bound_child(parent_fd: int, name: str, label: str, info: os.stat_result | None = None) -> int:
+    """Open directory ``name`` of ``parent_fd``, bound to what was classified.
+
+    ``info`` is the entry's ``lstat`` (taken now when not given). A symlink
+    raises ``ValueError``, a non-directory ``NotADirectoryError``; the opened
+    descriptor must be that same directory, so a replacement between
+    classification and open raises.
     """
+    if info is None:
+        info = os.lstat(name, dir_fd=parent_fd)
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
+    if not stat.S_ISDIR(info.st_mode):
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", label)
+    child_fd = _open_nofollow(name, _DIRECTORY_FLAGS, parent_fd, label)
+    opened = os.fstat(child_fd)
+    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+        os.close(child_fd)
+        raise ValueError(f"{label} changed during discovery")
+    return child_fd
+
+
+def _open_relative(root_fd: int, parts: tuple[str, ...]) -> int:
+    """Open directory ``parts`` below ``root_fd`` (consumed), bound and no-follow."""
     directory_fd = root_fd
     try:
         for index, name in enumerate(parts):
-            child_fd = _open_nofollow(name, _DIRECTORY_FLAGS, directory_fd, "/".join(parts[: index + 1]))
+            child_fd = _open_bound_child(directory_fd, name, "/".join(parts[: index + 1]))
             os.close(directory_fd)
             directory_fd = child_fd
     except BaseException:
@@ -199,119 +231,131 @@ def _open_relative(root_fd: int, parts: tuple[str, ...]) -> int:
     return directory_fd
 
 
-def _walk_py_files(start: Path, prune) -> list[Path]:
-    """Regular ``*.py`` files under ``start``, failing closed.
+def _walk_py_files(start: Path, prune) -> tuple[dict[str, _Signature], dict[str, tuple[int, int]]]:
+    """Snapshot of every regular ``*.py`` file and directory under ``start``.
 
+    Returns ``({relative file: signature}, {relative directory: identity})``.
     Directories for which ``prune(parts)`` is true (``parts`` relative to
-    ``CANDIDATE_ROOT``) are never entered. Every other directory is walked
-    through descriptors: the candidate root is anchored by ``_open_root``,
-    each child directory is opened with ``O_NOFOLLOW`` relative to its
-    parent and must be the same directory that was listed (``d_ino``) and
-    classified (``lstat``). A directory symlink or a ``*.py`` symlink raises
-    (pytest would collect through it, so skipping it would silently narrow
-    selection), as does any listing/classification error, any non-cache
-    entry that vanished, and an existing ``start`` that is not a directory.
-    A change inside a bytecode cache restarts the walk; persistent churn
-    raises. Only a missing ``start`` yields nothing.
+    ``CANDIDATE_ROOT``) are never entered. The root is anchored by
+    ``_open_root``; ``start`` and every child directory are opened with
+    ``O_NOFOLLOW`` relative to the parent's descriptor and must be the same
+    directory that was listed (``d_ino``) and classified (``lstat``). A
+    non-pruned symlink that pytest could collect through (a ``*.py`` link, a
+    link to a directory, or a dangling link) raises, as does a
+    missing or non-directory ``start``, any listing or classification error,
+    and any vanished entry except bytecode churn (see ``_BYTECODE_CACHE``).
     """
-    for _ in range(_WALK_ATTEMPTS):
-        try:
-            return _walk_once(start, prune)
-        except _CacheChurn:
-            continue
-    raise RuntimeError(
-        f"bytecode caches under {start} kept changing during discovery; refusing a possibly incomplete universe"
-    )
-
-
-def _walk_once(start: Path, prune) -> list[Path]:
     start_parts = start.relative_to(CANDIDATE_ROOT).parts
+    files: dict[str, _Signature] = {}
+    directories: dict[str, tuple[int, int]] = {}
+    directory_fd = _open_root(CANDIDATE_ROOT)
     try:
-        start_fd = _open_relative(_open_root(CANDIDATE_ROOT), start_parts)
-    except FileNotFoundError:
-        return []
-    found: list[Path] = []
-    identities: dict[tuple[Path, str], tuple[int, int]] = {}
+        for index, name in enumerate(start_parts):
+            label = "/".join(start_parts[: index + 1])
+            child_fd = _open_bound_child(directory_fd, name, label)
+            os.close(directory_fd)
+            directory_fd = child_fd
+            opened = os.fstat(directory_fd)
+            directories[label] = (opened.st_dev, opened.st_ino)
 
-    def walk(directory_fd: int, directory: Path, relative: tuple[str, ...]) -> None:
-        with os.scandir(directory_fd) as scanner:
-            entries = sorted(scanner, key=lambda entry: entry.name)
-        for entry in entries:
-            parts = relative + (entry.name,)
-            label = "/".join(parts)
-            try:
-                info = os.lstat(entry.name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                if _in_bytecode_cache(parts):
-                    raise _CacheChurn() from None
-                raise
-            is_python = fnmatch.fnmatchcase(entry.name, "*.py")
-            if stat.S_ISLNK(info.st_mode):
-                if is_python:
-                    raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
-                if prune(parts):
-                    continue
+        def walk(current_fd: int, relative: tuple[str, ...]) -> None:
+            in_cache = _BYTECODE_CACHE in relative
+            with os.scandir(current_fd) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+            for entry in entries:
+                parts = relative + (entry.name,)
+                label = "/".join(parts)
+                is_python = fnmatch.fnmatchcase(entry.name, "*.py")
                 try:
-                    target_is_directory = stat.S_ISDIR(os.stat(entry.name, dir_fd=directory_fd).st_mode)
+                    info = os.lstat(entry.name, dir_fd=current_fd)
                 except FileNotFoundError:
-                    target_is_directory = False  # dangling non-Python link: nothing to collect
-                if target_is_directory:
-                    raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
-                continue
-            if is_python and stat.S_ISREG(info.st_mode):
-                found.append(directory / entry.name)
-                identities[(CANDIDATE_ROOT, label)] = (info.st_dev, info.st_ino)
-            if prune(parts) or not stat.S_ISDIR(info.st_mode):
-                continue
-            if entry.inode() != info.st_ino:
-                raise ValueError(f"{label} changed during discovery")
-            try:
-                child_fd = _open_nofollow(entry.name, _DIRECTORY_FLAGS, directory_fd, label)
-            except FileNotFoundError:
-                if _in_bytecode_cache(parts):
-                    raise _CacheChurn() from None
-                raise
-            try:
-                opened = os.fstat(child_fd)
-                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    if in_cache and not is_python and not entry.is_dir(follow_symlinks=False):
+                        continue  # bytecode churn
+                    raise
+                if stat.S_ISLNK(info.st_mode):
+                    if prune(parts):
+                        continue
+                    # pytest collects through a link that is a *.py file or
+                    # leads to a directory; a dangling link's target could
+                    # appear as one. Only a link to an existing non-Python
+                    # file is inert (the end-of-plan re-walk re-checks it).
+                    if is_python:
+                        raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
+                    try:
+                        target = os.stat(entry.name, dir_fd=current_fd)
+                    except FileNotFoundError:
+                        raise ValueError(f"runtime-OS discovery refuses dangling symlink: {label}") from None
+                    if stat.S_ISDIR(target.st_mode):
+                        raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    if is_python:
+                        files[label] = _signature(info)
+                    continue
+                if not stat.S_ISDIR(info.st_mode) or prune(parts):
+                    continue
+                if entry.inode() != info.st_ino:
                     raise ValueError(f"{label} changed during discovery")
-                walk(child_fd, directory / entry.name, parts)
-            finally:
-                os.close(child_fd)
+                child_fd = _open_bound_child(current_fd, entry.name, label, info)
+                try:
+                    if not (in_cache or entry.name == _BYTECODE_CACHE):
+                        directories[label] = (info.st_dev, info.st_ino)
+                    walk(child_fd, parts)
+                finally:
+                    os.close(child_fd)
 
-    try:
-        walk(start_fd, start, start_parts)
+        walk(directory_fd, start_parts)
     finally:
-        os.close(start_fd)
-    _DISCOVERED_IDENTITY.update(identities)
-    return found
+        os.close(directory_fd)
+    for label, signature in files.items():
+        _DISCOVERED_FILES[(CANDIDATE_ROOT, label)] = signature
+    for label, identity in directories.items():
+        _DISCOVERED_DIRECTORIES[(CANDIDATE_ROOT, label)] = identity
+    return files, directories
+
+
+_TEST_SKIP_PARTS = {"integration", "e2e", "docker"}
+_SOURCE_EXCLUDED = {".git", ".venv", "tests", "venv"}
+# Generated interpreter/environment trees at the repository root are not
+# source: the bootstrap proof venv and the restored CI environment (which
+# carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
+_SOURCE_GENERATED_ROOTS = {".bootstrap-proof-venv", "ci-fast"}
+
+
+def _prune_tests(parts: tuple[str, ...]) -> bool:
+    return parts[-1] in _TEST_SKIP_PARTS
+
+
+def _prune_sources(parts: tuple[str, ...]) -> bool:
+    return parts[-1] in _SOURCE_EXCLUDED or (len(parts) == 1 and parts[0] in _SOURCE_GENERATED_ROOTS)
+
+
+_SCOPES = {
+    "tests": (lambda: CANDIDATE_ROOT / "tests", _prune_tests),
+    "sources": (lambda: CANDIDATE_ROOT, _prune_sources),
+}
+
+
+def _discover(scope: str) -> dict[str, _Signature]:
+    """Discovery snapshot for ``scope``; one consistent snapshot per plan."""
+    if _PLAN is not None:
+        key = (CANDIDATE_ROOT, scope)
+        if key not in _PLAN["universes"]:  # type: ignore[operator]
+            _PLAN["universes"][key] = _walk_py_files(_SCOPES[scope][0](), _SCOPES[scope][1])  # type: ignore[index]
+        return _PLAN["universes"][key][0]  # type: ignore[index]
+    return _walk_py_files(_SCOPES[scope][0](), _SCOPES[scope][1])[0]
 
 
 def discover_tests() -> list[str]:
-    skip_parts = {"integration", "e2e", "docker"}
     return sorted(
-        str(path.relative_to(CANDIDATE_ROOT))
-        for path in _walk_py_files(CANDIDATE_ROOT / "tests", lambda parts: parts[-1] in skip_parts)
-        if path.name.startswith("test_")
-        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
+        path
+        for path in _discover("tests")
+        if Path(path).name.startswith("test_") and not (set(Path(path).parts) & _TEST_SKIP_PARTS)
     )
 
 
 def discover_python_sources() -> list[str]:
-    excluded = {".git", ".venv", "tests", "venv"}
-    # Generated interpreter/environment trees at the repository root are not
-    # source: the bootstrap proof venv and the restored CI environment (which
-    # carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
-    generated_roots = {".bootstrap-proof-venv", "ci-fast"}
-
-    def prune(parts: tuple[str, ...]) -> bool:
-        return parts[-1] in excluded or (len(parts) == 1 and parts[0] in generated_roots)
-
-    return sorted(
-        str(path.relative_to(CANDIDATE_ROOT))
-        for path in _walk_py_files(CANDIDATE_ROOT, prune)
-        if not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
-    )
+    return sorted(path for path in _discover("sources") if not (set(Path(path).parts) & _SOURCE_EXCLUDED))
 
 
 def _module_name(path: str) -> str:
@@ -338,7 +382,7 @@ def _iter_nodes(tree: ast.AST):
 
 
 def _candidate_stat(root: Path, path: str) -> os.stat_result | None:
-    """``lstat`` of ``root/path`` through the anchored no-follow chain.
+    """``lstat`` of ``root/path`` through the anchored, bound no-follow chain.
 
     ``None`` when it does not exist; a symlink anywhere on the path (the final
     component included) raises ``ValueError``.
@@ -359,28 +403,47 @@ def _candidate_stat(root: Path, path: str) -> os.stat_result | None:
     return info
 
 
-def _read_candidate_bytes(root: Path, path: str, expected: tuple[int, int] | None = None) -> bytes:
-    """Read ``root/path`` without following any symlink.
+def _read_candidate_bytes(root: Path, path: str) -> bytes:
+    """Read ``root/path`` exactly as the latest discovery observed it.
 
-    The root is anchored by ``_open_root``; each directory component and the
-    file itself are opened with ``O_NOFOLLOW`` relative to the parent's
-    descriptor, and when discovery recorded the file's identity the opened
-    file must be that same file.
+    The root is anchored (once per plan); every directory on the path is
+    opened bound and no-follow and must be the directory discovery recorded;
+    the file is opened no-follow and its signature must match discovery's
+    both before and after the read, so a replacement, an in-place rewrite,
+    or a write during the read raises instead of being parsed.
     """
     parts = Path(path).parts
-    if _PLAN_DIRECTORIES is not None and root == CANDIDATE_ROOT:
-        file_fd = _open_nofollow(parts[-1], _FILE_FLAGS, _plan_directory(parts[:-1]), path)
+    if _PLAN is not None and root == CANDIDATE_ROOT:
+        if _PLAN.get("root") is None:
+            _PLAN["root"] = _open_root(root)
+        directory_fd = os.dup(_PLAN["root"])  # type: ignore[arg-type]
     else:
-        directory_fd = _open_relative(_open_root(root), parts[:-1])
-        try:
-            file_fd = _open_nofollow(parts[-1], _FILE_FLAGS, directory_fd, path)
-        finally:
+        directory_fd = _open_root(root)
+    try:
+        for index, name in enumerate(parts[:-1]):
+            label = "/".join(parts[: index + 1])
+            child_fd = _open_bound_child(directory_fd, name, label)
             os.close(directory_fd)
+            directory_fd = child_fd
+            expected = _DISCOVERED_DIRECTORIES.get((root, label))
+            opened = os.fstat(directory_fd)
+            if expected is not None and (opened.st_dev, opened.st_ino) != expected:
+                raise ValueError(f"{label} changed after discovery")
+        file_fd = _open_nofollow(parts[-1], _FILE_FLAGS, directory_fd, path)
+    finally:
+        os.close(directory_fd)
     with os.fdopen(file_fd, "rb") as handle:
-        opened = os.fstat(handle.fileno())
-        if expected is not None and (opened.st_dev, opened.st_ino) != expected:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        expected_file = _DISCOVERED_FILES.get((root, path))
+        if expected_file is not None and _signature(before) != expected_file:
             raise ValueError(f"{path} changed after discovery")
-        return handle.read()
+        data = handle.read()
+        after = os.fstat(handle.fileno())
+    if _signature(after) != _signature(before) or len(data) != after.st_size:
+        raise ValueError(f"{path} changed while it was read")
+    return data
 
 
 def _decode_source(data: bytes) -> str:
@@ -388,52 +451,30 @@ def _decode_source(data: bytes) -> str:
     return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8").read()
 
 
-def _read_candidate(root: Path, path: str, expected: tuple[int, int] | None = None) -> str:
-    return _decode_source(_read_candidate_bytes(root, path, expected))
+def _read_candidate(root: Path, path: str) -> str:
+    return _decode_source(_read_candidate_bytes(root, path))
 
 
 # Parse results are cached by the SHA-256 of the exact bytes read, never by
-# path or inode: every lookup re-reads the candidate (anchored, no-follow,
-# identity-checked), so an in-place rewrite or a replacement can never be
-# answered from a stale parse. Within one ``select_tests`` call a snapshot
-# keeps each file read once, so a plan sees one consistent version of it.
+# path or inode, and every lookup re-reads the candidate against the current
+# discovery snapshot, so a stale parse can never answer for changed content.
+# Within one plan each file is read once and the root is anchored once.
 _REFERENCES_BY_DIGEST: dict[bytes, frozenset[str]] = {}
 _PREFIXES_BY_DIGEST: dict[bytes, frozenset[str]] = {}
-_PLAN_SNAPSHOT: dict[tuple[Path, str], bytes] | None = None
-# Within one plan the candidate root is anchored once, and the most recently
-# used directory descriptor is reused (paths arrive grouped by directory), so
-# reads stay anchored and no-follow without re-walking from "/" per file.
-_PLAN_DIRECTORIES: dict[str, object] | None = None
-
-
-def _plan_directory(parts: tuple[str, ...]) -> int:
-    assert _PLAN_DIRECTORIES is not None
-    if "root" not in _PLAN_DIRECTORIES:
-        _PLAN_DIRECTORIES["root"] = _open_root(CANDIDATE_ROOT)
-    root_fd = _PLAN_DIRECTORIES["root"]
-    if not parts:
-        return root_fd  # type: ignore[return-value]
-    last = _PLAN_DIRECTORIES.get("last")
-    if last is not None and last[0] == parts:  # type: ignore[index]
-        return last[1]  # type: ignore[index]
-    if last is not None:
-        os.close(last[1])  # type: ignore[index]
-        del _PLAN_DIRECTORIES["last"]
-    directory_fd = _open_relative(os.dup(root_fd), parts)  # type: ignore[arg-type]
-    _PLAN_DIRECTORIES["last"] = (parts, directory_fd)
-    return directory_fd
+_PLAN: dict[str, object] | None = None
 
 
 def _candidate_digest(path: str) -> bytes:
     key = (CANDIDATE_ROOT, path)
-    if _PLAN_SNAPSHOT is not None and key in _PLAN_SNAPSHOT:
-        return _PLAN_SNAPSHOT[key]
-    data = _read_candidate_bytes(CANDIDATE_ROOT, path, _DISCOVERED_IDENTITY.get(key))
+    digests = _PLAN["digests"] if _PLAN is not None else None
+    if digests is not None and key in digests:  # type: ignore[operator]
+        return digests[key]  # type: ignore[index]
+    data = _read_candidate_bytes(CANDIDATE_ROOT, path)
     digest = hashlib.sha256(data).digest()
     if digest not in _REFERENCES_BY_DIGEST:
         _REFERENCES_BY_DIGEST[digest] = _parse_references(_decode_source(data), path)
-    if _PLAN_SNAPSHOT is not None:
-        _PLAN_SNAPSHOT[key] = digest
+    if digests is not None:
+        digests[key] = digest  # type: ignore[index]
     return digest
 
 
@@ -523,22 +564,32 @@ def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
 
 @contextlib.contextmanager
 def _plan_snapshot():
-    """Read each candidate file at most once for the duration of one plan."""
-    global _PLAN_SNAPSHOT, _PLAN_DIRECTORIES
-    if _PLAN_SNAPSHOT is not None:
-        yield  # nested: the outer plan owns the snapshot and descriptors
+    """One consistent plan: each scope discovered once, each file read once.
+
+    On success the plan re-walks every scope it used and requires the same
+    snapshot (every ``*.py`` file's identity, size and timestamps and every
+    non-cache directory's identity); a candidate tree that changed while it
+    was being planned -- an addition, removal, replacement or rewrite --
+    raises instead of yielding a selection that may no longer describe it.
+    """
+    global _PLAN
+    if _PLAN is not None:
+        yield  # nested: the outer plan owns the snapshot and its check
         return
-    _PLAN_SNAPSHOT, _PLAN_DIRECTORIES = {}, {}
+    plan: dict[str, object] = {"digests": {}, "universes": {}, "root": None}
+    _PLAN = plan
     try:
         yield
+        _PLAN = None
+        for (root, scope), observed in plan["universes"].items():  # type: ignore[attr-defined]
+            if root != CANDIDATE_ROOT:
+                raise ValueError("candidate root changed during planning")
+            if _walk_py_files(_SCOPES[scope][0](), _SCOPES[scope][1]) != observed:
+                raise ValueError(f"candidate {scope} changed during planning")
     finally:
-        directories = _PLAN_DIRECTORIES
-        _PLAN_SNAPSHOT = _PLAN_DIRECTORIES = None
-        last = directories.get("last")
-        if last is not None:
-            os.close(last[1])  # type: ignore[index]
-        if "root" in directories:
-            os.close(directories["root"])  # type: ignore[arg-type]
+        _PLAN = None
+        if plan["root"] is not None:
+            os.close(plan["root"])  # type: ignore[arg-type]
 
 
 def select_tests(files: list[str]) -> tuple[list[str], bool]:

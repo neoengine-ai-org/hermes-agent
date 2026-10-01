@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 
@@ -305,26 +306,32 @@ def test_indexed_closure_matches_pairwise_fixpoint(monkeypatch, tmp_path) -> Non
 
 
 def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_path) -> None:
-    # Parallel test processes create and delete tests/__pycache__ while the
-    # adapter walks the tree. A bytecode cache vanishing mid-walk restarts the
-    # walk, which then sees the tree without it. Any other vanished directory
-    # fails closed (test_discovery_fails_closed_when_a_source_dir_vanishes).
+    # Parallel processes atomically replace *.pyc files inside __pycache__,
+    # so bytecode files vanishing mid-walk are tolerated. A vanished cache
+    # directory could have held tracked Python that the execution checkout
+    # still has, so it fails closed instead of narrowing the universe.
     for relative in ("tests/test_kept.py", "tests/__pycache__/x.pyc", "pkg/mod.py", "pkg/__pycache__/y.pyc"):
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / relative).write_text("", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    _fail_entry_lstat(
+        monkeypatch,
+        lambda entry: FileNotFoundError(2, "No such file or directory", entry) if entry.endswith(".pyc") else None,
+    )
+    assert adapter.discover_tests() == ["tests/test_kept.py"]
+    assert adapter.discover_python_sources() == ["pkg/mod.py"]
+
+    monkeypatch.undo()
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
 
     def vanished(path, dir_fd):
         if Path(path).name == "__pycache__" and dir_fd is not None:
-            cache = next(tmp_path.rglob("__pycache__"), None)
-            if cache is not None:
-                shutil.rmtree(cache)
             return FileNotFoundError(2, "No such file or directory", path)
         return None
 
-    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     _fail_directory_open(monkeypatch, vanished)
-    assert adapter.discover_tests() == ["tests/test_kept.py"]
-    assert adapter.discover_python_sources() == ["pkg/mod.py"]
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_tests()
 
 
 
@@ -431,9 +438,15 @@ def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, err
         adapter.discover_tests()
 
 
-def test_discovery_of_missing_root_is_empty(tmp_path, monkeypatch) -> None:
+def test_discovery_of_a_missing_root_fails_closed(tmp_path, monkeypatch) -> None:
+    # A missing (or transiently vanished) tests/ or candidate root must not
+    # collapse discovery to an empty universe.
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    assert adapter.discover_tests() == []
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_tests()
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path / "missing")
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_python_sources()
 
 
 @pytest.mark.parametrize("swapped", ["agent", "tests"])
@@ -651,23 +664,27 @@ def test_discovery_includes_tracked_python_inside_bytecode_caches(tmp_path, monk
 
 
 def test_discovery_tolerates_bytecode_cache_entries_vanishing(tmp_path, monkeypatch) -> None:
-    # A cache entry that vanishes once restarts the walk; the restarted walk
-    # still reports what is on disk (here: everything), never a narrowed set.
+    # Only bytecode churn may vanish; a *.py inside a cache, or the cache
+    # directory itself, vanishing fails closed (no retry onto a smaller set).
     _write_tree(tmp_path, ["agent/core.py", "agent/__pycache__/stale.py", "tests/test_core.py"])
-    (tmp_path / "tests/__pycache__").mkdir()
+    (tmp_path / "agent/__pycache__/core.cpython-311.pyc.12345").write_bytes(b"")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    raced: list[str] = []
-
-    def once(entry):
-        if entry in {"__pycache__", "stale.py"} and entry not in raced:
-            raced.append(entry)
-            return FileNotFoundError(2, "No such file or directory", entry)
-        return None
-
-    _fail_entry_lstat(monkeypatch, once)
-    assert adapter.discover_python_sources() == ["agent/__pycache__/stale.py", "agent/core.py"]
-    assert adapter.discover_tests() == ["tests/test_core.py"]
-    assert raced
+    for vanishing, expected in (
+        ("core.cpython-311.pyc.12345", None),
+        ("stale.py", FileNotFoundError),
+        ("__pycache__", FileNotFoundError),
+    ):
+        _fail_entry_lstat(
+            monkeypatch,
+            lambda entry, _name=vanishing: FileNotFoundError(2, "No such file or directory", entry)
+            if entry == _name
+            else None,
+        )
+        if expected is None:
+            assert adapter.discover_python_sources() == ["agent/__pycache__/stale.py", "agent/core.py"]
+        else:
+            with pytest.raises(expected):
+                adapter.discover_python_sources()
 
 
 def test_reference_cache_is_keyed_by_candidate_root(tmp_path, monkeypatch) -> None:
@@ -831,10 +848,10 @@ def test_p1_atomic_replacement_after_warm_selection_is_reselected(tmp_path, monk
     assert "tests/unit/test_probe.py" in selected
 
 
-def test_p2_cache_resident_test_survives_transient_cache_churn(tmp_path, monkeypatch) -> None:
-    # A tracked-style test inside tests/__pycache__ whose classification races
-    # cache churn once must still be in the universe (the walk restarts).
-    root = _select_tree(
+def test_p2_cache_resident_test_vanishing_fails_closed(tmp_path, monkeypatch) -> None:
+    # A tracked-style test inside tests/__pycache__ that vanishes during the
+    # walk would still exist in the execution checkout: never narrow, raise.
+    _select_tree(
         tmp_path,
         monkeypatch,
         {
@@ -854,34 +871,30 @@ def test_p2_cache_resident_test_survives_transient_cache_churn(tmp_path, monkeyp
         return real_lstat(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "lstat", churn_once)
-    selected, unknown = adapter.select_tests(["pkg/changed.py"])
+    with pytest.raises(FileNotFoundError):
+        adapter.select_tests(["pkg/changed.py"])
     assert raced
-    assert "tests/__pycache__/test_cached.py" in selected
-    assert unknown is False
-    assert (root / "tests/__pycache__/test_cached.py").exists()
 
 
-def test_p2_persistent_cache_churn_fails_closed(tmp_path, monkeypatch) -> None:
+def test_p2_cache_resident_test_is_selected_when_stable(tmp_path, monkeypatch) -> None:
     _select_tree(
         tmp_path,
         monkeypatch,
-        {"tests/unit/test_other.py": "", "tests/__pycache__/test_cached.py": ""},
+        {
+            "pkg/__init__.py": "",
+            "pkg/changed.py": "",
+            "tests/unit/test_other.py": "import pkg.unrelated\n",
+            "tests/__pycache__/test_cached.py": "import pkg.changed\n",
+            "tests/__pycache__/conftest.cpython-311.pyc": "",
+        },
     )
-    real_lstat = os.lstat
-
-    def always_churning(path, *args, **kwargs):
-        if os.fspath(path) == "test_cached.py":
-            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "lstat", always_churning)
-    with pytest.raises(RuntimeError, match="bytecode cache"):
-        adapter.discover_tests()
+    selected, unknown = adapter.select_tests(["pkg/changed.py"])
+    assert "tests/__pycache__/test_cached.py" in selected
+    assert unknown is False
 
 
 def test_p2_vanished_cache_directory_never_narrows_silently(tmp_path, monkeypatch) -> None:
-    # The cache directory itself disappears between listing and opening: the
-    # walk restarts and returns the universe as it now exists on disk.
+    # The cache directory itself disappears between listing and opening.
     root = _select_tree(
         tmp_path,
         monkeypatch,
@@ -897,7 +910,8 @@ def test_p2_vanished_cache_directory_never_narrows_silently(tmp_path, monkeypatc
         return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
 
     monkeypatch.setattr(os, "open", delete_cache_on_open)
-    assert adapter.discover_tests() == ["tests/test_kept.py"]
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_tests()
     assert removed
 
 
@@ -1016,3 +1030,114 @@ def test_p7_backslash_path_is_never_aliased_to_a_slash_path(tmp_path, monkeypatc
     selected, unknown = adapter.select_tests(["tests/unit\\test_a.py"])
     assert "tests/unit/test_a.py" not in selected
     assert unknown is True
+
+
+# --- Round-7 (4f337b82) findings -------------------------------------------
+
+
+@pytest.mark.parametrize("dangling_name", ["linked", "linked.txt"])
+def test_r7_any_non_pruned_symlink_is_refused_even_if_dangling(tmp_path, monkeypatch, dangling_name) -> None:
+    # A dangling link's target can appear later (pytest would then collect
+    # through it), so a symlink is refused regardless of its target state.
+    root = _select_tree(tmp_path, monkeypatch, {"tests/unit/test_kept.py": ""})
+    (root / f"tests/unit/{dangling_name}").symlink_to(root / "not-yet-there")
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_tests()
+
+
+def test_r7_tests_start_directory_is_bound_across_classification_and_open(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"tests/unit/test_a.py": "", "tests/test_top.py": ""})
+    real_open = os.open
+    swapped = []
+
+    def swap_tests_before_open(path, flags, *args, dir_fd=None, **kwargs):
+        if os.fspath(path) == "tests" and dir_fd is not None and not swapped:
+            os.rename(root / "tests", root / "tests.moved")
+            (root / "tests").mkdir()
+            swapped.append(path)
+        return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_tests_before_open)
+    with pytest.raises(ValueError, match="changed during discovery"):
+        adapter.discover_tests()
+    assert swapped
+
+
+def test_r7_tree_changed_during_planning_fails_closed(tmp_path, monkeypatch) -> None:
+    # An addition after the one-shot listing (here: a new importing test
+    # created while the plan runs) must not yield a stale narrowed plan.
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {"pkg/__init__.py": "", "pkg/changed.py": "", "tests/unit/test_other.py": "import pkg.unrelated\n"},
+    )
+    real_closure = adapter._impacted_closure
+
+    def closure_then_add_test(module):
+        result = real_closure(module)
+        (root / "tests/unit/test_added.py").write_text("import pkg.changed\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(adapter, "_impacted_closure", closure_then_add_test)
+    with pytest.raises(ValueError, match="changed during planning"):
+        adapter.select_tests(["pkg/changed.py"])
+
+
+def test_r7_directory_replaced_after_discovery_is_not_read_through(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"agent/core.py": "import gateway.run\n"})
+    # The read is refused, and the plan's end-of-plan check refuses too.
+    with pytest.raises(ValueError, match="changed during planning"):
+        with adapter._plan_snapshot():
+            assert adapter.discover_python_sources() == ["agent/core.py"]
+            os.rename(root / "agent", root / "agent.moved")
+            shutil.copytree(root / "agent.moved", root / "agent")  # different real directory
+            with pytest.raises(ValueError, match="changed after discovery"):
+                adapter._module_references("agent/core.py")
+
+
+def test_r7_same_inode_rewrite_after_discovery_is_not_parsed(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"agent/core.py": "import gateway.run\n"})
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+    inode = (root / "agent/core.py").stat().st_ino
+    with open(root / "agent/core.py", "r+", encoding="utf-8") as handle:  # same inode
+        handle.write("import tools.other\n")
+    assert (root / "agent/core.py").stat().st_ino == inode
+    with pytest.raises(ValueError, match="changed after discovery"):
+        adapter._module_references("agent/core.py")
+
+
+def test_r7_write_during_read_is_not_parsed(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"agent/core.py": "import gateway.run\n"})
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+    real_fstat = os.fstat
+    calls = []
+
+    def growing_fstat(fd):
+        info = real_fstat(fd)
+        if stat.S_ISREG(info.st_mode):
+            calls.append(fd)
+            if len(calls) == 2:  # the post-read check: simulate a concurrent write
+                values = list(info)
+                values[stat.ST_SIZE] += 1
+                return os.stat_result(values)
+        return info
+
+    monkeypatch.setattr(os, "fstat", growing_fstat)
+    with pytest.raises(ValueError, match="changed while it was read"):
+        adapter._module_references("agent/core.py")
+    assert (root / "agent/core.py").exists()
+
+
+def test_r7_configured_candidate_root_is_bound_at_import() -> None:
+    assert adapter.CANDIDATE_ROOT in adapter._ROOT_IDENTITY
+
+
+def test_r7_symlink_to_an_existing_non_python_file_is_inert(tmp_path, monkeypatch) -> None:
+    # e.g. a runtime receipt link; pytest cannot collect through it.
+    root = _select_tree(tmp_path, monkeypatch, {"tests/unit/test_kept.py": "", "docs/receipt.md": "x"})
+    (root / "tests/unit/latest-receipt.md").symlink_to(root / "docs/receipt.md")
+    assert adapter.discover_tests() == ["tests/unit/test_kept.py"]
+    (root / "docs/receipt.md").unlink()
+    (root / "docs/receipt.md").mkdir()  # the target becomes a directory
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_tests()
