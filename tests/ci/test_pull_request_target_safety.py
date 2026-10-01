@@ -126,7 +126,11 @@ GIT_ALLOWED_OPTIONS = {
     "ls-files": {"-z"},
     "rev-parse": {"--verify", "-q", "--quiet"},
 }
-GIT_GLOBAL_WITH_VALUE = {"-C", "-c"}
+GIT_GLOBAL_WITH_VALUE = {"-C"}
+# git reached indirectly, where the verb cannot be checked statically.
+INDIRECT_GIT = re.compile(
+    r"(?:command\s+-v|which|type\s+-p)\s+git\b|=\s*[\"']?(?:\S*/)?git[\"']?(?=[\s;&|)]|$)"
+)
 
 
 def _git_violations(script: str) -> list[str]:
@@ -135,11 +139,11 @@ def _git_violations(script: str) -> list[str]:
     for command in SHELL_SEPARATOR.split(script):
         tokens = [token.strip("\"'") for token in command.split()]
         for start, token in enumerate(tokens):
-            if token not in {"git", "command"} or (
-                token == "command" and tokens[start + 1 : start + 2] != ["git"]
-            ):
+            if token in {"command", "exec", "xargs", "env", "sudo"}:
                 continue
-            index = start + 1 if token == "git" else start + 2
+            if token.rsplit("/", 1)[-1] != "git":
+                continue
+            index = start + 1
             while index < len(tokens) and tokens[index].startswith("-"):
                 if tokens[index] in GIT_GLOBAL_WITH_VALUE:
                     index += 2
@@ -263,6 +267,10 @@ def _job_violations(
             violations.append(f"{label} runs gh pr checkout/diff")
         if not reads_pr_refs:
             continue
+        if INDIRECT_GIT.search(script):
+            violations.append(
+                f"{label} reaches git indirectly in a job that reads PR refs"
+            )
         for problem in _git_violations(script):
             violations.append(f"{label} runs `{problem}` in a job that reads PR refs")
         for line in script.splitlines():
@@ -536,6 +544,11 @@ _TAINTED_FETCH = {
         'git cat-file -p "$HEAD":run.sh | sh',
         'out=$(git diff "$BASE" "$HEAD") && echo "$out" | sh',
         'command git checkout "$HEAD"',
+        # Final-head secondary-review bypasses.
+        '/usr/bin/git show "$HEAD":x.sh | sh',
+        '"$(command -v git)" show "$HEAD":x.sh | sh',
+        'G=git; $G show "$HEAD":x.sh | sh',
+        'git -c core.hooksPath=h fetch origin "$HEAD"',
     ],
 )
 def test_detector_flags_non_plumbing_git_in_pr_ref_jobs(script: str) -> None:

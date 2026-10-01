@@ -103,7 +103,8 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
     assert "process.env.DEFINITION_CHANGED !== 'false'" in script
     assert "run.display_title === expectedTitle" in script
     assert "Runtime OS candidate ${head} on ${process.env.EXPECTED_BASE}" in script
-    assert "grep -qxF .github/workflows/ci-runtime-os-candidate.yml changed-files.txt" in text
+    assert "grep -qxF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt" in text
+    assert '--name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt' in text
     for job_id in ("preflight", "review-evidence"):
         first_runs = [s.get("run", "") for s in jobs[job_id]["steps"] if "run" in s]
         assert 'find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1' in first_runs[
@@ -155,4 +156,10 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
             if str(ours_step.get("uses", "")).startswith("actions/checkout"):
                 assert ours_step["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
                 continue
+            if ours_step.get("name") == "Build locked environment with one infra-only retry":
+                ours_step = dict(ours_step)
+                assert ours_step.pop("env") == {
+                    "UV_PYTHON_INSTALL_DIR": "${{ github.workspace }}/ci-fast/bin/.python",
+                    "UV_PYTHON_PREFERENCE": "only-managed",
+                }
             assert ours_step == as_candidate(theirs_step), (job_id, ours_step.get("name"))

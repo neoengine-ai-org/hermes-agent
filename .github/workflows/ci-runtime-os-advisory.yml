@@ -141,8 +141,10 @@ jobs:
             fi
             git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
             # The candidate run executes its workflow definition from the PR
-            # merge ref; it is only base-defined while the PR leaves it alone.
-            if grep -qxF .github/workflows/ci-runtime-os-candidate.yml changed-files.txt; then
+            # merge ref; it is only base-defined while the PR's own commits
+            # (merge-base diff) leave it alone.
+            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
+            if grep -qxF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
               echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
             else
               echo "candidate_definition_changed=false" >> "$GITHUB_OUTPUT"
@@ -418,7 +420,12 @@ jobs:
                 return;
               }
               if (!latest && now > discoveryDeadline) {
-                core.setFailed(`No same-repository candidate proof run exists for ${head} on base ${process.env.EXPECTED_BASE}`);
+                core.setFailed(
+                  `No candidate proof run bound to PR #${prNumber} at ${head} on base ` +
+                    `${process.env.EXPECTED_BASE}. Likely causes: the base advanced or was ` +
+                    'retargeted since the last push, the head is shared with another open PR, ' +
+                    'or the PR predates the candidate workflow. Push, update the branch, or reopen.',
+                );
                 return;
               }
               if (now > deadline) {
