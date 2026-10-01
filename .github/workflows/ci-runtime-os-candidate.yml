@@ -1,4 +1,6 @@
 name: CI Runtime OS candidate proof
+# The waiter binds to this exact title; it is fixed when the run is triggered.
+run-name: Runtime OS candidate ${{ github.event.pull_request.head.sha }} on ${{ github.event.pull_request.base.sha }}
 
 # Unprivileged half of the Runtime OS advisory: the only place PR-head code is
 # checked out and executed. It runs in `pull_request` context, never base
@@ -6,7 +8,8 @@ name: CI Runtime OS candidate proof
 # `pull_request_target` token. As defined here it requests `contents: read`
 # and references no secrets, but GitHub loads this file from the PR merge ref:
 # a repository writer can edit it, exactly as they can already run any
-# workflow from a pushed branch. The privileged ci-runtime-os-advisory.yml
+# workflow from a pushed branch. It runs on GitHub-hosted ephemeral runners so
+# PR-head code never lands on the shared, persistent self-hosted host. The privileged ci-runtime-os-advisory.yml
 # therefore refuses proof from a PR that modifies this file, and treats the
 # result as test evidence only, never policy, review, or admission authority.
 
@@ -29,7 +32,7 @@ jobs:
   plan:
     name: Select candidate proof slices
     if: github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -112,7 +115,7 @@ jobs:
     needs: plan
     if: >-
       (needs.plan.outputs.has_tests == 'true' || needs.plan.outputs.run_e2e == 'true')
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - name: Checkout exact candidate
@@ -175,7 +178,7 @@ jobs:
     name: Runtime OS slice ${{ matrix.index }}/6
     needs: [plan, environment]
     if: needs.plan.outputs.has_tests == 'true'
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -213,7 +216,7 @@ jobs:
     name: Runtime OS e2e
     needs: [plan, environment]
     if: needs.plan.outputs.run_e2e == 'true'
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

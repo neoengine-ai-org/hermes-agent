@@ -358,6 +358,7 @@ jobs:
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
           EXPECTED_PR: ${{ github.event.pull_request.number }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
           DEFINITION_CHANGED: ${{ needs.preflight.outputs.candidate_definition_changed }}
           CANDIDATE_WORKFLOW: ci-runtime-os-candidate.yml
           DISCOVERY_MINUTES: "20"
@@ -373,6 +374,7 @@ jobs:
             }
             const head = process.env.EXPECTED_HEAD;
             const prNumber = Number(process.env.EXPECTED_PR);
+            const expectedTitle = `Runtime OS candidate ${head} on ${process.env.EXPECTED_BASE}`;
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const started = Date.now();
             const discoveryDeadline = started + Number(process.env.DISCOVERY_MINUTES) * 60 * 1000;
@@ -390,6 +392,7 @@ jobs:
               const bound = runs.filter(
                 (run) =>
                   run.head_sha === head &&
+                  run.display_title === expectedTitle &&
                   run.event === 'pull_request' &&
                   run.head_repository &&
                   run.head_repository.full_name === repository &&
@@ -409,7 +412,7 @@ jobs:
               }
               const now = Date.now();
               if (!latest && now > discoveryDeadline) {
-                core.setFailed(`No same-repository candidate proof run exists for ${head}`);
+                core.setFailed(`No same-repository candidate proof run exists for ${head} on base ${process.env.EXPECTED_BASE}`);
                 return;
               }
               if (now > deadline) {

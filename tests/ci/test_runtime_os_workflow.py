@@ -99,6 +99,8 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
     assert "latest.conclusion === 'success'" in script
     assert "(run.pull_requests || []).some((pull) => pull.number === prNumber)" in script
     assert "process.env.DEFINITION_CHANGED !== 'false'" in script
+    assert "run.display_title === expectedTitle" in script
+    assert "Runtime OS candidate ${head} on ${process.env.EXPECTED_BASE}" in script
     assert "grep -qxF .github/workflows/ci-runtime-os-candidate.yml changed-files.txt" in text
     for job_id in ("preflight", "review-evidence"):
         first_runs = [s.get("run", "") for s in jobs[job_id]["steps"] if "run" in s]
@@ -116,6 +118,11 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
     triggers = workflow.get("on", workflow.get(True))
     assert set(triggers) == {"pull_request"}
     assert workflow["permissions"] == {"contents": "read"}
+    assert workflow["run-name"] == (
+        "Runtime OS candidate ${{ github.event.pull_request.head.sha }} "
+        "on ${{ github.event.pull_request.base.sha }}"
+    )
+    assert all(job["runs-on"] == "ubuntu-latest" for job in workflow["jobs"].values())
     text = CANDIDATE.read_text(encoding="utf-8")
     assert "secrets." not in text
     assert "actions/cache/save" not in text

@@ -25,14 +25,27 @@ FORBIDDEN_REF = re.compile(
     r"github\.event\.pull_request\.head\.|github\.head_ref|"
     r"github\.event\.pull_request\.merge_commit_sha|refs/pull/|\bpull/[^/\s]+/(?:head|merge)\b",
 )
-# Shell commands that materialize, apply, or emit ref content (worktree or blob).
-MATERIALIZING_GIT = re.compile(
-    r"\bgit\b[^\n]*\b(checkout|switch|worktree|restore|reset|archive|read-tree|"
-    r"checkout-index|stash|show|apply|am|cherry-pick|merge|rebase|pull)\b"
-    r"|\bgit\b[^\n]*\bcat-file\s+(-p|blob)\b"
-    r"|\bFETCH_HEAD\b"
-    r"|\bgh\s+pr\s+(checkout|diff)\b",
+# Contexts a pull_request_target checkout may resolve its ref/repository from.
+# Anything else (PR head fields, step outputs, env indirection, inputs) fails.
+TRUSTED_CHECKOUT_CONTEXTS = (
+    "github.sha",
+    "github.ref",
+    "github.base_ref",
+    "github.repository",
+    "github.event.pull_request.base.",
+    "github.event.merge_group.",
+    "github.event.repository.",
 )
+EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
+CONTEXT_PATH = re.compile(
+    r"\b(?:github|env|steps|needs|inputs|vars|matrix|job|runner|strategy|secrets)\.[\w.*-]+"
+)
+GIT_CALL = re.compile(
+    r"(?<![\w./-])git(?:\s+(?:-C|-c)\s+\S+|\s+--no-pager)*\s+([a-z][\w-]*)([^\n;&|)]*)"
+)
+GH_CHECKOUT = re.compile(r"(?<![\w./-])gh\s+pr\s+(?:checkout|diff)\b")
+SHELL_COMMENT = re.compile(r"(?m)(?:^|(?<=\s))#.*$")
+NETWORK_TOOL = re.compile(r"(?<![\w./-])(?:curl|wget|gh\s+api)\b")
 
 
 def _triggers(workflow: dict[Any, Any]) -> set[str]:
@@ -50,18 +63,73 @@ def _triggers(workflow: dict[Any, Any]) -> set[str]:
     return names
 
 
-def _job_reads_pr_refs(workflow: dict[Any, Any], job: dict[Any, Any]) -> bool:
-    # Taint is job-wide: one step can fetch the head and a later step can
-    # check out FETCH_HEAD or a ref recorded on disk without naming it again.
-    scopes: list[Any] = [workflow.get("env"), job.get("env")]
-    for step in job.get("steps") or []:
-        if isinstance(step, dict):
-            scopes.extend([step.get("env"), step.get("run"), step.get("with")])
-    return any(FORBIDDEN_REF.search(str(scope)) for scope in scopes if scope)
+def _tainted_env(*scopes: Any) -> set[str]:
+    return {
+        str(name)
+        for scope in scopes
+        if isinstance(scope, dict)
+        for name, value in (scope.get("env") or {}).items()
+        if FORBIDDEN_REF.search(str(value))
+    }
+
+
+def _names_pr_ref(value: Any, tainted: set[str]) -> bool:
+    """An action input names PR-head content directly or via ``${{ env.X }}``."""
+    text = str(value)
+    if FORBIDDEN_REF.search(text):
+        return True
+    return any(
+        re.search(rf"\benv\.{re.escape(name)}\b", expression)
+        for expression in EXPRESSION.findall(text)
+        for name in tainted
+    )
+
+
+def _shell_names_pr_ref(line: str, tainted: set[str]) -> bool:
+    if FORBIDDEN_REF.search(line):
+        return True
+    return any(re.search(rf"\$\{{?{re.escape(name)}\b", line) for name in tainted)
+
+
+def _context_matches(path: str, prefix: str) -> bool:
+    if prefix.endswith("."):
+        return path.startswith(prefix)
+    return path == prefix or path.startswith(prefix + "_")
+
+
+def _untrusted_checkout_value(value: Any) -> bool:
+    text = str(value)
+    literal = EXPRESSION.sub("", text)
+    if FORBIDDEN_REF.search(literal):
+        return True
+    for expression in EXPRESSION.findall(text):
+        for path in CONTEXT_PATH.findall(expression):
+            if not any(
+                _context_matches(path, prefix) for prefix in TRUSTED_CHECKOUT_CONTEXTS
+            ):
+                return True
+    return False
+
+
+def _git_call_allowed(verb: str, args: str) -> bool:
+    words = args.split()
+    if verb in {"fetch", "ls-files", "rev-parse"}:
+        return True
+    if verb == "cat-file":
+        return bool(words) and words[0] == "-e"
+    if verb == "diff":
+        return "--name-only" in words or "--name-status" in words
+    return False
 
 
 def pull_request_target_violations(workflow: dict[Any, Any], label: str) -> list[str]:
-    """Return every place a pull_request_target workflow materializes PR-head content."""
+    """Return every place a pull_request_target workflow may materialize PR-head code.
+
+    Fail-closed allowlists rather than a deny-list: checkouts may only name
+    trusted contexts, and a job that reads PR refs may only run inert git
+    plumbing (fetch, cat-file -e, diff --name-only/--name-status, ls-files,
+    rev-parse). This is a regression guard, not a proof of shell semantics.
+    """
     if "pull_request_target" not in _triggers(workflow):
         return []
     violations: list[str] = []
@@ -69,27 +137,53 @@ def pull_request_target_violations(workflow: dict[Any, Any], label: str) -> list
         if not isinstance(job, dict):
             continue
         where = f"{label}:{job_id}"
-        if job.get("uses") and FORBIDDEN_REF.search(str(job.get("with") or {})):
+        job_tainted = _tainted_env(workflow, job)
+        if job.get("uses") and _names_pr_ref(job.get("with") or {}, job_tainted):
             violations.append(
                 f"{where} passes a PR-head ref to reusable workflow {job['uses']}"
             )
-        reads_pr_refs = _job_reads_pr_refs(workflow, job)
-        for index, step in enumerate(job.get("steps") or []):
-            if not isinstance(step, dict):
-                continue
+        steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
+        tainted = job_tainted | _tainted_env(*steps)
+        # Job-wide: one step can fetch the head and a later step can use
+        # FETCH_HEAD or a ref recorded on disk without naming it again.
+        reads_pr_refs = bool(tainted) or any(
+            FORBIDDEN_REF.search(str(step.get("run") or "")) for step in steps
+        )
+        for index, step in enumerate(steps):
             step_where = f"{where}:step[{index}] {step.get('name', step.get('uses', ''))}".rstrip()
-            # Any action input (checkout, alternate checkout actions, local
-            # composite actions, inline scripts) naming PR-head content.
+            uses = str(step.get("uses") or "")
             for field, value in (step.get("with") or {}).items():
-                if FORBIDDEN_REF.search(str(value)):
+                if _names_pr_ref(value, tainted):
                     violations.append(
-                        f"{step_where} passes {field}={value!r} to {step.get('uses')}"
+                        f"{step_where} passes {field}={value!r} to {uses}"
                     )
-            script = str(step.get("run") or "")
-            if script and reads_pr_refs and MATERIALIZING_GIT.search(script):
-                violations.append(
-                    f"{step_where} materializes PR-head content in a job that reads PR refs"
-                )
+            if uses.startswith("actions/checkout"):
+                for field in ("ref", "repository"):
+                    if field in (step.get("with") or {}) and _untrusted_checkout_value(
+                        step["with"][field]
+                    ):
+                        violations.append(
+                            f"{step_where} checks out untrusted {field}={step['with'][field]!r}"
+                        )
+            script = SHELL_COMMENT.sub(
+                "", str(step.get("run") or "").replace("\\\n", " ")
+            )
+            if not script:
+                continue
+            if GH_CHECKOUT.search(script):
+                violations.append(f"{step_where} runs gh pr checkout/diff")
+            if not reads_pr_refs:
+                continue
+            for verb, args in GIT_CALL.findall(script):
+                if not _git_call_allowed(verb, args):
+                    violations.append(
+                        f"{step_where} runs `git {verb}` in a job that reads PR refs"
+                    )
+            for line in script.splitlines():
+                if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
+                    violations.append(
+                        f"{step_where} downloads PR-head content: {line.strip()}"
+                    )
     return violations
 
 
@@ -198,6 +292,41 @@ def _prt(steps: list[dict[str, Any]], **job: Any) -> dict[Any, Any]:
             {
                 "uses": "actions/github-script@v7",
                 "with": {"script": "run('${{ github.event.pull_request.head.sha }}')"},
+            }
+        ]),
+        # Round-2 adversarial bypasses.
+        _prt(
+            [{"uses": "actions/checkout@v6", "with": {"ref": "${{ env.HEAD }}"}}],
+            env={"HEAD": "${{ github.event.pull_request.head.sha }}"},
+        ),
+        _prt([
+            {
+                "uses": "actions/checkout@v6",
+                "with": {"ref": "${{ steps.pr.outputs.sha }}"},
+            }
+        ]),
+        _prt([
+            {
+                "env": {"HEAD": "${{ github.event.pull_request.head.sha }}"},
+                "run": 'git fetch origin "$HEAD"\ngit diff "$BASE" "$HEAD" > payload; bash payload',
+            }
+        ]),
+        _prt([
+            {
+                "env": {"HEAD": "${{ github.event.pull_request.head.sha }}"},
+                "run": 'git fetch origin "$HEAD"\ngit cat-file --filters "$HEAD":run.sh | sh',
+            }
+        ]),
+        _prt([
+            {
+                "env": {"HEAD": "${{ github.event.pull_request.head.sha }}"},
+                "run": 'git fetch origin "$HEAD"\ngit \\\n  checkout "$HEAD"',
+            }
+        ]),
+        _prt([
+            {
+                "env": {"HEAD": "${{ github.event.pull_request.head.sha }}"},
+                "run": 'curl -sL "https://codeload.github.com/o/r/tar.gz/$HEAD" | tar -xz',
             }
         ]),
         {
