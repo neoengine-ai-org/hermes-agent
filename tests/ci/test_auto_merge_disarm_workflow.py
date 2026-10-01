@@ -42,6 +42,8 @@ def _script() -> str:
 
 class FakeGitHub:
     def __init__(self):
+        self.url = ""
+        self.tmp: Path | None = None
         self.prs = {}  # number -> dict(state, armed, sha)
         self.comments = {}  # number -> list of {body, user:{login,type}}
         self.calls = []
@@ -75,7 +77,7 @@ class FakeGitHub:
 
 def _handler(fake: FakeGitHub):
     class H(BaseHTTPRequestHandler):
-        def log_message(self, *a):
+        def log_message(self, format, *args):  # noqa: A002 - matches the base signature
             pass
 
         def _send(self, code, body):
