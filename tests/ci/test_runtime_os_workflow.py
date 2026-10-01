@@ -170,3 +170,17 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
                 assert ours_step["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
                 continue
             assert ours_step == as_candidate(theirs_step), (job_id, ours_step.get("name"))
+
+
+def test_restored_environment_keeps_receipt_checkout_clean_and_e2e_runnable() -> None:
+    # run_tests.sh validates receipt-grade with `git status --untracked-files=all`;
+    # the restored ci-fast/ tree lives in the checkout and must be ignored.
+    ignored = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "/ci-fast/" in ignored
+    for path in (WORKFLOW, CANDIDATE):
+        e2e = _jobs(path)["e2e"]
+        run = next(s for s in e2e["steps"] if s.get("name") == "Run full e2e proof")["run"]
+        # tests/integration is all `integration`-marked (external services) and
+        # deselected by addopts, so pytest exits 5; mirror tests.yml's e2e lane.
+        assert "tests/integration" not in run, path.name
+        assert "python -m pytest tests/e2e/ -v --tb=short" in run, path.name

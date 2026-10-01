@@ -5,6 +5,9 @@
 __pycache__/
 .venv/
 .bootstrap-proof-venv/
+# Runtime OS restored ci-fast environment (artifact tarball + uv-managed
+# Python); build output, never source, so receipt-grade checkouts stay clean.
+/ci-fast/
 .bootstrap/
 .vscode/
 .env
