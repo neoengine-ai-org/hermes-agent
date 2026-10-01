@@ -13,7 +13,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-TRUST_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPT = Path(os.path.abspath(__file__))
+# Refuse to run through a symlink inside the repository (the script, scripts/ci
+# or scripts): resolve() would follow it and load the classifier and policy
+# from an unpinned location.
+if any(part.is_symlink() for part in (_SCRIPT, _SCRIPT.parent, _SCRIPT.parent.parent)):
+    raise SystemExit("runtime_os_adapter must not run through a symlinked path")
+TRUST_ROOT = _SCRIPT.parents[2].resolve()
 CANDIDATE_ROOT = Path(os.environ.get("RUNTIME_OS_CANDIDATE_ROOT", TRUST_ROOT)).resolve()
 LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-bundle.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"
@@ -104,22 +110,51 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
+def _walk_py_files(start: Path, prune) -> list[Path]:
+    """``*.py`` files under ``start``, never descending into pruned dirs.
+
+    os.walk instead of Path.rglob: parallel test processes create and delete
+    ``__pycache__`` directories while this runs, and rglob raises
+    FileNotFoundError on a directory that vanishes mid-walk; os.walk skips it.
+    """
+    def vanished_only(error: OSError) -> None:
+        # Only a directory that disappeared mid-walk is skipped; any other
+        # traversal error must not silently drop sources or tests.
+        if not isinstance(error, (FileNotFoundError, NotADirectoryError)):
+            raise error
+
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(start, onerror=vanished_only):
+        relative = Path(dirpath).relative_to(CANDIDATE_ROOT).parts
+        dirnames[:] = [name for name in dirnames if not prune(relative + (name,))]
+        found.extend(Path(dirpath) / name for name in filenames if name.endswith(".py"))
+    return [path for path in found if path.is_file()]
+
+
 def discover_tests() -> list[str]:
     skip_parts = {"integration", "e2e", "docker"}
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in (CANDIDATE_ROOT / "tests").rglob("test_*.py")
-        if path.is_file() and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
+        for path in _walk_py_files(CANDIDATE_ROOT / "tests", lambda parts: parts[-1] in skip_parts)
+        if path.name.startswith("test_")
+        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
     )
 
 
 def discover_python_sources() -> list[str]:
     excluded = {".git", ".venv", "tests", "venv"}
+    # Generated interpreter/environment trees at the repository root are not
+    # source: the bootstrap proof venv and the restored CI environment (which
+    # carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
+    generated_roots = {".bootstrap-proof-venv", "ci-fast"}
+
+    def prune(parts: tuple[str, ...]) -> bool:
+        return parts[-1] in excluded or (len(parts) == 1 and parts[0] in generated_roots)
+
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in CANDIDATE_ROOT.rglob("*.py")
-        if path.is_file()
-        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
+        for path in _walk_py_files(CANDIDATE_ROOT, prune)
+        if not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
     )
 
 
@@ -163,6 +198,50 @@ def _imports_module(path: str, module_name: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _reference_prefixes(path: str) -> frozenset[str]:
+    """Every dotted prefix of every reference: ``a.b.c`` -> ``a``, ``a.b``, ``a.b.c``.
+
+    ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
+    """
+    prefixes: set[str] = set()
+    for reference in _module_references(path):
+        parts = reference.split(".")
+        prefixes.update(".".join(parts[: index + 1]) for index in range(len(parts)))
+    return frozenset(prefixes)
+
+
+def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
+    """Transitive importer closure of ``changed_module`` over repository sources.
+
+    Breadth-first over a prefix -> importer index; the same least fixpoint the
+    pairwise rescan computed, in time linear in the references. Also returns
+    sources that could not be parsed; any such source outside the closure
+    marks the plan unknown (unlike the old order-dependent rescan, a parse
+    failure that shares its module name with an impacted source does not).
+    """
+    importers: dict[str, list[str]] = {}
+    parse_failures: list[str] = []
+    for source_path in discover_python_sources():
+        try:
+            prefixes = _reference_prefixes(source_path)
+        except (OSError, SyntaxError, UnicodeError):
+            parse_failures.append(source_path)
+            continue
+        for prefix in prefixes:
+            importers.setdefault(prefix, []).append(source_path)
+    impacted = {changed_module}
+    queue = [changed_module]
+    while queue:
+        module = queue.pop()
+        for source_path in importers.get(module, ()):
+            source_module = _module_name(source_path)
+            if source_module not in impacted:
+                impacted.add(source_module)
+                queue.append(source_module)
+    return impacted, parse_failures
+
+
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
     classifier = load_classifier()
@@ -182,34 +261,16 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
             continue
         if suffix == ".py" and not path.startswith("tests/"):
             stem = candidate.stem.removeprefix("test_")
-            impacted_modules = {_module_name(path)}
-            source_paths = discover_python_sources()
-            changed = True
-            while changed:
-                changed = False
-                for source_path in source_paths:
-                    source_module = _module_name(source_path)
-                    if source_module in impacted_modules:
-                        continue
-                    try:
-                        if any(
-                            _imports_module(source_path, module)
-                            for module in impacted_modules
-                        ):
-                            impacted_modules.add(source_module)
-                            changed = True
-                    except (OSError, SyntaxError, UnicodeError):
-                        unknown_executable = True
+            impacted_modules, parse_failures = _impacted_closure(_module_name(path))
+            if any(_module_name(source) not in impacted_modules for source in parse_failures):
+                unknown_executable = True
             matches: list[str] = []
             for test in all_tests:
                 if Path(test).stem == f"test_{stem}":
                     matches.append(test)
                     continue
                 try:
-                    if any(
-                        _imports_module(test, module)
-                        for module in impacted_modules
-                    ):
+                    if _reference_prefixes(test) & impacted_modules:
                         matches.append(test)
                 except (OSError, SyntaxError, UnicodeError):
                     unknown_executable = True
@@ -288,6 +349,17 @@ def plan(args: argparse.Namespace) -> int:
     if unknown:
         run_full, reason = True, "unknown_executable_fails_closed"
     tests = discover_tests() if run_full else selected
+    # The matrix travels colon-joined; a path containing ':' would split into
+    # decoy paths and the real file would never run.
+    ambiguous = sorted(
+        path for path in tests if ":" in path or any(ord(char) < 32 for char in path)
+    )
+    if ambiguous:
+        raise ValueError(f"test paths cannot contain ':' or control characters: {ambiguous}")
+    # Full proof means every unit slice plus e2e; an empty unit set would let
+    # e2e alone satisfy it.
+    if run_full and not tests:
+        raise ValueError("full proof selected zero unit test files")
     matrix = slice_matrix(tests)
     review_key = "R4-R5" if classification.risk_class in {"R4", "R5"} else "R3" if classification.risk_class == "R3" else "R0-R2"
     result = {

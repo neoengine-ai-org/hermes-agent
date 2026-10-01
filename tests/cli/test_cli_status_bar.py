@@ -396,16 +396,21 @@ class TestCLIStatusBar:
 
         assert cli_obj._spinner_widget_height(width=64) == 2
 
-    def test_spinner_elapsed_format_is_fixed_width_to_reduce_wrap_jitter(self):
+    def test_spinner_elapsed_format_is_fixed_width_to_reduce_wrap_jitter(self, monkeypatch):
         cli_obj = _make_cli()
         cli_obj._spinner_text = "running tool"
+        # Pin the monotonic clock: on a freshly booted CI VM time.monotonic()
+        # can be below 65s, making the start time negative, which the renderer
+        # (correctly) treats as "no start time" and omits the elapsed segment.
+        now = 10_000.0
+        monkeypatch.setattr(time, "monotonic", lambda: now)
 
         # <60s path
-        cli_obj._tool_start_time = time.monotonic() - 9.2
+        cli_obj._tool_start_time = now - 9.2
         short = cli_obj._render_spinner_text()
 
         # >=60s path
-        cli_obj._tool_start_time = time.monotonic() - 65.2
+        cli_obj._tool_start_time = now - 65.2
         long = cli_obj._render_spinner_text()
 
         short_elapsed = short.split("(", 1)[1].rstrip(")")

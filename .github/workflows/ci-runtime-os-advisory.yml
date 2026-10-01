@@ -2,6 +2,9 @@ name: CI Runtime OS advisory
 
 on:
   pull_request_target:
+    # Only PRs into the protected default branch: base.sha is the trusted
+    # code this workflow checks out and runs, so it must be protected history.
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, labeled, unlabeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
@@ -28,9 +31,12 @@ env:
 jobs:
   preflight:
     name: Dependency-free policy preflight
+    # pull_request_review cannot be branch-filtered, so PR events also require
+    # a same-repository head and the protected default branch as base.
     if: >-
       !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch)
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 10
     outputs:
@@ -40,6 +46,7 @@ jobs:
       review_classification: ${{ steps.plan.outputs.review_classification }}
       run_e2e: ${{ steps.plan.outputs.run_e2e }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
+      candidate_definition_changed: ${{ steps.definition.outputs.candidate_definition_changed }}
       telemetry_write_allowed: ${{ steps.plan.outputs.telemetry_write_allowed }}
       environment_digest: ${{ steps.environment.outputs.environment_digest }}
       duration_cache_key: ${{ steps.environment.outputs.duration_cache_key }}
@@ -47,6 +54,9 @@ jobs:
       - name: Reject untrusted fork execution
         if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
         run: exit 1
+
+      - name: Discard residue from earlier jobs on this shared runner
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
       - name: Checkout trusted base policy
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -56,16 +66,51 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
           path: .runtime-os-trusted
 
-      - name: Checkout same-repository candidate
+      # Under pull_request_target this workflow runs base code only: PR-head
+      # code is never checked out or executed here. The head is read as inert
+      # objects for change selection; PR-head execution lives in the
+      # unprivileged ci-runtime-os-candidate.yml (`pull_request` context).
+      - name: Checkout trusted non-PR candidate
+        if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           path: candidate
+
+      - name: Fetch pull request head as inert git objects
+        if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          git -C .runtime-os-trusted fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"
+          git -C .runtime-os-trusted cat-file -e "${HEAD_SHA}^{commit}"
+
+      - name: Detect candidate-definition changes in the PR's own commits
+        id: definition
+        if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # The candidate run executes its workflow definition from the PR
+          # merge ref; it is only base-defined while the PR's own commits leave
+          # it alone. With several merge bases (criss-cross history) a
+          # three-dot diff picks one arbitrarily, so fail closed instead.
+          bases="$(git -C .runtime-os-trusted merge-base --all "$BASE_SHA" "$HEAD_SHA" | wc -l)"
+          git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
+          if [ "$bases" -ne 1 ] || grep -qxzF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
+            echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "candidate_definition_changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Compute immutable environment and duration identities
         id: environment
+        if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) }}
         run: |
           set -euo pipefail
           dependency_digest="$(sha256sum candidate/uv.lock | cut -d' ' -f1)"
@@ -84,6 +129,7 @@ jobs:
           echo "duration_cache_key=runtime-os-duration-${test_manifest_digest}-${dependency_digest}" >> "$GITHUB_OUTPUT"
 
       - name: Read protected-main duration telemetry
+        if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) }}
         uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: test_durations.json
@@ -101,28 +147,37 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number || 'unknown' }}
           REPOSITORY: ${{ github.repository }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-          RUNTIME_OS_CANDIDATE_ROOT: ${{ github.workspace }}/candidate
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
           RUNTIME_OS_DURATIONS_PATH: ${{ github.workspace }}/test_durations.json
         run: |
           set -euo pipefail
           test "$RUNTIME_OS_POLICY_VERSION" = "2.1.0"
           test "$RUNTIME_OS_SOURCE_COMMIT" = "871e416afc55db187d2b6f29c9ff7cac96472223"
-          if [ "$EVENT_NAME" = pull_request ] && [ -n "${BASE_SHA:-}" ]; then
-            git -C candidate fetch --no-tags origin "$BASE_SHA"
-          elif [ "$EVENT_NAME" != pull_request ]; then
-            git -C candidate ls-files > changed-files.txt
+          if [ "$EVENT_NAME" = pull_request ]; then
+            # Change selection only: the PR head is diffed as inert objects inside
+            # the trusted checkout and is never materialized as a worktree. The
+            # slice matrix computed here is informational for PR events; the
+            # executed matrix comes from the unprivileged candidate workflow.
+            export RUNTIME_OS_CANDIDATE_ROOT="$GITHUB_WORKSPACE/.runtime-os-trusted"
+            if [ -z "${BASE_SHA:-}" ] || [ -z "${HEAD_SHA:-}" ] \
+              || ! git -C .runtime-os-trusted cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
+              || ! git -C .runtime-os-trusted cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+              echo "::error::base or head commit unavailable; refusing ambiguous change selection"
+              exit 2
+            fi
+            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+          else
+            export RUNTIME_OS_CANDIDATE_ROOT="$GITHUB_WORKSPACE/candidate"
+            git -C candidate ls-files -z > changed-files.txt
           fi
-          if [ "$EVENT_NAME" = pull_request ] \
-            && [ -n "${BASE_SHA:-}" ] \
-            && git -C candidate cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-            git -C candidate diff --name-only "$BASE_SHA" HEAD > changed-files.txt
-          elif [ "$EVENT_NAME" = pull_request ]; then
-            echo "::error::base commit unavailable; refusing ambiguous change selection"
-            exit 2
-          fi
-          python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
+          # NUL-separated (-z): paths are never C-quoted, so odd names classify.
+          python3 -c 'import json; print(json.dumps([p for p in open("changed-files.txt", encoding="utf-8", newline="").read().split("\0") if p]))' > changed-files.json
           printf '%s' "$PR_BODY" > pr-body.md
-          python3 .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
+          # -I: isolated mode drops the script directory from sys.path, so a
+          # new module beside the pinned script cannot shadow a stdlib import.
+          # pycache_prefix: bytecode is read only from a fresh per-job directory,
+          # never from a committed __pycache__ beside the pinned sources.
+          python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
             --changed-files-json "$(cat changed-files.json)" \
             --event-name "$EVENT_NAME" \
             --ref "$EVENT_REF" \
@@ -134,7 +189,9 @@ jobs:
   environment:
     name: Build immutable ci-fast environment once
     needs: preflight
-    if: needs.preflight.outputs.has_tests == 'true' || needs.preflight.outputs.run_e2e == 'true'
+    if: >-
+      !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) &&
+      (needs.preflight.outputs.has_tests == 'true' || needs.preflight.outputs.run_e2e == 'true')
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 15
     steps:
@@ -142,7 +199,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          ref: ${{ github.event.merge_group.head_sha || github.sha }}
 
       - name: Install pinned uv once
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
@@ -197,7 +254,7 @@ jobs:
   test:
     name: Runtime OS slice ${{ matrix.index }}/6
     needs: [preflight, environment]
-    if: needs.preflight.outputs.has_tests == 'true'
+    if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) && needs.preflight.outputs.has_tests == 'true' }}
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 30
     strategy:
@@ -208,7 +265,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          ref: ${{ github.event.merge_group.head_sha || github.sha }}
 
       - name: Download immutable ci-fast environment
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -228,9 +285,26 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
         run: |
+          # The restored environment must leave the checkout clean (same query
+          # as the receipt validator), checked before this job imports any test
+          # code. /usr/bin/git, not PATH: ci-fast/bin is prepended to PATH.
+          # (The environment build already ran the candidate's build backend,
+          # and .gitignore is candidate content; see docs.)
+          dirty="$(/usr/bin/git status --porcelain=v1 --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf 'DIRTY_CHECKOUT after environment restore:\n%s\n' "$dirty" >&2
+            exit 1
+          fi
           source .venv/bin/activate
           python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
-          scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"
+          # Same per-file runner and environment contract as tests.yml's
+          # required slices (prebuilt .venv with all+dev extras). run_tests.sh
+          # is the Stage-0 bootstrap-proof wrapper: it rebuilds an
+          # unfingerprinted .venv from uv.lock without dev extras.
+          IFS=: read -r -a selected <<< "$SELECTED_FILES"
+          # Hermetic locale/hash settings the V1 wrapper also pinned.
+          env TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONHASHSEED=0 \
+            python scripts/run_tests_parallel.py -j 4 "${selected[@]}"
 
       - name: Upload protected-main duration sample
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -252,6 +326,9 @@ jobs:
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 5
     steps:
+      - name: Discard workspace residue before merging samples
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+
       - name: Download exact-run duration samples
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -281,14 +358,14 @@ jobs:
   e2e:
     name: Runtime OS e2e
     needs: [preflight, environment]
-    if: needs.preflight.outputs.run_e2e == 'true'
+    if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) && needs.preflight.outputs.run_e2e == 'true' }}
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
+          ref: ${{ github.event.merge_group.head_sha || github.sha }}
       - name: Download immutable ci-fast environment
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -305,37 +382,181 @@ jobs:
           NOUS_API_KEY: ""
         run: |
           source .venv/bin/activate
-          python -m pytest -m integration tests/test_wheel_locales_e2e.py -v
-          python -m pytest tests/integration/ -v --tb=short
           python -m pytest tests/e2e/ -v --tb=short
+
+  candidate-proof:
+    name: Await unprivileged candidate proof
+    needs: preflight
+    if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
+    # GitHub-hosted so it never holds a self-hosted runner. It still holds one
+    # hosted job slot while it polls; many concurrent PRs can therefore queue
+    # behind each other's waiters on the hosted concurrency limit.
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    permissions:
+      actions: read
+    steps:
+      - name: Bind exact-head candidate workflow conclusion
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_PR: ${{ github.event.pull_request.number }}
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
+          DEFINITION_CHANGED: ${{ needs.preflight.outputs.candidate_definition_changed }}
+          CANDIDATE_WORKFLOW: ci-runtime-os-candidate.yml
+          DISCOVERY_MINUTES: "20"
+          WAIT_MINUTES: "150"
+        with:
+          retries: 3
+          script: |
+            if (process.env.DEFINITION_CHANGED !== 'false') {
+              core.setFailed(
+                'This PR changes ci-runtime-os-candidate.yml, so its candidate proof would be ' +
+                  'self-defined; the advisory proof stays red until the definition lands on base',
+              );
+              return;
+            }
+            const head = process.env.EXPECTED_HEAD;
+            const prNumber = Number(process.env.EXPECTED_PR);
+            const expectedTitle = `Runtime OS candidate ${head} on ${process.env.EXPECTED_BASE}`;
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            const started = Date.now();
+            const discoveryDeadline = started + Number(process.env.DISCOVERY_MINUTES) * 60 * 1000;
+            const deadline = started + Number(process.env.WAIT_MINUTES) * 60 * 1000;
+            const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            // Back off from 30s to 5min between polls; a rate-limited or
+            // transient API failure waits and retries instead of failing.
+            let delay = 30 * 1000;
+            while (true) {
+              let runs;
+              try {
+                runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: process.env.CANDIDATE_WORKFLOW,
+                  event: 'pull_request',
+                  head_sha: head,
+                  per_page: 100,
+                });
+              } catch (error) {
+                // Only rate limits, server errors, and network failures are
+                // transient; any other client error fails fast.
+                const status = Number(error.status || 0);
+                const headers = (error.response && error.response.headers) || {};
+                const rateLimited =
+                  status === 429 ||
+                  (status === 403 &&
+                    (String(headers['x-ratelimit-remaining']) === '0' ||
+                      headers['retry-after'] !== undefined ||
+                      /rate limit/i.test(String(error.message))));
+                if (status >= 400 && status < 500 && !rateLimited) {
+                  core.setFailed(`Candidate proof lookup failed with HTTP ${status}: ${error.message}`);
+                  return;
+                }
+                if (Date.now() > deadline) {
+                  core.setFailed(`Candidate proof lookup kept failing: ${error.message}`);
+                  return;
+                }
+                core.info(`Candidate proof lookup failed (${error.status || error.message}); retrying`);
+                await sleep(delay);
+                delay = Math.min(delay * 2, 5 * 60 * 1000);
+                continue;
+              }
+              const bound = runs.filter(
+                (run) =>
+                  run.head_sha === head &&
+                  run.display_title === expectedTitle &&
+                  run.event === 'pull_request' &&
+                  run.head_repository &&
+                  run.head_repository.full_name === repository &&
+                  // Exactly this PR: a run shared with another PR could carry
+                  // that PR's (possibly modified) candidate definition.
+                  (run.pull_requests || []).length === 1 &&
+                  run.pull_requests[0].number === prNumber,
+              );
+              const latest = bound.sort((a, b) => b.id - a.id)[0];
+              const now = Date.now();
+              // A superseded run is cancelled before its replacement is listed.
+              const settling =
+                latest && latest.conclusion === 'cancelled' && now <= discoveryDeadline;
+              if (latest && latest.status === 'completed' && !settling) {
+                if (latest.conclusion === 'success') {
+                  core.info(`Candidate proof ${latest.html_url} attempt ${latest.run_attempt} succeeded for ${head}`);
+                  return;
+                }
+                core.setFailed(
+                  `Candidate proof ${latest.html_url} concluded ${latest.conclusion} for ${head}; ` +
+                    're-run it, then re-run this workflow',
+                );
+                return;
+              }
+              if (!latest && now > discoveryDeadline) {
+                core.setFailed(
+                  `No candidate proof run bound to PR #${prNumber} at ${head} on base ` +
+                    `${process.env.EXPECTED_BASE}. Likely causes: the base advanced or was ` +
+                    'retargeted since the last push, the head is shared with another open PR, ' +
+                    'or the PR predates the candidate workflow. Push, update the branch, or reopen.',
+                );
+                return;
+              }
+              if (now > deadline) {
+                core.setFailed(`Candidate proof for ${head} did not complete in time`);
+                return;
+              }
+              await sleep(delay);
+              delay = Math.min(delay * 2, 5 * 60 * 1000);
+            }
 
   hermes-required:
     name: Hermes CI required
     if: always()
-    needs: [preflight, environment, test, e2e]
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    needs: [preflight, environment, test, e2e, candidate-proof]
+    # GitHub-hosted: always() runs even for fork PRs (preflight skipped),
+    # so this must never land on the shared self-hosted pool; it still
+    # fails closed because preflight did not succeed.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Aggregate immutable policy proof
         env:
+          PULL_REQUEST_EVENT: ${{ contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) }}
           PREFLIGHT: ${{ needs.preflight.result }}
           ENVIRONMENT: ${{ needs.environment.result }}
           TESTS: ${{ needs.test.result }}
           E2E: ${{ needs.e2e.result }}
+          CANDIDATE: ${{ needs.candidate-proof.result }}
         run: |
+          set -euo pipefail
           test "$PREFLIGHT" = success
-          test "$ENVIRONMENT" = success -o "$ENVIRONMENT" = skipped
-          test "$TESTS" = success -o "$TESTS" = skipped
-          test "$E2E" = success -o "$E2E" = skipped
+          if [ "$PULL_REQUEST_EVENT" = true ]; then
+            test "$CANDIDATE" = success
+            test "$ENVIRONMENT" = skipped
+            test "$TESTS" = skipped
+            test "$E2E" = skipped
+          else
+            test "$CANDIDATE" = skipped
+            test "$ENVIRONMENT" = success -o "$ENVIRONMENT" = skipped
+            test "$TESTS" = success -o "$TESTS" = skipped
+            test "$E2E" = success -o "$E2E" = skipped
+          fi
 
   review-evidence:
     name: Review evidence required
     if: always()
     needs: [preflight, hermes-required]
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    # GitHub-hosted: always() runs even for fork PRs (preflight skipped),
+    # so this must never land on the shared self-hosted pool; it still
+    # fails closed because preflight did not succeed.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      - name: Discard workspace residue before trusted checkout
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+
       - name: Checkout trusted review validator
+        # Only after preflight admitted this event: preflight is skipped for
+        # forks and non-default bases, so base.sha is never checked out there.
+        if: needs.preflight.result == 'success'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
@@ -462,7 +683,7 @@ jobs:
             *) exit 1 ;;
           esac
           printf '%s' "$REVIEW_CLASSIFICATION" > review-classification.json
-          python3 trusted/scripts/review_receipt_validator.py \
+          python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" trusted/scripts/review_receipt_validator.py \
             --classification review-classification.json \
             --pr-body authenticated-reviews.md \
             --head-sha "$HEAD_SHA" \
@@ -475,7 +696,10 @@ jobs:
     name: Merge admission
     if: always()
     needs: [hermes-required, review-evidence]
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    # GitHub-hosted: always() runs even for fork PRs (preflight skipped),
+    # so this must never land on the shared self-hosted pool; it still
+    # fails closed because preflight did not succeed.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Verify live exact-head admission state

@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "description": "Reviewed sha256 of every pull_request_target workflow file, every local reusable workflow / composite action (with its directory) it reaches, and the scripts the Runtime OS advisory executes from trusted checkouts. Re-pin a file only after reviewing the whole file for PR-head materialization and privilege escalation. A tripwire for review, not an authority boundary.",
+  "files": {
+    ".github/workflows/auto-arm-auto-merge.yml": "397e1554eed3a7190654df3a50f11c385842e1d690317430b70c6e48b8ff3443",
+    ".github/workflows/ci-runtime-os-advisory.yml": "857e928b1f4036c0685a41a5a93cf4e77e3cdef9fa569eb6d5f4260460dfd706",
+    "scripts/ci/runtime_os_adapter.py": "924b180fca2b0c63186124048de650c07bc5d4e39618adf9d9d22b3f0e021d46",
+    "scripts/ci_risk_classifier.py": "6104b46b1b7d470ab8d8bd21070e6c48ce3745670243419735ead1b877c22ad6",
+    "scripts/ci_risk_classifier_core.py": "7c1cbf9544ff9365a7fbf62ae7475a87d64a1a39be64062e5c0f1a2b252691ff",
+    "scripts/review_receipt_validator.py": "9e9786705b5be06b9eb7e177e8c51fe075f4ec2634cd482838ec3d3d46dc1c2b",
+    "tests/ci/test_pull_request_target_safety.py": "fa488a6723a2c2de1d1ed683deb92398f4de129d832be65afee462d373475b51"
+  }
+}
