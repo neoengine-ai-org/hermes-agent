@@ -104,12 +104,28 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
+def _walk_py_files(start: Path, prune) -> list[Path]:
+    """``*.py`` files under ``start``, never descending into pruned dirs.
+
+    os.walk instead of Path.rglob: parallel test processes create and delete
+    ``__pycache__`` directories while this runs, and rglob raises
+    FileNotFoundError on a directory that vanishes mid-walk; os.walk skips it.
+    """
+    found: list[Path] = []
+    for dirpath, dirnames, filenames in os.walk(start):
+        relative = Path(dirpath).relative_to(CANDIDATE_ROOT).parts
+        dirnames[:] = [name for name in dirnames if not prune(relative + (name,))]
+        found.extend(Path(dirpath) / name for name in filenames if name.endswith(".py"))
+    return [path for path in found if path.is_file()]
+
+
 def discover_tests() -> list[str]:
     skip_parts = {"integration", "e2e", "docker"}
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in (CANDIDATE_ROOT / "tests").rglob("test_*.py")
-        if path.is_file() and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
+        for path in _walk_py_files(CANDIDATE_ROOT / "tests", lambda parts: parts[-1] in skip_parts)
+        if path.name.startswith("test_")
+        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
     )
 
 
@@ -119,12 +135,15 @@ def discover_python_sources() -> list[str]:
     # source: the bootstrap proof venv and the restored CI environment (which
     # carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
     generated_roots = {".bootstrap-proof-venv", "ci-fast"}
-    sources = []
-    for path in CANDIDATE_ROOT.rglob("*.py"):
-        parts = path.relative_to(CANDIDATE_ROOT).parts
-        if path.is_file() and not (set(parts) & excluded) and parts[0] not in generated_roots:
-            sources.append(str(path.relative_to(CANDIDATE_ROOT)))
-    return sorted(sources)
+
+    def prune(parts: tuple[str, ...]) -> bool:
+        return parts[-1] in excluded or (len(parts) == 1 and parts[0] in generated_roots)
+
+    return sorted(
+        str(path.relative_to(CANDIDATE_ROOT))
+        for path in _walk_py_files(CANDIDATE_ROOT, prune)
+        if not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
+    )
 
 
 def _module_name(path: str) -> str:

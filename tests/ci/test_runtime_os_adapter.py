@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -287,3 +288,22 @@ def test_indexed_closure_matches_pairwise_fixpoint(monkeypatch, tmp_path) -> Non
     assert adapter._impacted_closure("pkg.a")[0] == {"pkg.a", "pkg.b", "pkg.c", "pkg.d", "other.z"}
     adapter._module_references.cache_clear()
     adapter._reference_prefixes.cache_clear()
+
+
+def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_path) -> None:
+    # Parallel test processes create and delete tests/__pycache__ while the
+    # adapter walks the tree; a vanished directory must be skipped, not raise.
+    for relative in ("tests/test_kept.py", "tests/__pycache__/x.pyc", "pkg/mod.py", "pkg/__pycache__/y.pyc"):
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text("", encoding="utf-8")
+    real_scandir = os.scandir
+
+    def vanishing_scandir(path="."):
+        if Path(path).name == "__pycache__":
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    monkeypatch.setattr(os, "scandir", vanishing_scandir)
+    assert adapter.discover_tests() == ["tests/test_kept.py"]
+    assert adapter.discover_python_sources() == ["pkg/mod.py"]
