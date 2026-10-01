@@ -163,7 +163,9 @@ jobs:
           printf '%s' "$PR_BODY" > pr-body.md
           # -I: isolated mode drops the script directory from sys.path, so a
           # new module beside the pinned script cannot shadow a stdlib import.
-          python3 -I .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
+          # pycache_prefix: bytecode is read only from a fresh per-job directory,
+          # never from a committed __pycache__ beside the pinned sources.
+          python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" .runtime-os-trusted/scripts/ci/runtime_os_adapter.py \
             --changed-files-json "$(cat changed-files.json)" \
             --event-name "$EVENT_NAME" \
             --ref "$EVENT_REF" \
@@ -666,7 +668,7 @@ jobs:
             *) exit 1 ;;
           esac
           printf '%s' "$REVIEW_CLASSIFICATION" > review-classification.json
-          python3 -I trusted/scripts/review_receipt_validator.py \
+          python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" trusted/scripts/review_receipt_validator.py \
             --classification review-classification.json \
             --pr-body authenticated-reviews.md \
             --head-sha "$HEAD_SHA" \

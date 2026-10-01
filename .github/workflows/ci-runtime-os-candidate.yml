@@ -109,7 +109,7 @@ jobs:
           git -C candidate diff --no-renames --name-only "$BASE_SHA" HEAD > changed-files.txt
           python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
           printf '%s' "$PR_BODY" > pr-body.md
-          python3 -I .runtime-os-base/scripts/ci/runtime_os_adapter.py \
+          python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" .runtime-os-base/scripts/ci/runtime_os_adapter.py \
             --changed-files-json "$(cat changed-files.json)" \
             --event-name pull_request \
             --ref "$EVENT_REF" \

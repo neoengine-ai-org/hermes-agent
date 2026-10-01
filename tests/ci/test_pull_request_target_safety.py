@@ -117,7 +117,8 @@ CHECKSUM_LINE = re.compile(
 # Python puts its directory first on sys.path and a new sibling module could
 # shadow a stdlib import without changing any pinned file.
 TRUSTED_SCRIPT_RUN = re.compile(
-    r"(?<![\w./-])python3?(?P<flags>(?:\s+-\w+)*)\s+(?P<script>(?:\.runtime-os-[\w-]+|trusted)/\S+\.py)\b"
+    r"(?<![\w.-])(?:\S*/)?python[\d.]*(?P<flags>(?:\s+-X\s+\S+|\s+-\w+)*)\s+[\"']?(?:\./)?"
+    r"(?P<script>(?:\.runtime-os-[\w-]+|trusted)/[^\s\"']+\.py)"
 )
 # Scripts the privileged jobs execute from trusted checkouts; pinned too.
 PRIVILEGED_SCRIPTS = (
@@ -434,19 +435,34 @@ def _job_violations(
 
     expand(where, steps)
     tainted = job_tainted | _tainted_env(*(step for _, step in expanded))
-    event_env = set()
+    env_values: dict[str, str] = {}
     for scope in (workflow, job, *(step for _, step in expanded)):
         for name, value in (
             (scope.get("env") or {}) if isinstance(scope, dict) else {}
         ).items():
-            normalized = _normalize(value)
-            fields = EVENT_EXPRESSION.findall(normalized)
-            if re.search(r"\bgithub\.event\b(?!\.)", normalized) or any(
-                field not in INPUT_EVENT_FIELDS
-                and not field.startswith(INPUT_EVENT_PREFIXES)
-                for field in fields
+            env_values[str(name)] = (
+                env_values.get(str(name), "") + " " + _normalize(value)
+            )
+    event_env = set()
+    for name, normalized in env_values.items():
+        fields = EVENT_EXPRESSION.findall(normalized)
+        if re.search(r"\bgithub\.event\b(?!\.)", normalized) or any(
+            field not in INPUT_EVENT_FIELDS
+            and not field.startswith(INPUT_EVENT_PREFIXES)
+            for field in fields
+        ):
+            event_env.add(name)
+    # Taint flows through env-to-env indirection to a fixpoint.
+    grew = True
+    while grew:
+        grew = False
+        for name, normalized in env_values.items():
+            if name not in event_env and any(
+                re.search(rf"\benv\.{re.escape(other)}\b", normalized)
+                for other in event_env
             ):
-                event_env.add(str(name))
+                event_env.add(name)
+                grew = True
     for scope in (workflow, job, *(step for _, step in expanded)):
         for name, value in (
             (scope.get("env") or {}) if isinstance(scope, dict) else {}
@@ -561,8 +577,13 @@ def _job_violations(
         if URL_INSTALL.search(script):
             violations.append(f"{label} installs packages from a URL")
         for match in TRUSTED_SCRIPT_RUN.finditer(script):
-            if "-I" not in match["flags"].split():
+            flags = match["flags"].split()
+            if "-I" not in flags:
                 violations.append(f"{label} runs {match['script']} without python -I")
+            if not any(flag.startswith("pycache_prefix=") for flag in flags):
+                violations.append(
+                    f"{label} runs {match['script']} without -X pycache_prefix"
+                )
         if FOREIGN_DOWNLOAD.search(script):
             violations.append(
                 f"{label} downloads artifacts or repositories from outside this run"
@@ -699,6 +720,27 @@ def test_no_pull_request_target_workflow_checks_out_pull_request_head() -> None:
     assert sorted(KNOWN_VIOLATIONS - set(violations)) == [], (
         "stale KNOWN_VIOLATIONS entry"
     )
+
+
+def test_no_bytecode_is_tracked() -> None:
+    """A committed (unchecked-hash) .pyc beside a pinned script would run in
+    place of its pinned source when loaded via spec_from_file_location."""
+    import subprocess
+
+    tracked = (
+        subprocess
+        .run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"], capture_output=True, check=True
+        )
+        .stdout.decode("utf-8", "surrogateescape")
+        .split("\0")
+    )
+    bytecode = [
+        path
+        for path in tracked
+        if path.endswith((".pyc", ".pyo")) or "__pycache__/" in path
+    ]
+    assert bytecode == []
 
 
 def test_every_privileged_workflow_file_is_reviewed_and_pinned() -> None:
@@ -1597,7 +1639,107 @@ def test_isolated_mode_blocks_sibling_stdlib_shadowing(
     workflow_text = (WORKFLOWS / "ci-runtime-os-advisory.yml").read_text(
         encoding="utf-8"
     )
+    prefix = ".runtime-os-trusted/" if "ci/" in entrypoint else "trusted/"
     assert (
-        f"python3 -I {'.runtime-os-trusted/' if 'ci/' in entrypoint else 'trusted/'}{entrypoint}"
+        f'python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" {prefix}{entrypoint}'
         in workflow_text
     )
+
+
+def test_pycache_prefix_ignores_committed_bytecode(tmp_path: Path) -> None:
+    """Behavioural: an unchecked-hash .pyc committed beside the spec-loaded
+    classifier core runs in place of the pinned source under plain -I
+    (negative control) but is ignored with -X pycache_prefix=<fresh dir>."""
+    import importlib.util
+    import os
+    import py_compile
+    import shutil
+    import subprocess
+    import sys
+
+    for relative in PRIVILEGED_SCRIPTS:
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, tmp_path / relative)
+    shutil.copytree(ROOT / "ci/runtime-os", tmp_path / "ci/runtime-os")
+    evil = tmp_path / "evil_core.py"
+    evil.write_text("raise SystemExit('PWNED_VIA_PYC')\n", encoding="utf-8")
+    core = tmp_path / "scripts/ci_risk_classifier_core.py"
+    py_compile.compile(
+        str(evil),
+        cfile=importlib.util.cache_from_source(str(core)),
+        dfile=str(core),
+        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH,
+    )
+    body = tmp_path / "body.md"
+    body.write_text("", encoding="utf-8")
+    argv = [
+        "scripts/ci/runtime_os_adapter.py",
+        "--changed-files-json",
+        '["docs/x.md"]',
+        "--event-name",
+        "pull_request",
+        "--body-file",
+        str(body),
+    ]
+    env = {key: value for key, value in os.environ.items() if key != "GITHUB_OUTPUT"}
+    plain = subprocess.run(
+        [sys.executable, "-I", *argv],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "PWNED_VIA_PYC" in plain.stderr  # negative control: the bypass is real
+    prefixed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            f"pycache_prefix={tmp_path / 'fresh-pycache'}",
+            *argv,
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "PWNED_VIA_PYC" not in prefixed.stderr + prefixed.stdout, prefixed.stderr
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        "/usr/bin/python3 -I trusted/scripts/review_receipt_validator.py",
+        "python3.11 -I trusted/scripts/review_receipt_validator.py",
+        "python3 -X utf8 trusted/scripts/review_receipt_validator.py",
+        'python3 ".runtime-os-trusted/scripts/ci/runtime_os_adapter.py"',
+        "python3 ./trusted/scripts/review_receipt_validator.py",
+    ],
+)
+def test_isolation_rule_sees_alternate_invocations(run: str) -> None:
+    violations = pull_request_target_violations(
+        _prt([{"run": run}]), "synthetic", root=None
+    )
+    assert any(
+        "without python -I" in v or "without -X pycache_prefix" in v for v in violations
+    ), violations
+
+
+def test_env_taint_is_transitive_into_action_inputs() -> None:
+    workflow = {
+        True: {"pull_request_target": {"branches": ["main"]}},
+        "env": {"PR_PATH": "${{ github.event.pull_request.body }}"},
+        "jobs": {
+            "j": {
+                "env": {"INDIRECT_PATH": "${{ env.PR_PATH }}"},
+                "steps": [
+                    {
+                        "uses": "actions/upload-artifact@" + "0" * 40,
+                        "with": {"name": "x", "path": "${{ env.INDIRECT_PATH }}"},
+                    }
+                ],
+            }
+        },
+    }
+    violations = pull_request_target_violations(workflow, "synthetic", root=None)
+    assert any("event-derived env.INDIRECT_PATH" in v for v in violations), violations
