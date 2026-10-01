@@ -228,3 +228,10 @@ def test_colon_in_selected_test_path_fails_closed(monkeypatch, tmp_path) -> None
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     with pytest.raises(ValueError, match="cannot contain ':'"):
         adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+def test_newline_in_selected_test_path_fails_closed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "discover_tests", lambda: ["tests/test_a.py\ntests/test_b.py"])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="control characters"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))

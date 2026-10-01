@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "description": "Reviewed run/shell/github-script bodies reachable from pull_request_target workflows. Pin a body only after reviewing it for PR-head materialization; keys are sha256 of the exact body text, values say where it lives.",
+  "bodies": {
+    "665860725cfaf38638b630065cc8d7dbc139df306e7a23c3a77c3a7d1dfa8579": "auto-arm-auto-merge.yml:arm-auto-merge:step[1] Enable native GitHub auto-merge [run]",
+    "455794018408517a62051458b1eb8b297643591d31194d775916b4a0b7ec3893": "ci-runtime-os-advisory.yml:candidate-proof:step[0] Bind exact-head candidate workflow conclusion [script]",
+    "f1459b0d25c52fdee18ebf7c0dbef9d867f1a253106a2e4618b76472eee16a21": "ci-runtime-os-advisory.yml:duration-telemetry:step[1] Merge duration samples deterministically [run]",
+    "3e511375a9aac8db53d82438e11336ed54aaad90ea607fbf72b78d49ea8fe038": "ci-runtime-os-advisory.yml:e2e:step[3] Run full e2e proof [run]",
+    "5479d13db29a107f7aa8ef96ec145599f2e92c35f5090f1531ba329d108a3e99": "ci-runtime-os-advisory.yml:environment:step[2] Install pinned ripgrep once [run]",
+    "6e736a92a0c72c1987a7da3dad755744a5d4328b9cc7ff8b7702134b096b7bb1": "ci-runtime-os-advisory.yml:environment:step[3] Build locked environment with one infra-only retry [run]",
+    "6fd94c734596923bc3d34d432c1f91f5ded64c754a5229cff87f80660aa3d5eb": "ci-runtime-os-advisory.yml:hermes-required:step[0] Aggregate immutable policy proof [run]",
+    "5871bf90126fa9be099f3a916617a6badbd012046abaab23a38b3600a74e68ad": "ci-runtime-os-advisory.yml:merge-admission:step[0] Verify live exact-head admission state [script]",
+    "ccf61b81448223e04cacf2d0aaf0a53af69e3a58ad9f8aff27950708687543b8": "ci-runtime-os-advisory.yml:merge-admission:step[1] Evaluate advisory admission without mutation [run]",
+    "1a21be8bb1dc4721d30cc1850ead617faa55ae9aebf416da4369668bdeaf0824": "ci-runtime-os-advisory.yml:preflight:step[0] Reject untrusted fork execution [run]",
+    "b99103d47dccab0b394fa3c9f13f2fe8d5217f0b5d4204bba261ae2e483da70e": "ci-runtime-os-advisory.yml:preflight:step[1] Discard residue from earlier jobs on this shared runner [run]",
+    "21cd9897f7c748852c7ca8a53356f19cff29391a759199c9d03359de63bb6122": "ci-runtime-os-advisory.yml:preflight:step[4] Fetch pull request head as inert git objects [run]",
+    "fc49aa729ea58d87cbfaa2e097977199c0831b0b1703af2ed59e44062590c55f": "ci-runtime-os-advisory.yml:preflight:step[5] Compute immutable environment and duration identities [run]",
+    "0c75a48602c19307c684ae4e851375cdc3c868ec30eab8c95b5302a07be1f96a": "ci-runtime-os-advisory.yml:preflight:step[7] Verify immutable policy and select proof [run]",
+    "43aeb86c956a20eb8285e870a6a7e708cbd3277bed989e17216f84dc0d78057f": "ci-runtime-os-advisory.yml:review-evidence:step[2] Collect authenticated exact-head GitHub reviews [script]",
+    "85db8dd8c41e90f5f7592956286da16b93176c0a7cdfd818f07f8775c8c78f34": "ci-runtime-os-advisory.yml:review-evidence:step[3] Validate every merge-group constituent review [script]",
+    "6c97921721b22559587e8ff157ac93cab0b91874eb969e3ef4f653a9768746bb": "ci-runtime-os-advisory.yml:review-evidence:step[4] Validate head-bound canonical receipt [run]",
+    "fb4f34475b9ab07b8467688ea1752c92c9a673c82518bb82b4b93a0c6703d532": "ci-runtime-os-advisory.yml:test:step[2] Restore immutable environment [run]",
+    "f1a239f258059b66c5b7cd4a00f06deb6494769a9f8c71d43e58e328e1f1bf27": "ci-runtime-os-advisory.yml:test:step[3] Run selected files with interpreter isolation [run]"
+  }
+}

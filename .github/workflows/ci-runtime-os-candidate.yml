@@ -16,6 +16,8 @@ run-name: Runtime OS candidate ${{ github.event.pull_request.head.sha }} on ${{ 
 
 on:
   pull_request:
+    # The advisory only binds proof for PRs into the protected default branch.
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
@@ -220,9 +222,11 @@ jobs:
           NOUS_API_KEY: ""
         run: |
           # The restored environment must leave the checkout clean (same query
-          # as the receipt validator). Checked before anything imports or
-          # runs candidate code, so candidate code cannot mask residue.
-          dirty="$(git status --porcelain=v1 --untracked-files=all)"
+          # as the receipt validator), checked before this job imports any test
+          # code. /usr/bin/git, not PATH: ci-fast/bin is prepended to PATH.
+          # (The environment build already ran the candidate's build backend,
+          # and .gitignore is candidate content; see docs.)
+          dirty="$(/usr/bin/git status --porcelain=v1 --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf 'DIRTY_CHECKOUT after environment restore:\n%s\n' "$dirty" >&2
             exit 1

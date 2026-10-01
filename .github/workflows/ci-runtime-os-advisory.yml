@@ -2,6 +2,9 @@ name: CI Runtime OS advisory
 
 on:
   pull_request_target:
+    # Only PRs into the protected default branch: base.sha is the trusted
+    # code this workflow checks out and runs, so it must be protected history.
+    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, edited, labeled, unlabeled]
   pull_request_review:
     types: [submitted, edited, dismissed]
@@ -28,9 +31,12 @@ env:
 jobs:
   preflight:
     name: Dependency-free policy preflight
+    # pull_request_review cannot be branch-filtered, so PR events also require
+    # a same-repository head and the protected default branch as base.
     if: >-
       !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.base.ref == github.event.repository.default_branch)
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 10
     outputs:
@@ -264,9 +270,11 @@ jobs:
           NOUS_API_KEY: ""
         run: |
           # The restored environment must leave the checkout clean (same query
-          # as the receipt validator). Checked before anything imports or
-          # runs candidate code, so candidate code cannot mask residue.
-          dirty="$(git status --porcelain=v1 --untracked-files=all)"
+          # as the receipt validator), checked before this job imports any test
+          # code. /usr/bin/git, not PATH: ci-fast/bin is prepended to PATH.
+          # (The environment build already ran the candidate's build backend,
+          # and .gitignore is candidate content; see docs.)
+          dirty="$(/usr/bin/git status --porcelain=v1 --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf 'DIRTY_CHECKOUT after environment restore:\n%s\n' "$dirty" >&2
             exit 1
@@ -361,8 +369,9 @@ jobs:
     name: Await unprivileged candidate proof
     needs: preflight
     if: contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name)
-    # GitHub-hosted on purpose: a waiter parked on the shared self-hosted pool
-    # could starve the very candidate slices it is waiting for.
+    # GitHub-hosted so it never holds a self-hosted runner. It still holds one
+    # hosted job slot while it polls; many concurrent PRs can therefore queue
+    # behind each other's waiters on the hosted concurrency limit.
     runs-on: ubuntu-latest
     timeout-minutes: 160
     permissions:
@@ -396,15 +405,30 @@ jobs:
             const discoveryDeadline = started + Number(process.env.DISCOVERY_MINUTES) * 60 * 1000;
             const deadline = started + Number(process.env.WAIT_MINUTES) * 60 * 1000;
             const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+            // Back off from 30s to 5min between polls; a rate-limited or
+            // transient API failure waits and retries instead of failing.
+            let delay = 30 * 1000;
             while (true) {
-              const runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                workflow_id: process.env.CANDIDATE_WORKFLOW,
-                event: 'pull_request',
-                head_sha: head,
-                per_page: 100,
-              });
+              let runs;
+              try {
+                runs = await github.paginate(github.rest.actions.listWorkflowRuns, {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  workflow_id: process.env.CANDIDATE_WORKFLOW,
+                  event: 'pull_request',
+                  head_sha: head,
+                  per_page: 100,
+                });
+              } catch (error) {
+                if (Date.now() > deadline) {
+                  core.setFailed(`Candidate proof lookup kept failing: ${error.message}`);
+                  return;
+                }
+                core.info(`Candidate proof lookup failed (${error.status || error.message}); retrying`);
+                await sleep(delay);
+                delay = Math.min(delay * 2, 5 * 60 * 1000);
+                continue;
+              }
               const bound = runs.filter(
                 (run) =>
                   run.head_sha === head &&
@@ -446,7 +470,8 @@ jobs:
                 core.setFailed(`Candidate proof for ${head} did not complete in time`);
                 return;
               }
-              await sleep(30 * 1000);
+              await sleep(delay);
+              delay = Math.min(delay * 2, 5 * 60 * 1000);
             }
 
   hermes-required:
@@ -492,7 +517,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Discard residue from earlier jobs on this shared runner
+      - name: Discard workspace residue before trusted checkout
         run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
       - name: Checkout trusted review validator

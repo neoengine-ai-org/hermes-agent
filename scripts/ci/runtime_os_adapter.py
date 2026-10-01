@@ -294,9 +294,11 @@ def plan(args: argparse.Namespace) -> int:
     tests = discover_tests() if run_full else selected
     # The matrix travels colon-joined; a path containing ':' would split into
     # decoy paths and the real file would never run.
-    ambiguous = sorted(path for path in tests if ":" in path)
+    ambiguous = sorted(
+        path for path in tests if ":" in path or any(ord(char) < 32 for char in path)
+    )
     if ambiguous:
-        raise ValueError(f"test paths cannot contain ':': {ambiguous}")
+        raise ValueError(f"test paths cannot contain ':' or control characters: {ambiguous}")
     # Full proof means every unit slice plus e2e; an empty unit set would let
     # e2e alone satisfy it.
     if run_full and not tests:
