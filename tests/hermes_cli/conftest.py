@@ -74,7 +74,9 @@ def _protect_checkout_bytecode_cache(monkeypatch):
 
     def _guarded_clear(root):
         resolved = Path(root).resolve()
-        if resolved == checkout or checkout in resolved.parents:
+        # The checkout itself, anything inside it, or any ancestor of it
+        # (whose walk would recurse into the checkout's caches).
+        if resolved == checkout or checkout in resolved.parents or resolved in checkout.parents:
             return 0
         return real_clear(root)
 

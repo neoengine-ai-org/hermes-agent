@@ -5,6 +5,7 @@ import errno
 import importlib.util
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -305,15 +306,18 @@ def test_indexed_closure_matches_pairwise_fixpoint(monkeypatch, tmp_path) -> Non
 
 def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_path) -> None:
     # Parallel test processes create and delete tests/__pycache__ while the
-    # adapter walks the tree; a bytecode cache vanishing mid-walk is skipped.
-    # Any other vanished directory fails closed
-    # (test_discovery_fails_closed_when_a_source_dir_vanishes).
+    # adapter walks the tree. A bytecode cache vanishing mid-walk restarts the
+    # walk, which then sees the tree without it. Any other vanished directory
+    # fails closed (test_discovery_fails_closed_when_a_source_dir_vanishes).
     for relative in ("tests/test_kept.py", "tests/__pycache__/x.pyc", "pkg/mod.py", "pkg/__pycache__/y.pyc"):
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / relative).write_text("", encoding="utf-8")
 
     def vanished(path, dir_fd):
-        if Path(path).name == "__pycache__":
+        if Path(path).name == "__pycache__" and dir_fd is not None:
+            cache = next(tmp_path.rglob("__pycache__"), None)
+            if cache is not None:
+                shutil.rmtree(cache)
             return FileNotFoundError(2, "No such file or directory", path)
         return None
 
@@ -350,6 +354,19 @@ def _fail_directory_open(monkeypatch, fail) -> None:
         return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
 
     monkeypatch.setattr(os, "open", failing_open)
+
+
+def _fail_entry_lstat(monkeypatch, fail) -> None:
+    """Inject errors where the walker classifies each entry (``os.lstat``)."""
+    real_lstat = os.lstat
+
+    def failing_lstat(path, *args, **kwargs):
+        error = fail(Path(os.fspath(path)).name)
+        if error is not None:
+            raise error
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", failing_lstat)
 
 
 def _write_tree(root: Path, files: list[str]) -> None:
@@ -401,10 +418,9 @@ def test_discovery_fails_closed_when_a_source_dir_vanishes(tmp_path, monkeypatch
 def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, error) -> None:
     _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    roots = {os.fspath(tmp_path), os.fspath(tmp_path / "tests")}
 
     def failing_root(path, dir_fd):
-        if dir_fd is None and path in roots:
+        if dir_fd is not None and Path(path).name in {tmp_path.name, "tests"}:
             return OSError(error, os.strerror(error), path)
         return None
 
@@ -531,63 +547,31 @@ def test_discovery_fails_closed_when_a_file_stat_errors(tmp_path, monkeypatch, e
         adapter.discover_tests()
 
 
-class _FailingDirEntry:
-    def __init__(self, entry, error):
-        self._entry = entry
-        self._error = error
-        self.name = entry.name
-        self.path = entry.path
-
-    def is_dir(self, *, follow_symlinks=True):
-        raise OSError(self._error, os.strerror(self._error), self.path)
-
-
-class _ScannerWithFailingEntry:
-    def __init__(self, scanner, name, error):
-        self._scanner = scanner
-        self._name = name
-        self._error = error
-
-    def __enter__(self):
-        self._scanner.__enter__()
-        return self
-
-    def __exit__(self, *exc):
-        return self._scanner.__exit__(*exc)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        entry = next(self._scanner)
-        return _FailingDirEntry(entry, self._error) if entry.name == self._name else entry
-
-
 @pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
 def test_discovery_fails_closed_when_entry_classification_errors(
     tmp_path, monkeypatch, error
 ) -> None:
-    # os.walk swallows DirEntry.is_dir() errors and treats the entry as a
-    # file, which silently dropped the whole subtree from selection.
+    # os.walk swallowed classification errors and treated the entry as a
+    # file, silently dropping the whole subtree from selection.
     _write_tree(tmp_path, ["agent/core.py", "gateway/run.py", "tests/unit/test_run.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
-    cases = (("gateway", adapter.discover_python_sources), ("unit", adapter.discover_tests))
-    for name, discover in cases:
-
-        def failing_scandir(path=".", *args, _name=name, **kwargs):
-            return _ScannerWithFailingEntry(real_scandir(path, *args, **kwargs), _name, error)
-
-        monkeypatch.setattr(os, "scandir", failing_scandir)
+    for name, discover in (("gateway", adapter.discover_python_sources), ("unit", adapter.discover_tests)):
+        _fail_entry_lstat(
+            monkeypatch,
+            lambda entry, _name=name: OSError(error, os.strerror(error), entry) if entry == _name else None,
+        )
         with pytest.raises(OSError):
             discover()
 
 
 def test_discovery_does_not_follow_directory_symlinks(tmp_path, monkeypatch) -> None:
+    # A directory symlink is never traversed; because pytest would collect
+    # through it, discovery refuses it rather than silently omitting it.
     _write_tree(tmp_path, ["agent/core.py", "elsewhere/linked.py"])
     (tmp_path / "agent/linked_dir").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    assert adapter.discover_python_sources() == ["agent/core.py", "elsewhere/linked.py"]
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_python_sources()
 
 
 @pytest.mark.parametrize("target", ["inside", "dangling", "escaping"])
@@ -638,17 +622,17 @@ def test_discovery_fails_closed_when_a_listed_file_vanishes(tmp_path, monkeypatc
 def test_discovery_fails_closed_when_a_listed_entry_vanishes_before_classification(
     tmp_path, monkeypatch
 ) -> None:
-    # A source subtree removed between listing and DirEntry.is_dir() must not
+    # A source subtree removed between listing and classification must not
     # silently drop out of selection.
     _write_tree(tmp_path, ["agent/core.py", "gateway/run.py", "tests/unit/test_run.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
     for name, discover in (("gateway", adapter.discover_python_sources), ("unit", adapter.discover_tests)):
-
-        def vanishing_scandir(path=".", *args, _name=name, **kwargs):
-            return _ScannerWithFailingEntry(real_scandir(path, *args, **kwargs), _name, errno.ENOENT)
-
-        monkeypatch.setattr(os, "scandir", vanishing_scandir)
+        _fail_entry_lstat(
+            monkeypatch,
+            lambda entry, _name=name: FileNotFoundError(2, "No such file or directory", entry)
+            if entry == _name
+            else None,
+        )
         with pytest.raises(FileNotFoundError):
             discover()
 
@@ -667,35 +651,23 @@ def test_discovery_includes_tracked_python_inside_bytecode_caches(tmp_path, monk
 
 
 def test_discovery_tolerates_bytecode_cache_entries_vanishing(tmp_path, monkeypatch) -> None:
+    # A cache entry that vanishes once restarts the walk; the restarted walk
+    # still reports what is on disk (here: everything), never a narrowed set.
     _write_tree(tmp_path, ["agent/core.py", "agent/__pycache__/stale.py", "tests/test_core.py"])
     (tmp_path / "tests/__pycache__").mkdir()
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir, real_stat, real_lstat = os.scandir, os.stat, os.lstat
+    raced: list[str] = []
 
-    def cache_entry_vanishes(path=".", *args, **kwargs):
-        return _ScannerWithFailingEntry(real_scandir(path, *args, **kwargs), "__pycache__", errno.ENOENT)
+    def once(entry):
+        if entry in {"__pycache__", "stale.py"} and entry not in raced:
+            raced.append(entry)
+            return FileNotFoundError(2, "No such file or directory", entry)
+        return None
 
-    monkeypatch.setattr(os, "scandir", cache_entry_vanishes)
-    assert adapter.discover_python_sources() == ["agent/core.py"]
+    _fail_entry_lstat(monkeypatch, once)
+    assert adapter.discover_python_sources() == ["agent/__pycache__/stale.py", "agent/core.py"]
     assert adapter.discover_tests() == ["tests/test_core.py"]
-
-    def gone(path):
-        return Path(os.fspath(path)).name == "stale.py"
-
-    def stat_gone(path, *args, **kwargs):
-        if gone(path):
-            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
-        return real_stat(path, *args, **kwargs)
-
-    def lstat_gone(path, *args, **kwargs):
-        if gone(path):
-            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
-        return real_lstat(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "scandir", real_scandir)
-    monkeypatch.setattr(os, "stat", stat_gone)
-    monkeypatch.setattr(os, "lstat", lstat_gone)
-    assert adapter.discover_python_sources() == ["agent/core.py"]
+    assert raced
 
 
 def test_reference_cache_is_keyed_by_candidate_root(tmp_path, monkeypatch) -> None:
@@ -763,15 +735,16 @@ def test_collection_hook_builds_index_only_when_adapter_tests_run() -> None:
 def test_prefix_index_matches_reference_import_semantics() -> None:
     sources = adapter.discover_python_sources()[:200] + adapter.discover_tests()[:200]
     modules = sorted({adapter._module_name(path) for path in sources})
-    for path in sources:
-        try:
-            adapter._module_references(path)
-        except (OSError, SyntaxError, UnicodeError):
-            continue
-        for module in modules:
-            assert (module in adapter._reference_prefixes(path)) is adapter._imports_module(
-                path, module
-            ), (path, module)
+    with adapter._plan_snapshot():
+        for path in sources:
+            try:
+                adapter._module_references(path)
+            except (OSError, SyntaxError, UnicodeError):
+                continue
+            for module in modules:
+                assert (module in adapter._reference_prefixes(path)) is adapter._imports_module(
+                    path, module
+                ), (path, module)
 
 
 def test_node_iteration_visits_exactly_the_ast_walk_node_set() -> None:
@@ -801,3 +774,245 @@ def test_node_iteration_visits_exactly_the_ast_walk_node_set() -> None:
         tree = ast.parse(source)
         walked = sorted(map(id, ast.walk(tree)))
         assert sorted(map(id, adapter._iter_nodes(tree))) == walked
+
+
+# --- Round-6 (f1a86bdc) blocking predicates -------------------------------
+
+
+def _select_tree(tmp_path, monkeypatch, files: dict[str, str]) -> Path:
+    root = tmp_path / "candidate"
+    for relative, text in files.items():
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", root)
+    return root
+
+
+def test_p1_same_inode_rewrite_after_warm_selection_is_reselected(tmp_path, monkeypatch) -> None:
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {
+            "pkg/__init__.py": "",
+            "pkg/old.py": "",
+            "pkg/new.py": "",
+            "tests/unit/test_probe.py": "import pkg.old\n",
+            "tests/unit/test_new.py": "import pkg.unrelated\n",
+        },
+    )
+    probe = root / "tests/unit/test_probe.py"
+    inode = probe.stat().st_ino
+    assert adapter.select_tests(["pkg/old.py"]) == (["tests/unit/test_probe.py"], False)
+    probe.write_text("import pkg.new\n", encoding="utf-8")  # same inode, new content
+    assert probe.stat().st_ino == inode
+    selected, unknown = adapter.select_tests(["pkg/new.py"])
+    assert "tests/unit/test_probe.py" in selected
+    assert unknown is False
+
+
+def test_p1_atomic_replacement_after_warm_selection_is_reselected(tmp_path, monkeypatch) -> None:
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {
+            "pkg/__init__.py": "",
+            "pkg/old.py": "",
+            "pkg/new.py": "",
+            "tests/unit/test_probe.py": "import pkg.old\n",
+            "tests/unit/test_new.py": "import pkg.unrelated\n",
+        },
+    )
+    assert adapter.select_tests(["pkg/old.py"]) == (["tests/unit/test_probe.py"], False)
+    replacement = root / "replacement.tmp"
+    replacement.write_text("import pkg.new\n", encoding="utf-8")
+    os.replace(replacement, root / "tests/unit/test_probe.py")
+    selected, _ = adapter.select_tests(["pkg/new.py"])
+    assert "tests/unit/test_probe.py" in selected
+
+
+def test_p2_cache_resident_test_survives_transient_cache_churn(tmp_path, monkeypatch) -> None:
+    # A tracked-style test inside tests/__pycache__ whose classification races
+    # cache churn once must still be in the universe (the walk restarts).
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {
+            "pkg/__init__.py": "",
+            "pkg/changed.py": "",
+            "tests/unit/test_other.py": "import pkg.unrelated\n",
+            "tests/__pycache__/test_cached.py": "import pkg.changed\n",
+        },
+    )
+    real_lstat = os.lstat
+    raced = []
+
+    def churn_once(path, *args, **kwargs):
+        if os.fspath(path) == "test_cached.py" and not raced:
+            raced.append(path)
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", churn_once)
+    selected, unknown = adapter.select_tests(["pkg/changed.py"])
+    assert raced
+    assert "tests/__pycache__/test_cached.py" in selected
+    assert unknown is False
+    assert (root / "tests/__pycache__/test_cached.py").exists()
+
+
+def test_p2_persistent_cache_churn_fails_closed(tmp_path, monkeypatch) -> None:
+    _select_tree(
+        tmp_path,
+        monkeypatch,
+        {"tests/unit/test_other.py": "", "tests/__pycache__/test_cached.py": ""},
+    )
+    real_lstat = os.lstat
+
+    def always_churning(path, *args, **kwargs):
+        if os.fspath(path) == "test_cached.py":
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", always_churning)
+    with pytest.raises(RuntimeError, match="bytecode cache"):
+        adapter.discover_tests()
+
+
+def test_p2_vanished_cache_directory_never_narrows_silently(tmp_path, monkeypatch) -> None:
+    # The cache directory itself disappears between listing and opening: the
+    # walk restarts and returns the universe as it now exists on disk.
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {"tests/test_kept.py": "", "tests/__pycache__/test_cached.py": ""},
+    )
+    real_open = os.open
+    removed = []
+
+    def delete_cache_on_open(path, flags, *args, dir_fd=None, **kwargs):
+        if os.fspath(path) == "__pycache__" and not removed:
+            shutil.rmtree(root / "tests/__pycache__")
+            removed.append(path)
+        return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "open", delete_cache_on_open)
+    assert adapter.discover_tests() == ["tests/test_kept.py"]
+    assert removed
+
+
+@pytest.mark.parametrize("pruned", ["integration", "e2e", "docker"])
+def test_p3_direct_changed_test_symlink_is_refused(tmp_path, monkeypatch, pruned) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"tests/unit/test_kept.py": "", "decoy/test_decoy.py": ""})
+    (root / f"tests/{pruned}").mkdir(parents=True)
+    (root / f"tests/{pruned}/test_linked.py").symlink_to(root / "decoy/test_decoy.py")
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.select_tests([f"tests/{pruned}/test_linked.py"])
+
+
+def test_p3_direct_changed_test_through_symlinked_directory_is_refused(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"tests/unit/test_kept.py": "", "decoy/test_x.py": ""})
+    (root / "tests/e2e").symlink_to(root / "decoy", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.select_tests(["tests/e2e/test_x.py"])
+
+
+def test_p4_static_test_directory_symlink_fails_closed(tmp_path, monkeypatch) -> None:
+    # pytest collects through directory symlinks, so a symlinked test
+    # directory must not be silently outside the adapter's universe.
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {
+            "pkg/__init__.py": "",
+            "pkg/linkmod.py": "",
+            "tests/unit/test_linkmod.py": "import pkg.unrelated\n",
+            "outside/test_linked.py": "import pkg.linkmod\n",
+        },
+    )
+    (root / "tests/unit/linked").symlink_to(root / "outside", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_tests()
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.select_tests(["pkg/linkmod.py"])
+
+
+def test_p4_source_directory_symlink_fails_closed(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"agent/core.py": "", "elsewhere/mod.py": ""})
+    (root / "agent/linked").symlink_to(root / "elsewhere", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_python_sources()
+
+
+def test_p5_child_directory_swapped_between_classification_and_open(tmp_path, monkeypatch) -> None:
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {"tests/unit/test_a.py": "", "tests/unit/test_b.py": "", "tests/test_top.py": ""},
+    )
+    real_open = os.open
+    swapped = []
+
+    def swap_before_open(path, flags, *args, dir_fd=None, **kwargs):
+        if os.fspath(path) == "unit" and dir_fd is not None and not swapped:
+            os.rename(root / "tests/unit", root / "unit.moved")
+            (root / "tests/unit").mkdir()  # different, empty, real directory
+            swapped.append(path)
+        return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "open", swap_before_open)
+    with pytest.raises(ValueError, match="changed during discovery"):
+        adapter.discover_tests()
+    assert swapped
+
+
+def test_p5_child_directory_swapped_between_listing_and_classification(tmp_path, monkeypatch) -> None:
+    root = _select_tree(
+        tmp_path,
+        monkeypatch,
+        {"tests/unit/test_a.py": "", "tests/test_top.py": ""},
+    )
+    real_lstat = os.lstat
+    swapped = []
+
+    def swap_before_lstat(path, *args, **kwargs):
+        if os.fspath(path) == "unit" and not swapped:
+            os.rename(root / "tests/unit", root / "unit.moved")
+            (root / "tests/unit").mkdir()
+            swapped.append(path)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", swap_before_lstat)
+    with pytest.raises(ValueError, match="changed during discovery"):
+        adapter.discover_tests()
+    assert swapped
+
+
+@pytest.mark.parametrize("decoy_kind", ["symlink", "real_directory"])
+def test_p6_candidate_root_ancestor_swap_is_refused(tmp_path, monkeypatch, decoy_kind) -> None:
+    anchor = tmp_path / "anchor"
+    root = anchor / "candidate"
+    _write_tree(root, ["agent/core.py", "tests/test_core.py"])
+    decoy_anchor = tmp_path / "decoy_anchor"
+    _write_tree(decoy_anchor / "candidate", ["agent/other.py", "tests/test_decoy.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", root)
+    assert adapter.discover_tests() == ["tests/test_core.py"]  # binds the root
+    os.rename(anchor, tmp_path / "anchor.moved")
+    if decoy_kind == "symlink":
+        anchor.symlink_to(decoy_anchor, target_is_directory=True)
+        match = "symlink"
+    else:
+        os.rename(decoy_anchor, anchor)
+        match = "candidate root changed"
+    with pytest.raises(ValueError, match=match):
+        adapter.discover_tests()
+    with pytest.raises(ValueError, match=match):
+        adapter._module_references("agent/core.py")
+
+
+def test_p7_backslash_path_is_never_aliased_to_a_slash_path(tmp_path, monkeypatch) -> None:
+    root = _select_tree(tmp_path, monkeypatch, {"tests/unit/test_a.py": ""})
+    (root / "tests/unit\\test_a.py").write_text("", encoding="utf-8")  # distinct legal POSIX name
+    selected, unknown = adapter.select_tests(["tests/unit\\test_a.py"])
+    assert "tests/unit/test_a.py" not in selected
+    assert unknown is True

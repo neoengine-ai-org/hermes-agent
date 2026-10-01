@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import fnmatch
 import functools
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -113,58 +115,36 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
 
 
 # Parallel test processes (and ``hermes update``) create and delete bytecode
-# caches in the shared checkout at any moment. A ``__pycache__`` directory, or
-# anything inside one, disappearing mid-walk is the only tolerated race; it is
-# still descended into, so a tracked ``*.py`` placed inside one is discovered.
+# caches in the shared checkout at any moment. A ``__pycache__`` directory is
+# still walked (a tracked ``*.py`` inside one is discovered), but if it or an
+# entry inside it changes mid-walk the whole walk restarts, so a successful
+# discovery always describes one complete, consistent listing of the tree.
 _BYTECODE_CACHE = "__pycache__"
+_WALK_ATTEMPTS = 5
+_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
 
-
-def _vanished_cache_entry(parts: tuple[str, ...]) -> bool:
-    return _BYTECODE_CACHE in parts
-
-
+# Candidate root -> (st_dev, st_ino) bound the first time it is opened; every
+# later open must reach that same directory.
+_ROOT_IDENTITY: dict[Path, tuple[int, int]] = {}
 # (root, relative path) -> (st_dev, st_ino) of every regular file the latest
-# discovery returned; reads verify they open that same file.
+# successful discovery returned; reads verify they open that same file.
 _DISCOVERED_IDENTITY: dict[tuple[Path, str], tuple[int, int]] = {}
 
 
-def _classify_python_entry(name: str, directory_fd: int, parts: tuple[str, ...]) -> tuple[int, int] | None:
-    """Identity of a regular ``*.py`` entry of an open directory, else ``None``.
-
-    Classified through the directory's descriptor with ``lstat``, never by
-    re-resolving a path. A ``*.py`` symlink is refused (``ValueError``): it
-    can dangle in one checkout layout and resolve in another, or escape the
-    tree, so neither following nor skipping it is safe. A non-regular entry
-    (e.g. a directory named ``x.py``) and a file inside a bytecode cache that
-    was cleared mid-walk are not files. Any other entry that vanished, and
-    any other error (EIO, EACCES, ...), raises: it may have been a source
-    or test, so dropping it would silently narrow selection.
-    """
-    try:
-        info = os.lstat(name, dir_fd=directory_fd)
-    except FileNotFoundError:
-        if _vanished_cache_entry(parts[:-1]):
-            return None
-        raise
-    if stat.S_ISLNK(info.st_mode):
-        raise ValueError(f"discovery refuses Python file symlinks: {'/'.join(parts)}")
-    if not stat.S_ISREG(info.st_mode):
-        return None
-    return info.st_dev, info.st_ino
+class _CacheChurn(Exception):
+    """A bytecode cache changed during the walk; the walk restarts."""
 
 
-def _open_directory(name: str | Path, parts: tuple[str, ...], dir_fd: int | None = None) -> int | None:
-    """Open a directory without following a symlink at its last component.
+def _in_bytecode_cache(parts: tuple[str, ...]) -> bool:
+    return _BYTECODE_CACHE in parts
 
-    Returns ``None`` only for a bytecode cache (or an entry inside one) that
-    vanished. A symlink raises ``ValueError``; every other error propagates.
-    """
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+def _open_nofollow(name: str, flags: int, dir_fd: int | None, label: str) -> int:
+    """``os.open`` relative to ``dir_fd`` that refuses a symlink (``ValueError``)."""
     try:
         return os.open(name, flags, dir_fd=dir_fd)
     except FileNotFoundError:
-        if _vanished_cache_entry(parts):
-            return None
         raise
     except OSError as error:
         try:
@@ -172,75 +152,138 @@ def _open_directory(name: str | Path, parts: tuple[str, ...], dir_fd: int | None
         except OSError:
             is_link = False
         if is_link:
-            raise ValueError(f"discovery must not traverse a symlinked directory: {'/'.join(parts) or name}") from error
+            raise ValueError(f"runtime-OS discovery refuses symlink: {label}") from error
         raise
+
+
+def _open_root(root: Path) -> int:
+    """Open the candidate root through every component, binding its identity.
+
+    Each component from ``/`` is opened with ``O_NOFOLLOW`` relative to its
+    parent's descriptor, so an ancestor replaced by a symlink raises; the
+    opened root must also be the directory bound on first use, so an ancestor
+    replaced by a different real directory raises too.
+    """
+    if not root.is_absolute():
+        raise ValueError(f"candidate root must be absolute: {root}")
+    directory_fd = os.open(root.anchor, _DIRECTORY_FLAGS)
+    try:
+        for name in root.parts[1:]:
+            child_fd = _open_nofollow(name, _DIRECTORY_FLAGS, directory_fd, str(root))
+            os.close(directory_fd)
+            directory_fd = child_fd
+        opened = os.fstat(directory_fd)
+        identity = (opened.st_dev, opened.st_ino)
+        if _ROOT_IDENTITY.setdefault(root, identity) != identity:
+            raise ValueError(f"candidate root changed after it was bound: {root}")
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    return directory_fd
+
+
+def _open_relative(root_fd: int, parts: tuple[str, ...]) -> int:
+    """Open the directory ``parts`` below an open root without following symlinks.
+
+    Consumes ``root_fd``; the caller owns the returned descriptor.
+    """
+    directory_fd = root_fd
+    try:
+        for index, name in enumerate(parts):
+            child_fd = _open_nofollow(name, _DIRECTORY_FLAGS, directory_fd, "/".join(parts[: index + 1]))
+            os.close(directory_fd)
+            directory_fd = child_fd
+    except BaseException:
+        os.close(directory_fd)
+        raise
+    return directory_fd
 
 
 def _walk_py_files(start: Path, prune) -> list[Path]:
     """Regular ``*.py`` files under ``start``, failing closed.
 
     Directories for which ``prune(parts)`` is true (``parts`` relative to
-    ``CANDIDATE_ROOT``) are never descended into. A ``__pycache__`` directory
-    (or an entry inside one) that disappears mid-walk is skipped. Any other
-    error listing or classifying an entry (PermissionError, a non-cache
-    entry that vanished, EIO, ...) raises: it could hold sources or tests,
-    and skipping it would silently narrow selection.
-
-    The root is opened with ``O_NOFOLLOW`` and every subdirectory with
-    ``O_NOFOLLOW`` relative to its parent's descriptor, and each is listed
-    through its descriptor, so a directory swapped for a symlink (e.g.
-    ``tests -> decoy``) can never be traversed. Every ``*.py`` file is
-    classified through its directory's descriptor and its identity recorded;
-    ``_read_candidate`` reopens it without following symlinks and verifies
-    that identity, so a swap after discovery cannot redirect parsing. Only a
-    missing root yields nothing; a
-    root that exists but is not a directory, or is a symlink, raises.
-    ``os.walk`` is not used because it swallows ``DirEntry.is_dir()`` errors
-    and treats the entry as a file.
+    ``CANDIDATE_ROOT``) are never entered. Every other directory is walked
+    through descriptors: the candidate root is anchored by ``_open_root``,
+    each child directory is opened with ``O_NOFOLLOW`` relative to its
+    parent and must be the same directory that was listed (``d_ino``) and
+    classified (``lstat``). A directory symlink or a ``*.py`` symlink raises
+    (pytest would collect through it, so skipping it would silently narrow
+    selection), as does any listing/classification error, any non-cache
+    entry that vanished, and an existing ``start`` that is not a directory.
+    A change inside a bytecode cache restarts the walk; persistent churn
+    raises. Only a missing ``start`` yields nothing.
     """
-    root_parts = start.relative_to(CANDIDATE_ROOT).parts
+    for _ in range(_WALK_ATTEMPTS):
+        try:
+            return _walk_once(start, prune)
+        except _CacheChurn:
+            continue
+    raise RuntimeError(
+        f"bytecode caches under {start} kept changing during discovery; refusing a possibly incomplete universe"
+    )
+
+
+def _walk_once(start: Path, prune) -> list[Path]:
+    start_parts = start.relative_to(CANDIDATE_ROOT).parts
     try:
-        root_fd = _open_directory(start, root_parts)
+        start_fd = _open_relative(_open_root(CANDIDATE_ROOT), start_parts)
     except FileNotFoundError:
         return []
-    if root_fd is None:
-        return []
     found: list[Path] = []
+    identities: dict[tuple[Path, str], tuple[int, int]] = {}
 
     def walk(directory_fd: int, directory: Path, relative: tuple[str, ...]) -> None:
         with os.scandir(directory_fd) as scanner:
             entries = sorted(scanner, key=lambda entry: entry.name)
         for entry in entries:
             parts = relative + (entry.name,)
-            if fnmatch.fnmatchcase(entry.name, "*.py"):
-                identity = _classify_python_entry(entry.name, directory_fd, parts)
-                if identity is not None:
-                    found.append(directory / entry.name)
-                    _DISCOVERED_IDENTITY[(CANDIDATE_ROOT, "/".join(parts))] = identity
-            if prune(parts):
-                continue
-            # Like 3.11 ``rglob``: recurse into real directories only, never
-            # through directory symlinks.
+            label = "/".join(parts)
             try:
-                is_directory = entry.is_dir(follow_symlinks=False)
+                info = os.lstat(entry.name, dir_fd=directory_fd)
             except FileNotFoundError:
-                if _vanished_cache_entry(parts):
-                    continue
+                if _in_bytecode_cache(parts):
+                    raise _CacheChurn() from None
                 raise
-            if not is_directory:
+            is_python = fnmatch.fnmatchcase(entry.name, "*.py")
+            if stat.S_ISLNK(info.st_mode):
+                if is_python:
+                    raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
+                if prune(parts):
+                    continue
+                try:
+                    target_is_directory = stat.S_ISDIR(os.stat(entry.name, dir_fd=directory_fd).st_mode)
+                except FileNotFoundError:
+                    target_is_directory = False  # dangling non-Python link: nothing to collect
+                if target_is_directory:
+                    raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
                 continue
-            child_fd = _open_directory(entry.name, parts, dir_fd=directory_fd)
-            if child_fd is None:
+            if is_python and stat.S_ISREG(info.st_mode):
+                found.append(directory / entry.name)
+                identities[(CANDIDATE_ROOT, label)] = (info.st_dev, info.st_ino)
+            if prune(parts) or not stat.S_ISDIR(info.st_mode):
                 continue
+            if entry.inode() != info.st_ino:
+                raise ValueError(f"{label} changed during discovery")
             try:
+                child_fd = _open_nofollow(entry.name, _DIRECTORY_FLAGS, directory_fd, label)
+            except FileNotFoundError:
+                if _in_bytecode_cache(parts):
+                    raise _CacheChurn() from None
+                raise
+            try:
+                opened = os.fstat(child_fd)
+                if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                    raise ValueError(f"{label} changed during discovery")
                 walk(child_fd, directory / entry.name, parts)
             finally:
                 os.close(child_fd)
 
     try:
-        walk(root_fd, start, root_parts)
+        walk(start_fd, start, start_parts)
     finally:
-        os.close(root_fd)
+        os.close(start_fd)
+    _DISCOVERED_IDENTITY.update(identities)
     return found
 
 
@@ -294,56 +337,107 @@ def _iter_nodes(tree: ast.AST):
                 stack.append(value)
 
 
-def _read_candidate(root: Path, path: str, expected: tuple[int, int] | None = None) -> str:
-    """Read ``root/path`` as text without following any symlink.
+def _candidate_stat(root: Path, path: str) -> os.stat_result | None:
+    """``lstat`` of ``root/path`` through the anchored no-follow chain.
 
-    Each directory component and the file itself are opened with
-    ``O_NOFOLLOW`` relative to the parent's descriptor; when discovery
-    recorded the file's identity, the opened file must be that same file.
-    A swap after discovery therefore raises instead of silently redirecting
-    the parse. Text decoding matches ``Path.read_text(encoding="utf-8")``.
+    ``None`` when it does not exist; a symlink anywhere on the path (the final
+    component included) raises ``ValueError``.
     """
     parts = Path(path).parts
-    directory_fd = _open_directory(root, ())
-    if directory_fd is None:
-        raise FileNotFoundError(2, "No such file or directory", str(root))
     try:
-        for index, name in enumerate(parts[:-1]):
-            child_fd = _open_directory(name, parts[: index + 1], dir_fd=directory_fd)
-            os.close(directory_fd)
-            directory_fd = child_fd
-            if directory_fd is None:
-                raise FileNotFoundError(2, "No such file or directory", str(root / path))
-        try:
-            file_fd = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
-        except OSError as error:
-            try:
-                is_link = stat.S_ISLNK(os.lstat(parts[-1], dir_fd=directory_fd).st_mode)
-            except OSError:
-                is_link = False
-            if is_link:
-                raise ValueError(f"refusing to read a Python file symlink: {path}") from error
-            raise
+        directory_fd = _open_relative(_open_root(root), parts[:-1])
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        info = os.lstat(parts[-1], dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
     finally:
-        if directory_fd is not None:
+        os.close(directory_fd)
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+    return info
+
+
+def _read_candidate_bytes(root: Path, path: str, expected: tuple[int, int] | None = None) -> bytes:
+    """Read ``root/path`` without following any symlink.
+
+    The root is anchored by ``_open_root``; each directory component and the
+    file itself are opened with ``O_NOFOLLOW`` relative to the parent's
+    descriptor, and when discovery recorded the file's identity the opened
+    file must be that same file.
+    """
+    parts = Path(path).parts
+    if _PLAN_DIRECTORIES is not None and root == CANDIDATE_ROOT:
+        file_fd = _open_nofollow(parts[-1], _FILE_FLAGS, _plan_directory(parts[:-1]), path)
+    else:
+        directory_fd = _open_relative(_open_root(root), parts[:-1])
+        try:
+            file_fd = _open_nofollow(parts[-1], _FILE_FLAGS, directory_fd, path)
+        finally:
             os.close(directory_fd)
-    with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+    with os.fdopen(file_fd, "rb") as handle:
         opened = os.fstat(handle.fileno())
         if expected is not None and (opened.st_dev, opened.st_ino) != expected:
             raise ValueError(f"{path} changed after discovery")
         return handle.read()
 
 
-def _module_references(path: str) -> frozenset[str]:
-    return _references_under(CANDIDATE_ROOT, path, _DISCOVERED_IDENTITY.get((CANDIDATE_ROOT, path)))
+def _decode_source(data: bytes) -> str:
+    """Decode exactly like ``Path.read_text(encoding="utf-8")`` (universal newlines)."""
+    return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8").read()
 
 
-# Parse results are cached per (root, relative path, discovered file identity):
-# keying by root keeps one candidate tree from answering for another, and by
-# identity keeps a file replaced after discovery from reusing a stale parse.
-@functools.lru_cache(maxsize=None)
-def _references_under(root: Path, path: str, identity: tuple[int, int] | None) -> frozenset[str]:
-    source = _read_candidate(root, path, identity)
+def _read_candidate(root: Path, path: str, expected: tuple[int, int] | None = None) -> str:
+    return _decode_source(_read_candidate_bytes(root, path, expected))
+
+
+# Parse results are cached by the SHA-256 of the exact bytes read, never by
+# path or inode: every lookup re-reads the candidate (anchored, no-follow,
+# identity-checked), so an in-place rewrite or a replacement can never be
+# answered from a stale parse. Within one ``select_tests`` call a snapshot
+# keeps each file read once, so a plan sees one consistent version of it.
+_REFERENCES_BY_DIGEST: dict[bytes, frozenset[str]] = {}
+_PREFIXES_BY_DIGEST: dict[bytes, frozenset[str]] = {}
+_PLAN_SNAPSHOT: dict[tuple[Path, str], bytes] | None = None
+# Within one plan the candidate root is anchored once, and the most recently
+# used directory descriptor is reused (paths arrive grouped by directory), so
+# reads stay anchored and no-follow without re-walking from "/" per file.
+_PLAN_DIRECTORIES: dict[str, object] | None = None
+
+
+def _plan_directory(parts: tuple[str, ...]) -> int:
+    assert _PLAN_DIRECTORIES is not None
+    if "root" not in _PLAN_DIRECTORIES:
+        _PLAN_DIRECTORIES["root"] = _open_root(CANDIDATE_ROOT)
+    root_fd = _PLAN_DIRECTORIES["root"]
+    if not parts:
+        return root_fd  # type: ignore[return-value]
+    last = _PLAN_DIRECTORIES.get("last")
+    if last is not None and last[0] == parts:  # type: ignore[index]
+        return last[1]  # type: ignore[index]
+    if last is not None:
+        os.close(last[1])  # type: ignore[index]
+        del _PLAN_DIRECTORIES["last"]
+    directory_fd = _open_relative(os.dup(root_fd), parts)  # type: ignore[arg-type]
+    _PLAN_DIRECTORIES["last"] = (parts, directory_fd)
+    return directory_fd
+
+
+def _candidate_digest(path: str) -> bytes:
+    key = (CANDIDATE_ROOT, path)
+    if _PLAN_SNAPSHOT is not None and key in _PLAN_SNAPSHOT:
+        return _PLAN_SNAPSHOT[key]
+    data = _read_candidate_bytes(CANDIDATE_ROOT, path, _DISCOVERED_IDENTITY.get(key))
+    digest = hashlib.sha256(data).digest()
+    if digest not in _REFERENCES_BY_DIGEST:
+        _REFERENCES_BY_DIGEST[digest] = _parse_references(_decode_source(data), path)
+    if _PLAN_SNAPSHOT is not None:
+        _PLAN_SNAPSHOT[key] = digest
+    return digest
+
+
+def _parse_references(source: str, path: str) -> frozenset[str]:
     tree = ast.parse(source, filename=path)
     references: set[str] = set()
     for node in _iter_nodes(tree):
@@ -368,6 +462,10 @@ def _references_under(root: Path, path: str, identity: tuple[int, int] | None) -
     return frozenset(references)
 
 
+def _module_references(path: str) -> frozenset[str]:
+    return _REFERENCES_BY_DIGEST[_candidate_digest(path)]
+
+
 def _imports_module(path: str, module_name: str) -> bool:
     """Return whether a source/test directly references a module boundary."""
     return any(
@@ -381,16 +479,15 @@ def _reference_prefixes(path: str) -> frozenset[str]:
 
     ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
     """
-    return _prefixes_under(CANDIDATE_ROOT, path, _DISCOVERED_IDENTITY.get((CANDIDATE_ROOT, path)))
-
-
-@functools.lru_cache(maxsize=None)
-def _prefixes_under(root: Path, path: str, identity: tuple[int, int] | None) -> frozenset[str]:
-    prefixes: set[str] = set()
-    for reference in _references_under(root, path, identity):
-        parts = reference.split(".")
-        prefixes.update(".".join(parts[: index + 1]) for index in range(len(parts)))
-    return frozenset(prefixes)
+    digest = _candidate_digest(path)
+    prefixes = _PREFIXES_BY_DIGEST.get(digest)
+    if prefixes is None:
+        expanded: set[str] = set()
+        for reference in _REFERENCES_BY_DIGEST[digest]:
+            parts = reference.split(".")
+            expanded.update(".".join(parts[: index + 1]) for index in range(len(parts)))
+        prefixes = _PREFIXES_BY_DIGEST[digest] = frozenset(expanded)
+    return prefixes
 
 
 def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
@@ -424,16 +521,52 @@ def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
     return impacted, parse_failures
 
 
+@contextlib.contextmanager
+def _plan_snapshot():
+    """Read each candidate file at most once for the duration of one plan."""
+    global _PLAN_SNAPSHOT, _PLAN_DIRECTORIES
+    if _PLAN_SNAPSHOT is not None:
+        yield  # nested: the outer plan owns the snapshot and descriptors
+        return
+    _PLAN_SNAPSHOT, _PLAN_DIRECTORIES = {}, {}
+    try:
+        yield
+    finally:
+        directories = _PLAN_DIRECTORIES
+        _PLAN_SNAPSHOT = _PLAN_DIRECTORIES = None
+        last = directories.get("last")
+        if last is not None:
+            os.close(last[1])  # type: ignore[index]
+        if "root" in directories:
+            os.close(directories["root"])  # type: ignore[arg-type]
+
+
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
+    with _plan_snapshot():
+        return _select_tests(files)
+
+
+def _select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
     classifier = load_classifier()
     executable_suffixes = set(classifier.EXECUTABLE_SUFFIXES)
     selected: set[str] = set()
     unknown_executable = False
     for raw in files:
-        path = raw.replace("\\", "/").removeprefix("./")
+        if "\\" in raw:
+            # A literal backslash is a legal POSIX filename character; mapping
+            # it to "/" could select a different file. Force full proof.
+            unknown_executable = True
+            continue
+        path = raw.removeprefix("./")
         candidate = CANDIDATE_ROOT / path
-        if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.name.startswith("test_") and candidate.exists():
+        if (
+            path.startswith("tests/")
+            and candidate.suffix in TEST_SUFFIXES
+            and candidate.name.startswith("test_")
+            and (info := _candidate_stat(CANDIDATE_ROOT, path)) is not None
+            and stat.S_ISREG(info.st_mode)
+        ):
             selected.add(path)
             continue
         suffix = candidate.suffix.lower()
