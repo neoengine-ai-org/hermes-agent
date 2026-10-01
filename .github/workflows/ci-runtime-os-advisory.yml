@@ -265,9 +265,19 @@ jobs:
         run: |
           source .venv/bin/activate
           python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
-          # run_tests_parallel.py takes the selected files as positional paths.
+          # The restored environment must leave the checkout clean (same query
+          # as the receipt validator); fail before running any test otherwise.
+          dirty="$(git status --porcelain=v1 --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf 'DIRTY_CHECKOUT after environment restore:\n%s\n' "$dirty" >&2
+            exit 1
+          fi
+          # Same per-file runner and environment contract as tests.yml's
+          # required slices (prebuilt .venv with all+dev extras). run_tests.sh
+          # is the Stage-0 bootstrap-proof wrapper: it rebuilds an
+          # unfingerprinted .venv from uv.lock without dev extras.
           IFS=: read -r -a selected <<< "$SELECTED_FILES"
-          scripts/run_tests.sh -j 4 "${selected[@]}"
+          python scripts/run_tests_parallel.py -j 4 "${selected[@]}"
 
       - name: Upload protected-main duration sample
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'

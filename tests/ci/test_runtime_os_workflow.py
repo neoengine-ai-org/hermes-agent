@@ -33,7 +33,8 @@ def test_runtime_os_workflow_has_stable_advisory_contexts_and_qwen_runner() -> N
 def test_runtime_os_workflow_preserves_pins_and_per_file_isolation() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in text
-    assert 'scripts/run_tests.sh -j 4 "${selected[@]}"' in text
+    assert 'python scripts/run_tests_parallel.py -j 4 "${selected[@]}"' in text
+    assert "scripts/run_tests.sh" not in text
     assert "--files" not in text
     assert "SELECTED_FILES: ${{ matrix.files }}" in text
     assert "--files '${{ matrix.files }}'" not in text
@@ -229,31 +230,57 @@ def test_restored_environment_layout_passes_the_receipt_cleanliness_check(tmp_pa
         assert "tar -czf ci-fast/hermes-ci-fast-environment.tar.gz .venv ci-fast/bin" in build
 
 
-def test_selected_files_reach_the_parallel_runner_as_positional_paths(tmp_path: Path) -> None:
-    # Execute the workflow's real run script with a recording run_tests.sh and
-    # check the argv, then check run_tests_parallel.py accepts that shape.
-    recorder = tmp_path / "scripts/run_tests.sh"
-    recorder.parent.mkdir(parents=True)
-    recorder.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n', encoding="utf-8")
-    recorder.chmod(0o755)
-    (tmp_path / ".venv/bin").mkdir(parents=True)
-    (tmp_path / ".venv/bin/activate").write_text("", encoding="utf-8")
+def _run_slice_script(workflow: Path, workdir: Path, record: Path) -> subprocess.CompletedProcess[str]:
+    script = _step_run(workflow, "test", "Run selected files with interpreter isolation")
+    fake_bin = workdir.parent / "fake-bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_python = fake_bin / "python"
+    # Records every python invocation; the collect-only probe exits 0.
+    fake_python.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "$RECORD"\nprintf -- "--\\n" >> "$RECORD"\n',
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}{os.pathsep}{os.environ['PATH']}",
+        "SELECTED_FILES": "tests/a/test_x.py:tests/b/test_y.py",
+        "RECORD": str(record),
+    }
+    return subprocess.run(["bash", "-e", "-c", script], cwd=workdir, env=env, capture_output=True, text=True)
+
+
+def test_slice_script_enforces_clean_checkout_then_runs_selected_files(tmp_path: Path) -> None:
+    # Execute each workflow's real slice script in a git checkout carrying the
+    # restored layout, with a recording `python` on PATH.
     for workflow in (WORKFLOW, CANDIDATE):
-        script = _step_run(workflow, "test", "Run selected files with interpreter isolation")
-        script = script.replace(
-            "python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, \"-m\", \"pytest\", \"--collect-only\", \"-q\", *os.environ[\"SELECTED_FILES\"].split(\":\")]).returncode)'",
-            "true",
-        )
-        assert "collect-only" not in script
-        out = tmp_path / f"{workflow.stem}.argv"
-        env = {**os.environ, "SELECTED_FILES": "tests/a/test_x.py:tests/b/test_y.py", "ARGV_OUT": str(out)}
-        subprocess.run(["bash", "-e", "-c", script], cwd=tmp_path, env=env, check=True)
-        assert out.read_text(encoding="utf-8").splitlines() == [
+        repo = tmp_path / workflow.stem / "checkout"
+        repo.mkdir(parents=True)
+        git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+        subprocess.run([*git[:3], "init", "-q"], check=True)
+        (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
+        subprocess.run([*git, "add", ".gitignore"], check=True)
+        subprocess.run([*git, "commit", "-qm", "base"], check=True)
+        for relative in (".venv/bin/activate", "ci-fast/bin/rg", "ci-fast/hermes-ci-fast-environment.tar.gz"):
+            (repo / relative).parent.mkdir(parents=True, exist_ok=True)
+            (repo / relative).write_text("", encoding="utf-8")
+        record = tmp_path / f"{workflow.stem}.record"
+        result = _run_slice_script(workflow, repo, record)
+        assert result.returncode == 0, result.stderr
+        calls = [c.strip("\n").splitlines() for c in record.read_text(encoding="utf-8").split("--\n") if c.strip()]
+        assert calls[-1] == [
+            "scripts/run_tests_parallel.py",
             "-j",
             "4",
             "tests/a/test_x.py",
             "tests/b/test_y.py",
-        ]
+        ], workflow.name
+        # A stray file makes the checkout dirty: the script fails before tests.
+        (repo / "stray.py").write_text("x = 1\n", encoding="utf-8")
+        record.unlink()
+        result = _run_slice_script(workflow, repo, record)
+        assert result.returncode != 0 and "DIRTY_CHECKOUT" in result.stderr, workflow.name
+        assert not record.exists() or "run_tests_parallel.py" not in record.read_text(encoding="utf-8")
     help_text = subprocess.run(
         [sys.executable, str(ROOT / "scripts/run_tests_parallel.py"), "--help"],
         capture_output=True,
@@ -261,6 +288,8 @@ def test_selected_files_reach_the_parallel_runner_as_positional_paths(tmp_path: 
         check=True,
     ).stdout
     assert "PATH" in help_text and "--files" not in help_text
+    tests_yml = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    assert "python scripts/run_tests_parallel.py --slice" in tests_yml
 
 
 def test_e2e_proof_selects_the_repository_e2e_suite() -> None:

@@ -140,6 +140,8 @@ GIT_ALLOWED_OPTIONS = {
     },
     "ls-files": {"-z"},
     "rev-parse": {"--verify", "-q", "--quiet"},
+    # The exact read-only cleanliness query the receipt validator uses.
+    "status": {"--porcelain=v1", "--untracked-files=all"},
 }
 GIT_GLOBAL_WITH_VALUE = {"-C"}
 # git reached indirectly, where the verb cannot be checked statically.
@@ -582,6 +584,8 @@ _TAINTED_FETCH = {
         '"$(command -v git)" show "$HEAD":x.sh | sh',
         'G=git; $G show "$HEAD":x.sh | sh',
         'git -c core.hooksPath=h fetch origin "$HEAD"',
+        "git status --short --ignore-submodules=none",
+        "git status --porcelain=v1 --untracked-files=all --find-renames",
     ],
 )
 def test_detector_flags_non_plumbing_git_in_pr_ref_jobs(script: str) -> None:
