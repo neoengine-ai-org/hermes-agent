@@ -32,17 +32,12 @@ WORKFLOW_DIR = ROOT / ".github/workflows"
 def _tracked_action_manifests() -> list[Path]:
     # Enumerate tracked files rather than pruning by directory name: a local
     # `uses: ./node_modules/x` is just as executable as `./.github/actions/x`.
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*action.yml", "*action.yaml"],
-            check=True,
-            capture_output=True,
-        ).stdout.decode()
-    except (OSError, subprocess.CalledProcessError):
-        return sorted(
-            p for pattern in ("action.yml", "action.yaml") for p in ROOT.rglob(pattern)
-            if ".git" not in p.relative_to(ROOT).parts
-        )
+    # No fallback: if trackedness cannot be established, collection fails.
+    out = subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "-z", "--", "*action.yml", "*action.yaml"],
+        check=True,
+        capture_output=True,
+    ).stdout.decode()
     return sorted(ROOT / rel for rel in out.split("\0") if Path(rel).name in {"action.yml", "action.yaml"})
 
 
@@ -61,6 +56,7 @@ class UsesRef(NamedTuple):
     line: int  # 1-based
     ref: str
     comment: str
+    kind: str  # "step" (action) or "job" (reusable workflow call)
 
     def where(self) -> str:
         return f"{self.path.relative_to(ROOT)}:{self.line}: {self.ref}"
@@ -80,7 +76,7 @@ def _collect_uses(path: Path, text: str | None = None) -> tuple[list[UsesRef], l
     errors: list[str] = []
     seen: set[int] = set()
 
-    def record(value: yaml.Node, trail: tuple[str, ...]) -> None:
+    def record(value: yaml.Node, trail: tuple[str, ...], kind: str) -> None:
         if id(value) in seen:  # anchors/aliases share one node
             return
         seen.add(id(value))
@@ -90,19 +86,17 @@ def _collect_uses(path: Path, text: str | None = None) -> tuple[list[UsesRef], l
         line = lines[value.end_mark.line] if value.end_mark.line < len(lines) else ""
         # Drop flow-collection closers so `- {uses: x@sha}  # v1` keeps its comment.
         comment = re.sub(r"^[\s}\]]*", "", line[value.end_mark.column :])
-        refs.append(UsesRef(path, value.start_mark.line + 1, value.value, comment))
+        refs.append(UsesRef(path, value.start_mark.line + 1, value.value, comment, kind))
 
     def walk(node: yaml.Node, trail: tuple[str, ...]) -> None:
         if isinstance(node, yaml.MappingNode):
             for key_node, value in node.value:
                 key = _key(key_node)
                 if key == "uses":
-                    recognised = (
-                        (len(trail) == 2 and trail[0] == "jobs")  # reusable workflow call
-                        or (len(trail) >= 2 and trail[-1] == "[]" and trail[-2] == "steps")
-                    )
-                    if recognised:
-                        record(value, trail)
+                    if len(trail) == 2 and trail[0] == "jobs":  # reusable workflow call
+                        record(value, trail, "job")
+                    elif len(trail) >= 2 and trail[-1] == "[]" and trail[-2] == "steps":
+                        record(value, trail, "step")
                     else:
                         errors.append(
                             f"{path.relative_to(ROOT)}:{key_node.start_mark.line + 1}: "
@@ -177,14 +171,18 @@ def test_every_remote_action_is_sha_pinned(path: Path) -> None:
 
 
 def _local_target_errors(refs: list[UsesRef]) -> list[str]:
-    scanned = {path.parent.resolve() for path in COMPOSITE_ACTIONS}
+    # Normalise first, then check by structural kind: a step must land on a
+    # scanned tracked manifest directory, a job call on a scanned workflow file.
+    scanned_actions = {path.parent.resolve() for path in COMPOSITE_ACTIONS}
+    scanned_workflows = {path.resolve() for path in WORKFLOWS}
     errors = []
     for ref in refs:
-        if not ref.ref.startswith("./") or ref.ref.startswith("./.github/workflows/"):
-            continue  # remote refs are pattern-checked; local reusable workflows are scanned as WORKFLOWS
+        if not ref.ref.startswith("./"):
+            continue  # remote refs are pattern-checked
         target = (ROOT / ref.ref).resolve()
-        if target not in scanned:
-            errors.append(f"{ref.where()} (local action is not a scanned tracked action.yml)")
+        allowed = scanned_workflows if ref.kind == "job" else scanned_actions
+        if target not in allowed:
+            errors.append(f"{ref.where()} (local {ref.kind} target is not a scanned tracked file)")
     return errors
 
 
@@ -198,10 +196,22 @@ def test_local_actions_resolve_to_scanned_manifests(path: Path) -> None:
 def test_local_target_outside_scan_is_rejected() -> None:
     refs, _ = _collect_uses(
         ROOT / "synthetic.yml",
-        "jobs:\n  j:\n    steps:\n      - uses: ./node_modules/bridge\n      - uses: ./.github/actions/nix-setup\n",
+        "jobs:\n"
+        "  j:\n"
+        "    steps:\n"
+        "      - uses: ./node_modules/bridge\n"
+        "      - uses: ./.github/workflows/../../node_modules/bridge\n"
+        "      - uses: ./.github/workflows/tests.yml\n"  # a workflow is not a step action
+        "      - uses: ./.github/actions/nix-setup\n"
+        "      - uses: ./.github/actions/nix-setup/\n"
+        "  k:\n"
+        "    uses: ./.github/workflows/../../node_modules/bridge\n"
+        "  ok:\n"
+        "    uses: ./.github/workflows/tests.yml\n",
     )
     errors = _local_target_errors(refs)
-    assert len(errors) == 1 and "node_modules/bridge" in errors[0]
+    assert len(errors) == 4, errors
+    assert not any("nix-setup" in e or ":12:" in e for e in errors)
 
 
 @pytest.mark.parametrize(
