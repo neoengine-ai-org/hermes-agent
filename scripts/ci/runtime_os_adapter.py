@@ -112,13 +112,6 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
 _ALWAYS_PRUNED = {"__pycache__"}
 
 
-def _raise_walk_error(error: OSError) -> None:
-    # Selection must fail closed: an unreadable or failing directory that is
-    # not pruned could hold sources or tests, so silently skipping it would
-    # narrow the proof. Pruned directories are never entered and never raise.
-    raise error
-
-
 def _is_regular_file(path: Path) -> bool:
     """``Path.is_file()`` without swallowing errors other than ENOENT.
 
@@ -135,8 +128,10 @@ def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
     """List files under ``top`` matching ``pattern``, pruning excluded dirs.
 
     Unlike ``Path.rglob``, excluded directories (virtualenvs, ``.git``,
-    ``__pycache__``) are never descended into, and any error walking a
-    non-excluded directory (including PermissionError) raises.
+    ``__pycache__``) are never descended into, and any error listing or
+    classifying an entry of a non-excluded directory (including
+    PermissionError) raises. Matching names are returned regardless of type;
+    callers filter with ``_is_regular_file``.
     """
     # Stat the root explicitly: ``Path.is_dir()`` swallows OSError (every
     # errno on 3.12+), which would turn e.g. EIO into an empty, fail-open
@@ -149,10 +144,29 @@ def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
         return []
     skip = pruned | _ALWAYS_PRUNED
     found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(top, onerror=_raise_walk_error):
-        dirnames[:] = sorted(name for name in dirnames if name not in skip)
-        base = Path(dirpath)
-        found.extend(base / name for name in filenames if fnmatch.fnmatchcase(name, pattern))
+    pending = [top]
+    while pending:
+        directory = pending.pop()
+        # Listing errors (including PermissionError) propagate: an unreadable
+        # or vanished non-pruned directory could hold sources or tests, so
+        # skipping it would silently narrow selection. ``os.walk`` is not used
+        # because it swallows ``DirEntry.is_dir()`` errors and treats the entry
+        # as a file.
+        with os.scandir(directory) as scanner:
+            entries = sorted(scanner, key=lambda entry: entry.name)
+        for entry in entries:
+            if fnmatch.fnmatchcase(entry.name, pattern):
+                found.append(directory / entry.name)
+            if entry.name in skip:
+                continue
+            try:
+                # Like 3.11 ``rglob``: recurse into real directories only,
+                # never through directory symlinks.
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except FileNotFoundError:
+                continue  # entry vanished after listing
+            if is_directory:
+                pending.append(directory / entry.name)
     return found
 
 

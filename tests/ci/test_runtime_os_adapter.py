@@ -24,13 +24,15 @@ PARITY_FIXTURES = json.loads(
 
 
 def _build_repository_reference_index() -> None:
-    """Parse the real repository once per test file, at collection time.
+    """Parse the real repository once, after collection and before any test.
 
     The whole-repo import closure must parse every source and test file
     (~36 MB of Python). ``_module_references`` is cached per process, so the
-    parse already happens once; building it here keeps that one-time cost
-    under the runner's per-file guard instead of charging it to whichever
-    test happens to run first under the 30 s per-test hang guard. Errors are
+    parse already happens once; ``tests/ci/conftest.py`` builds it from
+    ``pytest_collection_finish`` (only when tests from this module are
+    selected, never for ``--collect-only``) so that one-time cost sits under
+    the runner's per-file guard instead of being charged to whichever test
+    runs first under the 30 s per-test hang guard. Errors are
     not cached, so files that fail to read/parse are re-raised to
     ``select_tests`` exactly as before.
     """
@@ -40,8 +42,6 @@ def _build_repository_reference_index() -> None:
         except (OSError, SyntaxError, UnicodeError):
             pass
 
-
-_build_repository_reference_index()
 
 
 def test_policy_lock_verifies_canonical_identity() -> None:
@@ -328,6 +328,67 @@ def test_discovery_fails_closed_when_a_file_stat_errors(tmp_path, monkeypatch, e
         adapter.discover_python_sources()
     with pytest.raises(OSError):
         adapter.discover_tests()
+
+
+class _FailingDirEntry:
+    def __init__(self, entry, error):
+        self._entry = entry
+        self._error = error
+        self.name = entry.name
+        self.path = entry.path
+
+    def is_dir(self, *, follow_symlinks=True):
+        raise OSError(self._error, os.strerror(self._error), self.path)
+
+
+class _ScannerWithFailingEntry:
+    def __init__(self, scanner, name, error):
+        self._scanner = scanner
+        self._name = name
+        self._error = error
+
+    def __enter__(self):
+        self._scanner.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._scanner.__exit__(*exc)
+
+    def __iter__(self):
+        for entry in self._scanner:
+            yield _FailingDirEntry(entry, self._error) if entry.name == self._name else entry
+
+
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
+def test_discovery_fails_closed_when_entry_classification_errors(
+    tmp_path, monkeypatch, error
+) -> None:
+    # os.walk swallows DirEntry.is_dir() errors and treats the entry as a
+    # file, which silently dropped the whole subtree from selection.
+    _write_tree(tmp_path, ["agent/core.py", "gateway/run.py", "tests/unit/test_run.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+    cases = (("gateway", adapter.discover_python_sources), ("unit", adapter.discover_tests))
+    for name, discover in cases:
+
+        def failing_scandir(path=".", *args, _name=name, **kwargs):
+            return _ScannerWithFailingEntry(real_scandir(path, *args, **kwargs), _name, error)
+
+        monkeypatch.setattr(os, "scandir", failing_scandir)
+        with pytest.raises(OSError):
+            discover()
+
+
+def test_discovery_does_not_follow_directory_symlinks(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "elsewhere/linked.py"])
+    (tmp_path / "agent/linked_dir").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
+    (tmp_path / "agent/linked_file.py").symlink_to(tmp_path / "agent/core.py")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    assert adapter.discover_python_sources() == [
+        "agent/core.py",
+        "agent/linked_file.py",
+        "elsewhere/linked.py",
+    ]
 
 
 def test_discovery_skips_files_that_vanish_or_dangle(tmp_path, monkeypatch) -> None:
