@@ -40,6 +40,7 @@ jobs:
       review_classification: ${{ steps.plan.outputs.review_classification }}
       run_e2e: ${{ steps.plan.outputs.run_e2e }}
       has_tests: ${{ steps.plan.outputs.has_tests }}
+      candidate_definition_changed: ${{ steps.plan.outputs.candidate_definition_changed }}
       telemetry_write_allowed: ${{ steps.plan.outputs.telemetry_write_allowed }}
       environment_digest: ${{ steps.environment.outputs.environment_digest }}
       duration_cache_key: ${{ steps.environment.outputs.duration_cache_key }}
@@ -47,6 +48,9 @@ jobs:
       - name: Reject untrusted fork execution
         if: github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository
         run: exit 1
+
+      - name: Discard residue from earlier jobs on this shared runner
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 
       - name: Checkout trusted base policy
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -56,10 +60,10 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}
           path: .runtime-os-trusted
 
-      # Pull-request head code never runs, or is checked out, in this privileged
-      # workflow. PR events read the head only as inert git objects for change
-      # selection; PR-head execution lives in ci-runtime-os-candidate.yml
-      # (`pull_request`, read-only token, no secrets).
+      # Under pull_request_target this workflow runs base code only: PR-head
+      # code is never checked out or executed here. The head is read as inert
+      # git objects for change selection; PR-head execution lives in the
+      # unprivileged ci-runtime-os-candidate.yml (`pull_request` context).
       - name: Checkout trusted non-PR candidate
         if: ${{ !contains(fromJSON('["pull_request_target","pull_request_review"]'), github.event_name) }}
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -136,6 +140,13 @@ jobs:
               exit 2
             fi
             git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+            # The candidate run executes its workflow definition from the PR
+            # merge ref; it is only base-defined while the PR leaves it alone.
+            if grep -qxF .github/workflows/ci-runtime-os-candidate.yml changed-files.txt; then
+              echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "candidate_definition_changed=false" >> "$GITHUB_OUTPUT"
+            fi
           else
             export RUNTIME_OS_CANDIDATE_ROOT="$GITHUB_WORKSPACE/candidate"
             git -C candidate ls-files > changed-files.txt
@@ -346,12 +357,22 @@ jobs:
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_PR: ${{ github.event.pull_request.number }}
+          DEFINITION_CHANGED: ${{ needs.preflight.outputs.candidate_definition_changed }}
           CANDIDATE_WORKFLOW: ci-runtime-os-candidate.yml
           DISCOVERY_MINUTES: "20"
           WAIT_MINUTES: "150"
         with:
           script: |
+            if (process.env.DEFINITION_CHANGED !== 'false') {
+              core.setFailed(
+                'This PR changes ci-runtime-os-candidate.yml, so its candidate proof would be ' +
+                  'self-defined; the advisory proof stays red until the definition lands on base',
+              );
+              return;
+            }
             const head = process.env.EXPECTED_HEAD;
+            const prNumber = Number(process.env.EXPECTED_PR);
             const repository = `${context.repo.owner}/${context.repo.repo}`;
             const started = Date.now();
             const discoveryDeadline = started + Number(process.env.DISCOVERY_MINUTES) * 60 * 1000;
@@ -371,7 +392,8 @@ jobs:
                   run.head_sha === head &&
                   run.event === 'pull_request' &&
                   run.head_repository &&
-                  run.head_repository.full_name === repository,
+                  run.head_repository.full_name === repository &&
+                  (run.pull_requests || []).some((pull) => pull.number === prNumber),
               );
               const latest = bound.sort((a, b) => b.id - a.id)[0];
               if (latest && latest.status === 'completed') {
@@ -434,6 +456,9 @@ jobs:
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 5
     steps:
+      - name: Discard residue from earlier jobs on this shared runner
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+
       - name: Checkout trusted review validator
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:

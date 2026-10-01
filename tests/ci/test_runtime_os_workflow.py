@@ -97,6 +97,14 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
     assert "run.head_sha === head" in script
     assert "run.head_repository.full_name === repository" in script
     assert "latest.conclusion === 'success'" in script
+    assert "(run.pull_requests || []).some((pull) => pull.number === prNumber)" in script
+    assert "process.env.DEFINITION_CHANGED !== 'false'" in script
+    assert "grep -qxF .github/workflows/ci-runtime-os-candidate.yml changed-files.txt" in text
+    for job_id in ("preflight", "review-evidence"):
+        first_runs = [s.get("run", "") for s in jobs[job_id]["steps"] if "run" in s]
+        assert 'find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1' in first_runs[
+            0 if job_id == "review-evidence" else 1
+        ]
     assert waiter["steps"][0]["env"]["CANDIDATE_WORKFLOW"] == CANDIDATE.name
     aggregate = jobs["hermes-required"]["steps"][0]["run"]
     assert 'test "$CANDIDATE" = success' in aggregate

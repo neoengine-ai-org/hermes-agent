@@ -1,12 +1,14 @@
 name: CI Runtime OS candidate proof
 
-# Unprivileged half of the Runtime OS advisory. This is the only place where
-# pull-request head code is checked out and executed: `pull_request` context,
-# read-only token, no secrets, PR-scoped cache writes. The privileged
-# `pull_request_target` workflow (ci-runtime-os-advisory.yml) runs base code
-# only and binds `Hermes CI required` to this run's exact-head conclusion.
-# A writer can edit this file on their branch, so its result is test evidence
-# about the candidate, never policy, review, or admission authority.
+# Unprivileged half of the Runtime OS advisory: the only place PR-head code is
+# checked out and executed. It runs in `pull_request` context, never base
+# context, so it cannot write base-scoped caches or inherit the privileged
+# `pull_request_target` token. As defined here it requests `contents: read`
+# and references no secrets, but GitHub loads this file from the PR merge ref:
+# a repository writer can edit it, exactly as they can already run any
+# workflow from a pushed branch. The privileged ci-runtime-os-advisory.yml
+# therefore refuses proof from a PR that modifies this file, and treats the
+# result as test evidence only, never policy, review, or admission authority.
 
 on:
   pull_request:
