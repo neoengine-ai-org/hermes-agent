@@ -265,7 +265,9 @@ jobs:
         run: |
           source .venv/bin/activate
           python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
-          scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"
+          # run_tests_parallel.py takes the selected files as positional paths.
+          IFS=: read -r -a selected <<< "$SELECTED_FILES"
+          scripts/run_tests.sh -j 4 "${selected[@]}"
 
       - name: Upload protected-main duration sample
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'

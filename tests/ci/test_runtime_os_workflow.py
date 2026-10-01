@@ -1,3 +1,6 @@
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -30,7 +33,8 @@ def test_runtime_os_workflow_has_stable_advisory_contexts_and_qwen_runner() -> N
 def test_runtime_os_workflow_preserves_pins_and_per_file_isolation() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     assert "astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39" in text
-    assert 'scripts/run_tests.sh -j 4 --files "$SELECTED_FILES"' in text
+    assert 'scripts/run_tests.sh -j 4 "${selected[@]}"' in text
+    assert "--files" not in text
     assert "SELECTED_FILES: ${{ matrix.files }}" in text
     assert "--files '${{ matrix.files }}'" not in text
     assert "persist-credentials: false" in text
@@ -184,3 +188,99 @@ def test_restored_environment_keeps_receipt_checkout_clean_and_e2e_runnable() ->
         # deselected by addopts, so pytest exits 5; mirror tests.yml's e2e lane.
         assert "tests/integration" not in run, path.name
         assert "python -m pytest tests/e2e/ -v --tb=short" in run, path.name
+
+
+
+def _step_run(path: Path, job_id: str, name: str) -> str:
+    return next(s for s in _jobs(path)[job_id]["steps"] if s.get("name") == name)["run"]
+
+
+def test_restored_environment_layout_passes_the_receipt_cleanliness_check(tmp_path: Path) -> None:
+    # Behavioural: reproduce the exact restored layout inside a clean checkout
+    # and run the validator's own cleanliness query against it.
+    repo = tmp_path / "checkout"
+    repo.mkdir()
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    subprocess.run([*git[:3], "init", "-q"], check=True)
+    (repo / ".gitignore").write_text((ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8")
+    subprocess.run([*git, "add", ".gitignore"], check=True)
+    subprocess.run([*git, "commit", "-qm", "base"], check=True)
+    for relative in (
+        "ci-fast/hermes-ci-fast-environment.tar.gz",
+        "ci-fast/bin/rg",
+        "ci-fast/bin/.python/cpython-3.11.15-linux-x86_64-gnu/bin/python3.11",
+        ".venv/bin/python",
+        ".venv/pyvenv.cfg",
+    ):
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("restored", encoding="utf-8")
+    status = ["git", "-C", str(repo), "status", "--porcelain=v1", "--untracked-files=all"]
+    assert subprocess.run(status, capture_output=True, text=True, check=True).stdout == ""
+    # The invariant is not globally disabled: an unrelated stray file is dirty.
+    (repo / "stray.py").write_text("x = 1\n", encoding="utf-8")
+    assert "stray.py" in subprocess.run(status, capture_output=True, text=True, check=True).stdout
+    validator = (ROOT / "scripts/validate_hermes_bootstrap_closure.py").read_text(encoding="utf-8")
+    assert '"status", "--porcelain=v1", "--untracked-files=all"' in validator
+    for workflow in (WORKFLOW, CANDIDATE):
+        restore = _step_run(workflow, "test", "Restore immutable environment")
+        assert "tar -xzf ci-fast/hermes-ci-fast-environment.tar.gz" in restore
+        build = _step_run(workflow, "environment", "Build locked environment with one infra-only retry")
+        assert "tar -czf ci-fast/hermes-ci-fast-environment.tar.gz .venv ci-fast/bin" in build
+
+
+def test_selected_files_reach_the_parallel_runner_as_positional_paths(tmp_path: Path) -> None:
+    # Execute the workflow's real run script with a recording run_tests.sh and
+    # check the argv, then check run_tests_parallel.py accepts that shape.
+    recorder = tmp_path / "scripts/run_tests.sh"
+    recorder.parent.mkdir(parents=True)
+    recorder.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n', encoding="utf-8")
+    recorder.chmod(0o755)
+    (tmp_path / ".venv/bin").mkdir(parents=True)
+    (tmp_path / ".venv/bin/activate").write_text("", encoding="utf-8")
+    for workflow in (WORKFLOW, CANDIDATE):
+        script = _step_run(workflow, "test", "Run selected files with interpreter isolation")
+        script = script.replace(
+            "python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, \"-m\", \"pytest\", \"--collect-only\", \"-q\", *os.environ[\"SELECTED_FILES\"].split(\":\")]).returncode)'",
+            "true",
+        )
+        assert "collect-only" not in script
+        out = tmp_path / f"{workflow.stem}.argv"
+        env = {**os.environ, "SELECTED_FILES": "tests/a/test_x.py:tests/b/test_y.py", "ARGV_OUT": str(out)}
+        subprocess.run(["bash", "-e", "-c", script], cwd=tmp_path, env=env, check=True)
+        assert out.read_text(encoding="utf-8").splitlines() == [
+            "-j",
+            "4",
+            "tests/a/test_x.py",
+            "tests/b/test_y.py",
+        ]
+    help_text = subprocess.run(
+        [sys.executable, str(ROOT / "scripts/run_tests_parallel.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    assert "PATH" in help_text and "--files" not in help_text
+
+
+def test_e2e_proof_selects_the_repository_e2e_suite() -> None:
+    # tests.yml's required e2e lane runs exactly `pytest tests/e2e/`; the
+    # proof must select a non-empty set from it under the repo's addopts
+    # (integration-marked external-service tests stay deselected).
+    for workflow in (WORKFLOW, CANDIDATE):
+        run = _step_run(workflow, "e2e", "Run full e2e proof")
+        assert [line.strip() for line in run.strip().splitlines()] == [
+            "source .venv/bin/activate",
+            "python -m pytest tests/e2e/ -v --tb=short",
+        ]
+    tests_yml = (ROOT / ".github/workflows/tests.yml").read_text(encoding="utf-8")
+    assert "python -m pytest tests/e2e/ -v --tb=short" in tests_yml
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "tests/e2e/"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert collected.returncode == 0, collected.stdout + collected.stderr
+    assert "no tests collected" not in collected.stdout
+    assert sum("::" in line for line in collected.stdout.splitlines()) > 0
