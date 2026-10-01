@@ -40,9 +40,7 @@ EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
 CONTEXT_PATH = re.compile(
     r"\b(?:github|env|steps|needs|inputs|vars|matrix|job|runner|strategy|secrets)\.[\w.*-]+"
 )
-GIT_CALL = re.compile(
-    r"(?<![\w./-])git(?:\s+(?:-C|-c)\s+\S+|\s+--no-pager)*\s+([a-z][\w-]*)([^\n;&|)]*)"
-)
+SHELL_SEPARATOR = re.compile(r"[;&|()\n`]|\$\(")
 GH_CHECKOUT = re.compile(r"(?<![\w./-])gh\s+pr\s+(?:checkout|diff)\b")
 SHELL_COMMENT = re.compile(r"(?m)(?:^|(?<=\s))#.*$")
 NETWORK_TOOL = re.compile(r"(?<![\w./-])(?:curl|wget|gh\s+api)\b")
@@ -111,79 +109,187 @@ def _untrusted_checkout_value(value: Any) -> bool:
     return False
 
 
-def _git_call_allowed(verb: str, args: str) -> bool:
-    words = args.split()
-    if verb in {"fetch", "ls-files", "rev-parse"}:
-        return True
-    if verb == "cat-file":
-        return bool(words) and words[0] == "-e"
-    if verb == "diff":
-        return "--name-only" in words or "--name-status" in words
-    return False
+# Inert git plumbing a job that reads PR refs may run, with the exact options
+# each verb may take. Anything else (other verbs, other options such as
+# --patch, --upload-pack, --filters, or global --work-tree/--git-dir) fails.
+GIT_ALLOWED_OPTIONS = {
+    "fetch": {"--no-tags", "--no-recurse-submodules", "--quiet", "-q", "--prune"},
+    "cat-file": {"-e"},
+    "diff": {
+        "--no-ext-diff",
+        "--no-textconv",
+        "--name-only",
+        "--name-status",
+        "--no-renames",
+        "-z",
+    },
+    "ls-files": {"-z"},
+    "rev-parse": {"--verify", "-q", "--quiet"},
+}
+GIT_GLOBAL_WITH_VALUE = {"-C", "-c"}
 
 
-def pull_request_target_violations(workflow: dict[Any, Any], label: str) -> list[str]:
+def _git_violations(script: str) -> list[str]:
+    """Return disallowed git invocations, parsed token by token per command."""
+    problems: list[str] = []
+    for command in SHELL_SEPARATOR.split(script):
+        tokens = [token.strip("\"'") for token in command.split()]
+        for start, token in enumerate(tokens):
+            if token not in {"git", "command"} or (
+                token == "command" and tokens[start + 1 : start + 2] != ["git"]
+            ):
+                continue
+            index = start + 1 if token == "git" else start + 2
+            while index < len(tokens) and tokens[index].startswith("-"):
+                if tokens[index] in GIT_GLOBAL_WITH_VALUE:
+                    index += 2
+                elif tokens[index] == "--no-pager":
+                    index += 1
+                else:
+                    problems.append(f"git global option {tokens[index]}")
+                    index = len(tokens)
+            if index >= len(tokens):
+                break
+            verb, args = tokens[index], tokens[index + 1 :]
+            allowed = GIT_ALLOWED_OPTIONS.get(verb)
+            if allowed is None:
+                problems.append(f"git {verb}")
+            elif any(arg.startswith("-") and arg not in allowed for arg in args):
+                problems.append(f"git {verb} {' '.join(args)}")
+            elif verb == "cat-file" and "-e" not in args:
+                problems.append(f"git cat-file {' '.join(args)}")
+            elif verb == "diff" and not {"--name-only", "--name-status"} & set(args):
+                problems.append(f"git diff {' '.join(args)}")
+            break
+    return problems
+
+
+def _local_path(root: Path | None, uses: str) -> Path | None:
+    if root is None or not uses.startswith("./"):
+        return None
+    return root / uses.removeprefix("./").split("@", 1)[0]
+
+
+def _job_violations(
+    workflow: dict[Any, Any],
+    job: dict[Any, Any],
+    where: str,
+    root: Path | None,
+    seen: set[str],
+) -> list[str]:
+    violations: list[str] = []
+    job_tainted = _tainted_env(workflow, job)
+    uses = str(job.get("uses") or "")
+    if uses:
+        if _names_pr_ref(job.get("with") or {}, job_tainted):
+            violations.append(
+                f"{where} passes a PR-head ref to reusable workflow {uses}"
+            )
+        callee_path = _local_path(root, uses)
+        if callee_path is None:
+            # A remote reusable workflow runs in this privileged context but
+            # cannot be inspected here, so it fails closed.
+            violations.append(f"{where} calls uninspectable reusable workflow {uses}")
+        elif str(callee_path) not in seen:
+            seen.add(str(callee_path))
+            callee = _load(callee_path) if callee_path.is_file() else {}
+            if not callee:
+                violations.append(f"{where} calls missing reusable workflow {uses}")
+            for callee_id, callee_job in (callee.get("jobs") or {}).items():
+                if isinstance(callee_job, dict):
+                    violations.extend(
+                        _job_violations(
+                            callee,
+                            callee_job,
+                            f"{where}->{uses}:{callee_id}",
+                            root,
+                            seen,
+                        )
+                    )
+        return violations
+    steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
+    # Composite actions run their steps inside this job; inline local ones.
+    expanded: list[tuple[str, dict[str, Any]]] = []
+    for index, step in enumerate(steps):
+        label = (
+            f"{where}:step[{index}] {step.get('name', step.get('uses', ''))}".rstrip()
+        )
+        expanded.append((label, step))
+        action_dir = _local_path(root, str(step.get("uses") or ""))
+        if action_dir is not None and str(action_dir) not in seen:
+            seen.add(str(action_dir))
+            manifest = next(
+                (
+                    action_dir / name
+                    for name in ("action.yml", "action.yaml")
+                    if (action_dir / name).is_file()
+                ),
+                None,
+            )
+            if manifest is None:
+                violations.append(f"{label} uses missing local action {step['uses']}")
+                continue
+            runs = (_load(manifest).get("runs") or {}) if manifest else {}
+            if runs.get("using") != "composite":
+                violations.append(
+                    f"{label} uses non-composite local action {step['uses']}"
+                )
+            for inner_index, inner in enumerate(runs.get("steps") or []):
+                if isinstance(inner, dict):
+                    expanded.append((f"{label}->step[{inner_index}]", inner))
+    tainted = job_tainted | _tainted_env(*(step for _, step in expanded))
+    # Job-wide: one step can fetch the head and a later step can use
+    # FETCH_HEAD or a ref recorded on disk without naming it again.
+    reads_pr_refs = bool(tainted) or any(
+        FORBIDDEN_REF.search(str(step.get("run") or "")) for _, step in expanded
+    )
+    for label, step in expanded:
+        step_uses = str(step.get("uses") or "")
+        for field, value in (step.get("with") or {}).items():
+            if _names_pr_ref(value, tainted):
+                violations.append(f"{label} passes {field}={value!r} to {step_uses}")
+        if step_uses.startswith("actions/checkout"):
+            for field in ("ref", "repository"):
+                if field in (step.get("with") or {}) and _untrusted_checkout_value(
+                    step["with"][field]
+                ):
+                    violations.append(
+                        f"{label} checks out untrusted {field}={step['with'][field]!r}"
+                    )
+        script = SHELL_COMMENT.sub("", str(step.get("run") or "").replace("\\\n", " "))
+        if not script:
+            continue
+        if GH_CHECKOUT.search(script):
+            violations.append(f"{label} runs gh pr checkout/diff")
+        if not reads_pr_refs:
+            continue
+        for problem in _git_violations(script):
+            violations.append(f"{label} runs `{problem}` in a job that reads PR refs")
+        for line in script.splitlines():
+            if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
+                violations.append(f"{label} downloads PR-head content: {line.strip()}")
+    return violations
+
+
+def pull_request_target_violations(
+    workflow: dict[Any, Any], label: str, root: Path | None = ROOT
+) -> list[str]:
     """Return every place a pull_request_target workflow may materialize PR-head code.
 
     Fail-closed allowlists rather than a deny-list: checkouts may only name
-    trusted contexts, and a job that reads PR refs may only run inert git
-    plumbing (fetch, cat-file -e, diff --name-only/--name-status, ls-files,
-    rev-parse). This is a regression guard, not a proof of shell semantics.
+    trusted contexts, a job that reads PR refs may only run inert git plumbing
+    with allowlisted options, and local reusable workflows and composite
+    actions are scanned transitively (remote reusable workflows fail closed).
+    This is a regression guard, not a proof of shell semantics.
     """
     if "pull_request_target" not in _triggers(workflow):
         return []
     violations: list[str] = []
     for job_id, job in (workflow.get("jobs") or {}).items():
-        if not isinstance(job, dict):
-            continue
-        where = f"{label}:{job_id}"
-        job_tainted = _tainted_env(workflow, job)
-        if job.get("uses") and _names_pr_ref(job.get("with") or {}, job_tainted):
-            violations.append(
-                f"{where} passes a PR-head ref to reusable workflow {job['uses']}"
+        if isinstance(job, dict):
+            violations.extend(
+                _job_violations(workflow, job, f"{label}:{job_id}", root, set())
             )
-        steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
-        tainted = job_tainted | _tainted_env(*steps)
-        # Job-wide: one step can fetch the head and a later step can use
-        # FETCH_HEAD or a ref recorded on disk without naming it again.
-        reads_pr_refs = bool(tainted) or any(
-            FORBIDDEN_REF.search(str(step.get("run") or "")) for step in steps
-        )
-        for index, step in enumerate(steps):
-            step_where = f"{where}:step[{index}] {step.get('name', step.get('uses', ''))}".rstrip()
-            uses = str(step.get("uses") or "")
-            for field, value in (step.get("with") or {}).items():
-                if _names_pr_ref(value, tainted):
-                    violations.append(
-                        f"{step_where} passes {field}={value!r} to {uses}"
-                    )
-            if uses.startswith("actions/checkout"):
-                for field in ("ref", "repository"):
-                    if field in (step.get("with") or {}) and _untrusted_checkout_value(
-                        step["with"][field]
-                    ):
-                        violations.append(
-                            f"{step_where} checks out untrusted {field}={step['with'][field]!r}"
-                        )
-            script = SHELL_COMMENT.sub(
-                "", str(step.get("run") or "").replace("\\\n", " ")
-            )
-            if not script:
-                continue
-            if GH_CHECKOUT.search(script):
-                violations.append(f"{step_where} runs gh pr checkout/diff")
-            if not reads_pr_refs:
-                continue
-            for verb, args in GIT_CALL.findall(script):
-                if not _git_call_allowed(verb, args):
-                    violations.append(
-                        f"{step_where} runs `git {verb}` in a job that reads PR refs"
-                    )
-            for line in script.splitlines():
-                if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
-                    violations.append(
-                        f"{step_where} downloads PR-head content: {line.strip()}"
-                    )
     return violations
 
 
@@ -411,3 +517,66 @@ def test_detector_flags_pull_request_head_materialization(
 )
 def test_detector_allows_base_code_and_pr_data(workflow: dict[Any, Any]) -> None:
     assert pull_request_target_violations(workflow, "synthetic") == []
+
+
+_TAINTED_FETCH = {
+    "env": {"HEAD": "${{ github.event.pull_request.head.sha }}"},
+    "run": 'git fetch --no-tags origin "$HEAD"',
+}
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        # Round-3 adversarial and secondary-review bypasses.
+        'git diff --name-only --patch "$BASE" "$HEAD" | sed -n \'s/^+//p\' | sh',
+        'git --work-tree=w checkout "$HEAD" -- .',
+        'git --git-dir=.git show "$HEAD":x.sh | sh',
+        "git fetch --upload-pack='sh -c id' origin \"$HEAD\"",
+        'git cat-file -p "$HEAD":run.sh | sh',
+        'out=$(git diff "$BASE" "$HEAD") && echo "$out" | sh',
+        'command git checkout "$HEAD"',
+    ],
+)
+def test_detector_flags_non_plumbing_git_in_pr_ref_jobs(script: str) -> None:
+    workflow = _prt([_TAINTED_FETCH, {"run": script}])
+    assert pull_request_target_violations(workflow, "synthetic", root=None)
+
+
+def test_detector_scans_local_reusable_workflows_and_composite_actions(
+    tmp_path: Path,
+) -> None:
+    workflows = tmp_path / ".github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "materialize.yml").write_text(
+        "on: workflow_call\n"
+        "jobs:\n"
+        "  run:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v6\n"
+        "        with:\n"
+        "          ref: ${{ github.event.pull_request.head.sha }}\n",
+        encoding="utf-8",
+    )
+    action = tmp_path / ".github/actions/pr"
+    action.mkdir(parents=True)
+    (action / "action.yml").write_text(
+        "runs:\n"
+        "  using: composite\n"
+        "  steps:\n"
+        "    - shell: bash\n"
+        "      run: git checkout ${{ github.event.pull_request.head.sha }}\n",
+        encoding="utf-8",
+    )
+    reusable = {
+        True: {"pull_request_target": {}},
+        "jobs": {"j": {"uses": "./.github/workflows/materialize.yml"}},
+    }
+    composite = _prt([{"uses": "./.github/actions/pr"}])
+    remote = {
+        True: {"pull_request_target": {}},
+        "jobs": {"j": {"uses": "org/repo/.github/workflows/x.yml@v1"}},
+    }
+    for workflow in (reusable, composite, remote):
+        assert pull_request_target_violations(workflow, "synthetic", root=tmp_path)

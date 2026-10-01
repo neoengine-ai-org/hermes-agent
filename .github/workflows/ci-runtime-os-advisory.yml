@@ -396,10 +396,17 @@ jobs:
                   run.event === 'pull_request' &&
                   run.head_repository &&
                   run.head_repository.full_name === repository &&
-                  (run.pull_requests || []).some((pull) => pull.number === prNumber),
+                  // Exactly this PR: a run shared with another PR could carry
+                  // that PR's (possibly modified) candidate definition.
+                  (run.pull_requests || []).length === 1 &&
+                  run.pull_requests[0].number === prNumber,
               );
               const latest = bound.sort((a, b) => b.id - a.id)[0];
-              if (latest && latest.status === 'completed') {
+              const now = Date.now();
+              // A superseded run is cancelled before its replacement is listed.
+              const settling =
+                latest && latest.conclusion === 'cancelled' && now <= discoveryDeadline;
+              if (latest && latest.status === 'completed' && !settling) {
                 if (latest.conclusion === 'success') {
                   core.info(`Candidate proof ${latest.html_url} attempt ${latest.run_attempt} succeeded for ${head}`);
                   return;
@@ -410,7 +417,6 @@ jobs:
                 );
                 return;
               }
-              const now = Date.now();
               if (!latest && now > discoveryDeadline) {
                 core.setFailed(`No same-repository candidate proof run exists for ${head} on base ${process.env.EXPECTED_BASE}`);
                 return;

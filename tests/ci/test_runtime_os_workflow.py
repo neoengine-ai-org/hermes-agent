@@ -97,7 +97,9 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
     assert "run.head_sha === head" in script
     assert "run.head_repository.full_name === repository" in script
     assert "latest.conclusion === 'success'" in script
-    assert "(run.pull_requests || []).some((pull) => pull.number === prNumber)" in script
+    assert "(run.pull_requests || []).length === 1" in script
+    assert "run.pull_requests[0].number === prNumber" in script
+    assert "latest.conclusion === 'cancelled' && now <= discoveryDeadline" in script
     assert "process.env.DEFINITION_CHANGED !== 'false'" in script
     assert "run.display_title === expectedTitle" in script
     assert "Runtime OS candidate ${head} on ${process.env.EXPECTED_BASE}" in script
@@ -130,14 +132,27 @@ def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
     assert "runtime-os-duration-${{" not in text
     trusted, candidate = _jobs(WORKFLOW), _jobs(CANDIDATE)
     assert candidate["plan"]["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
+    def as_candidate(value: object) -> object:
+        # The trusted copy names its planner "preflight" and also gates on
+        # non-PR events; otherwise the candidate copy must match it exactly.
+        text = yaml.safe_dump(value, sort_keys=True)
+        text = text.replace(f"!contains({PR_EVENTS}, github.event_name) &&", "")
+        text = text.replace("preflight", "plan")
+        return yaml.safe_load(text)
+
     for job_id in ("environment", "test", "e2e"):
-        assert candidate[job_id]["name"] == trusted[job_id]["name"]
-        assert "permissions" not in candidate[job_id]
-        trusted_steps = [s for s in trusted[job_id]["steps"] if "protected-main" not in s.get("name", "")]
-        for theirs, ours in zip(trusted_steps, candidate[job_id]["steps"], strict=True):
-            if str(ours.get("uses", "")).startswith("actions/checkout"):
-                assert ours["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+        ours, theirs = candidate[job_id], trusted[job_id]
+        assert ours["name"] == theirs["name"]
+        assert "permissions" not in ours
+        assert ours["runs-on"] == "ubuntu-latest"
+        for key in ("needs", "timeout-minutes", "strategy"):
+            assert ours.get(key) == as_candidate(theirs.get(key)), (job_id, key)
+        trusted_if = " ".join(str(theirs["if"]).replace("${{", "").replace("}}", "").split())
+        trusted_if = trusted_if.replace(f"!contains({PR_EVENTS}, github.event_name) && ", "")
+        assert " ".join(str(ours["if"]).split()) == trusted_if.replace("preflight", "plan"), job_id
+        trusted_steps = [s for s in theirs["steps"] if "protected-main" not in s.get("name", "")]
+        for theirs_step, ours_step in zip(trusted_steps, ours["steps"], strict=True):
+            if str(ours_step.get("uses", "")).startswith("actions/checkout"):
+                assert ours_step["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
                 continue
-            assert ours.get("run") == theirs.get("run")
-            assert ours.get("uses") == theirs.get("uses")
-            assert ours.get("env") == theirs.get("env")
+            assert ours_step == as_candidate(theirs_step), (job_id, ours_step.get("name"))
