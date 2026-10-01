@@ -130,6 +130,55 @@ def _make_workdir(root, lane_id, mtime):
     return wd
 
 
+def _git_init(wd):
+    """``git init`` with auto-maintenance off for every later command.
+
+    Since git 2.47, ``git commit`` spawns ``git maintenance run --auto
+    --detach``; the daemonized child holds ``.git/objects/maintenance.lock``
+    and removes it only after ``commit`` has returned. Under load that lock
+    is still listed when the test walks the tree to age it, then vanishes
+    before ``os.utime`` reaches it (flaky FileNotFoundError on CI).
+    """
+    import subprocess as sp
+
+    sp.run(["git", "init", "-q", str(wd)], check=True)
+    for key, value in (("maintenance.auto", "false"), ("gc.auto", "0")):
+        sp.run(["git", "-C", str(wd), "config", key, value], check=True)
+
+
+def _age_tree(wd, mtime=OLD):
+    """Age ``wd`` and everything under it.
+
+    Only a ``.git`` entry may vanish between listing and ``os.utime`` (a
+    transient lock or temp file); any other missing path still fails.
+    """
+    for p in [wd, *wd.rglob("*")]:
+        try:
+            os.utime(p, (mtime, mtime))
+        except FileNotFoundError:
+            if ".git" not in p.relative_to(wd).parts:
+                raise
+
+
+def test_git_init_helper_disables_detached_auto_maintenance(tmp_path):
+    """Guard for _git_init: a commit must not spawn background maintenance
+    that could mutate .git while a test walks it."""
+    import subprocess as sp
+
+    wd = tmp_path / "repo"
+    _git_init(wd)
+    (wd / "f.txt").write_text("x")
+    git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
+    sp.run([*git, "add", "-A"], check=True)
+    trace = tmp_path / "trace2.txt"
+    sp.run(
+        [*git, "commit", "-qm", "c"],
+        check=True,
+        env={**os.environ, "GIT_TRACE2": str(trace)},
+    )
+    assert "maintenance run" not in trace.read_text()
+
+
 def test_lane_workdir_inside_grace_survives(tmp_path):
     root = tmp_path / "hermes"
     wd = _make_workdir(root, "lane-fresh", FRESH)
@@ -229,13 +278,12 @@ def test_dirty_workdir_full_content_archived(tmp_path, monkeypatch):
     root = tmp_path / "hermes"
     wd = _make_workdir(root, "lane-dirty", OLD)
     # make it a real git repo with an UNTRACKED file (diff won't carry it)
-    sp.run(["git", "init", "-q", str(wd)], check=True)
+    _git_init(wd)
     untracked = wd / "untracked-result.txt"
     untracked.write_text("the only copy of generated work")
     # age everything (incl. .git internals) past the grace window — the
     # nested newest-mtime liveness check must see a fully-dead lane
-    for p in [wd, *wd.rglob("*")]:
-        os.utime(p, (OLD, OLD))
+    _age_tree(wd)
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._process_sweep_mentions",
         lambda needles: False,
@@ -259,7 +307,7 @@ def test_unpushed_commit_counts_as_dirty_and_content_archived(
 
     root = tmp_path / "hermes"
     wd = _make_workdir(root, "lane-unpushed", OLD)
-    sp.run(["git", "init", "-q", str(wd)], check=True)
+    _git_init(wd)
     (wd / "work.py").write_text("committed but never pushed")
     sp.run(
         ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t",
@@ -272,8 +320,7 @@ def test_unpushed_commit_counts_as_dirty_and_content_archived(
         check=True,
     )
     # tree is CLEAN by porcelain status, but the commit exists on no remote
-    for p in [wd, *wd.rglob("*")]:
-        os.utime(p, (OLD, OLD))
+    _age_tree(wd)
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._process_sweep_mentions",
         lambda needles: False,
@@ -301,7 +348,7 @@ def test_detached_head_commit_counts_as_dirty_and_content_archived(
     root = tmp_path / "hermes"
     wd = _make_workdir(root, "lane-detached", OLD)
     git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
-    sp.run(["git", "init", "-q", str(wd)], check=True)
+    _git_init(wd)
     (wd / "base.txt").write_text("base")
     sp.run([*git, "add", "-A"], check=True)
     sp.run([*git, "commit", "-qm", "base"], check=True)
@@ -309,8 +356,7 @@ def test_detached_head_commit_counts_as_dirty_and_content_archived(
     (wd / "detached-work.py").write_text("committed on detached HEAD")
     sp.run([*git, "add", "-A"], check=True)
     sp.run([*git, "commit", "-qm", "detached work"], check=True)
-    for p in [wd, *wd.rglob("*")]:
-        os.utime(p, (OLD, OLD))
+    _age_tree(wd)
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._process_sweep_mentions",
         lambda needles: False,
@@ -339,14 +385,13 @@ def test_pushed_clean_clone_collected_first_pass(tmp_path, monkeypatch):
     sp.run(["git", "init", "-q", "--bare", str(remote)], check=True)
     wd = _make_workdir(root, "lane-pushed", OLD)
     git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
-    sp.run(["git", "init", "-q", str(wd)], check=True)
+    _git_init(wd)
     sp.run([*git, "remote", "add", "origin", str(remote)], check=True)
     (wd / "done.txt").write_text("pushed work")
     sp.run([*git, "add", "-A"], check=True)
     sp.run([*git, "commit", "-qm", "done"], check=True)
     sp.run([*git, "push", "-q", "-u", "origin", "HEAD"], check=True)
-    for p in [wd, *wd.rglob("*")]:
-        os.utime(p, (OLD, OLD))
+    _age_tree(wd)
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._process_sweep_mentions",
         lambda needles: False,
@@ -366,14 +411,13 @@ def test_stash_untracked_content_recoverable_from_archive(
     root = tmp_path / "hermes"
     wd = _make_workdir(root, "lane-stash", OLD)
     git = ["git", "-C", str(wd), "-c", "user.name=t", "-c", "user.email=t@t"]
-    sp.run(["git", "init", "-q", str(wd)], check=True)
+    _git_init(wd)
     (wd / "base.txt").write_text("base")
     sp.run([*git, "add", "-A"], check=True)
     sp.run([*git, "commit", "-qm", "base"], check=True)
     (wd / "untracked-stashed.bin").write_bytes(b"\x00binary only in stash")
     sp.run([*git, "stash", "-u", "-q"], check=True)
-    for p in [wd, *wd.rglob("*")]:
-        os.utime(p, (OLD, OLD))
+    _age_tree(wd)
     monkeypatch.setattr(
         "neoengine_local.hermes_home_retention._process_sweep_mentions",
         lambda needles: False,
