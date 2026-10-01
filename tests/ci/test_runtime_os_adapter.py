@@ -18,16 +18,30 @@ assert SPEC and SPEC.loader
 adapter = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = adapter
 SPEC.loader.exec_module(adapter)
-# The real-repository import closure parses every source and test file once
-# (~36 MB of Python, ~3 s of CPU uncontended after the adapter speedups). Under
-# scripts/run_tests_parallel.py the sliced CI runners run 8 files at once next
-# to 60 s browser/agent suites, so wall time for this CPU-bound work is not
-# bounded by the global 30 s hang guard. Only the tests that compute the
-# whole-repo closure get a wider budget; everything else keeps the default.
-WHOLE_REPO_CLOSURE_TIMEOUT = pytest.mark.timeout(120)
 PARITY_FIXTURES = json.loads(
     (ROOT / "ci/runtime-os/hermes-parity-fixtures.v1.json").read_text(encoding="utf-8")
 )
+
+
+def _build_repository_reference_index() -> None:
+    """Parse the real repository once per test file, at collection time.
+
+    The whole-repo import closure must parse every source and test file
+    (~36 MB of Python). ``_module_references`` is cached per process, so the
+    parse already happens once; building it here keeps that one-time cost
+    under the runner's per-file guard instead of charging it to whichever
+    test happens to run first under the 30 s per-test hang guard. Errors are
+    not cached, so files that fail to read/parse are re-raised to
+    ``select_tests`` exactly as before.
+    """
+    for path in adapter.discover_python_sources() + adapter.discover_tests():
+        try:
+            adapter._module_references(path)
+        except (OSError, SyntaxError, UnicodeError):
+            pass
+
+
+_build_repository_reference_index()
 
 
 def test_policy_lock_verifies_canonical_identity() -> None:
@@ -65,7 +79,6 @@ def test_main_and_nightly_require_full_proof() -> None:
     assert adapter.full_proof(["README.md"], "schedule", policy)[0] is True
 
 
-@WHOLE_REPO_CLOSURE_TIMEOUT
 def test_canonical_parity_and_historical_escape_fixtures() -> None:
     policy = adapter.load_policy()
     assert PARITY_FIXTURES["canonical_runtime_os"]["source_commit"] == policy["source_commit"]
@@ -126,7 +139,6 @@ def test_module_mapping_is_anchored_not_substring_based() -> None:
     assert unknown is True
 
 
-@WHOLE_REPO_CLOSURE_TIMEOUT
 def test_module_mapping_includes_direct_import_and_monkeypatch_consumers() -> None:
     selected, unknown = adapter.select_tests(["agent/rate_limit_tracker.py"])
     assert "tests/agent/test_rate_limit_tracker.py" in selected
@@ -135,7 +147,6 @@ def test_module_mapping_includes_direct_import_and_monkeypatch_consumers() -> No
     assert unknown is False
 
 
-@WHOLE_REPO_CLOSURE_TIMEOUT
 def test_module_mapping_closes_transitive_source_to_test_dependencies() -> None:
     selected, unknown = adapter.select_tests(["agent/file_safety.py"])
     assert "tests/agent/test_file_safety_credentials.py" in selected
@@ -286,7 +297,7 @@ def test_discovery_of_missing_root_is_empty(tmp_path, monkeypatch) -> None:
     assert adapter.discover_tests() == []
 
 
-def test_discovery_skips_unreadable_dirs_like_rglob(tmp_path, monkeypatch) -> None:
+def test_discovery_fails_closed_on_unreadable_dir(tmp_path, monkeypatch) -> None:
     _write_tree(tmp_path, ["agent/core.py", "locked/hidden.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     real_scandir = os.scandir
@@ -297,6 +308,32 @@ def test_discovery_skips_unreadable_dirs_like_rglob(tmp_path, monkeypatch) -> No
         return real_scandir(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "scandir", denied_scandir)
+    with pytest.raises(PermissionError):
+        adapter.discover_python_sources()
+
+
+@pytest.mark.parametrize("error", [errno.EIO, errno.EACCES, errno.ELOOP])
+def test_discovery_fails_closed_when_a_file_stat_errors(tmp_path, monkeypatch, error) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "agent/broken.py", "tests/test_broken.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_stat = os.stat
+
+    def failing_stat(path, *args, **kwargs):
+        if Path(os.fspath(path)).name in {"broken.py", "test_broken.py"}:
+            raise OSError(error, os.strerror(error), os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+    with pytest.raises(OSError):
+        adapter.discover_python_sources()
+    with pytest.raises(OSError):
+        adapter.discover_tests()
+
+
+def test_discovery_skips_files_that_vanish_or_dangle(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py"])
+    (tmp_path / "agent/dangling.py").symlink_to(tmp_path / "missing.py")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     assert adapter.discover_python_sources() == ["agent/core.py"]
 
 

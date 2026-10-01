@@ -113,18 +113,30 @@ _ALWAYS_PRUNED = {"__pycache__"}
 
 
 def _raise_walk_error(error: OSError) -> None:
-    # Parity with Python 3.11 ``Path.rglob``: unreadable directories are
-    # skipped; any other walk failure (vanished source dir, ELOOP, EIO) still
-    # raises so selection fails closed instead of silently narrowing.
-    if not isinstance(error, PermissionError):
-        raise error
+    # Selection must fail closed: an unreadable or failing directory that is
+    # not pruned could hold sources or tests, so silently skipping it would
+    # narrow the proof. Pruned directories are never entered and never raise.
+    raise error
+
+
+def _is_regular_file(path: Path) -> bool:
+    """``Path.is_file()`` without swallowing errors other than ENOENT.
+
+    A path that vanished between listing and stat, or a dangling symlink,
+    is not a file (as before); EIO, ELOOP, EACCES, ... propagate.
+    """
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except FileNotFoundError:
+        return False
 
 
 def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
     """List files under ``top`` matching ``pattern``, pruning excluded dirs.
 
     Unlike ``Path.rglob``, excluded directories (virtualenvs, ``.git``,
-    ``__pycache__``) are never descended into.
+    ``__pycache__``) are never descended into, and any error walking a
+    non-excluded directory (including PermissionError) raises.
     """
     # Stat the root explicitly: ``Path.is_dir()`` swallows OSError (every
     # errno on 3.12+), which would turn e.g. EIO into an empty, fail-open
@@ -149,7 +161,7 @@ def discover_tests() -> list[str]:
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
         for path in _walk_files(CANDIDATE_ROOT / "tests", skip_parts, "test_*.py")
-        if path.is_file() and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
+        if _is_regular_file(path) and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
     )
 
 
@@ -158,7 +170,7 @@ def discover_python_sources() -> list[str]:
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
         for path in _walk_files(CANDIDATE_ROOT, excluded, "*.py")
-        if path.is_file()
+        if _is_regular_file(path)
         and not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
     )
 
