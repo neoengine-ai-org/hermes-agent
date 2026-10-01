@@ -1,7 +1,11 @@
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/ci-runtime-os-advisory.yml"
+CANDIDATE = ROOT / ".github/workflows/ci-runtime-os-candidate.yml"
+PR_EVENTS = "fromJSON('[\"pull_request_target\",\"pull_request_review\"]')"
 
 
 def test_runtime_os_workflow_has_stable_advisory_contexts_and_qwen_runner() -> None:
@@ -34,7 +38,7 @@ def test_runtime_os_workflow_preserves_pins_and_per_file_isolation() -> None:
     assert text.count("astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39") == 1
     assert text.count("RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599") == 1
     assert "hermes-ci-fast-${{ needs.preflight.outputs.environment_digest }}" in text
-    assert "needs: [preflight, environment, test, e2e]" in text
+    assert "needs: [preflight, environment, test, e2e, candidate-proof]" in text
     assert 'test "$ENVIRONMENT" = success -o "$ENVIRONMENT" = skipped' in text
     assert "one infra-only retry" in text
     assert "runtime-os-duration-${test_manifest_digest}-${dependency_digest}" in text
@@ -68,3 +72,57 @@ def test_runtime_os_workflow_is_advisory_and_has_no_write_permission() -> None:
     assert "String(label.name).toLowerCase()" in text
     assert "changesRequested" in text
     assert "reviewState.reviewDecision === 'CHANGES_REQUESTED'" in text
+
+
+def _jobs(path: Path) -> dict:
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
+
+
+def test_privileged_workflow_never_executes_pull_request_head() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+    jobs = _jobs(WORKFLOW)
+    for job_id in ("environment", "test", "e2e"):
+        assert f"!contains({PR_EVENTS}, github.event_name)" in jobs[job_id]["if"]
+        for step in jobs[job_id]["steps"]:
+            if str(step.get("uses", "")).startswith("actions/checkout"):
+                assert step["with"]["ref"] == "${{ github.event.merge_group.head_sha || github.sha }}"
+    assert "Checkout same-repository candidate" not in text
+    assert 'git -C .runtime-os-trusted fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"' in text
+    assert "--no-ext-diff --no-textconv --name-only" in text
+    waiter = jobs["candidate-proof"]
+    assert waiter["name"] == "Await unprivileged candidate proof"
+    assert waiter["permissions"] == {"actions": "read"}
+    assert waiter["runs-on"] == "ubuntu-latest"
+    script = waiter["steps"][0]["with"]["script"]
+    assert "run.head_sha === head" in script
+    assert "run.head_repository.full_name === repository" in script
+    assert "latest.conclusion === 'success'" in script
+    assert waiter["steps"][0]["env"]["CANDIDATE_WORKFLOW"] == CANDIDATE.name
+    aggregate = jobs["hermes-required"]["steps"][0]["run"]
+    assert 'test "$CANDIDATE" = success' in aggregate
+    assert 'test "$CANDIDATE" = skipped' in aggregate
+
+
+def test_candidate_workflow_is_unprivileged_and_mirrors_trusted_proof() -> None:
+    workflow = yaml.safe_load(CANDIDATE.read_text(encoding="utf-8"))
+    triggers = workflow.get("on", workflow.get(True))
+    assert set(triggers) == {"pull_request"}
+    assert workflow["permissions"] == {"contents": "read"}
+    text = CANDIDATE.read_text(encoding="utf-8")
+    assert "secrets." not in text
+    assert "actions/cache/save" not in text
+    assert "Upload protected-main duration sample" not in text
+    assert "runtime-os-duration-${{" not in text
+    trusted, candidate = _jobs(WORKFLOW), _jobs(CANDIDATE)
+    assert candidate["plan"]["if"] == "github.event.pull_request.head.repo.full_name == github.repository"
+    for job_id in ("environment", "test", "e2e"):
+        assert candidate[job_id]["name"] == trusted[job_id]["name"]
+        assert "permissions" not in candidate[job_id]
+        trusted_steps = [s for s in trusted[job_id]["steps"] if "protected-main" not in s.get("name", "")]
+        for theirs, ours in zip(trusted_steps, candidate[job_id]["steps"], strict=True):
+            if str(ours.get("uses", "")).startswith("actions/checkout"):
+                assert ours["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
+                continue
+            assert ours.get("run") == theirs.get("run")
+            assert ours.get("uses") == theirs.get("uses")
+            assert ours.get("env") == theirs.get("env")

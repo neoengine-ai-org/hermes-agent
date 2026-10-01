@@ -2,7 +2,13 @@
 
 The advisory adapter pins NeoEngine policy `2.1.0` from `871e416afc55db187d2b6f29c9ff7cac96472223` through `ci/runtime-os/policy-bundle.lock.json`.
 
-Trusted-base `pull_request_target` code selects affected isolated tests, including direct-import and monkeypatch consumers, and fails closed to all six slices plus e2e for broad or unknown executable changes. The canonical decision-contract digests and Hermes repository profile are locked with historical parity fixtures. `merge_group` always receives full proof.
+Trusted-base code selects affected isolated tests, including direct-import and monkeypatch consumers, and fails closed to all six slices plus e2e for broad or unknown executable changes. The canonical decision-contract digests and Hermes repository profile are locked with historical parity fixtures. `merge_group` always receives full proof.
+
+## Privilege split
+
+`ci-runtime-os-advisory.yml` runs on `pull_request_target` and executes base-branch code only. For pull-request events it never checks out or runs the PR head: it fetches the head as inert git objects into the trusted checkout for `git diff --name-only`, classifies risk from that list plus the PR body, and evaluates review evidence and admission from the GitHub API. `tests/ci/test_pull_request_target_safety.py` fails if any `pull_request_target` workflow checks out `github.event.pull_request.head.*`, `github.head_ref`, the merge commit, or `refs/pull/*`, or materializes them in a run script.
+
+PR-head execution (environment build, test slices, e2e) runs in `ci-runtime-os-candidate.yml` on `pull_request` with a `contents: read` token, no secrets, and PR-scoped cache writes, under the same job names. The trusted `Await unprivileged candidate proof` job (GitHub-hosted, `actions: read`, so it cannot starve the self-hosted pool) binds `Hermes CI required` to the latest same-repository candidate run for the exact head SHA. A writer can edit the candidate workflow on their branch, so that result is test evidence only and never policy, review, or admission authority. After re-running a failed candidate run, re-run the advisory workflow (or push, label, or review) to refresh `Hermes CI required`. Push, merge-group, schedule, and dispatch events still run the proof inline from trusted refs.
 
 One run-scoped immutable `ci-fast` artifact contains the locked Python environment and pinned ripgrep binary; selected slices restore it instead of repeating downloads and dependency setup. Only the environment build may retry once, and only for classified network/infrastructure failures. Duration telemetry is read under a test-manifest plus dependency digest and PR jobs never publish shared telemetry.
 
