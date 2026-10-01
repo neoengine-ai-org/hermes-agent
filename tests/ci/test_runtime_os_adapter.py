@@ -18,6 +18,13 @@ assert SPEC and SPEC.loader
 adapter = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = adapter
 SPEC.loader.exec_module(adapter)
+# The real-repository import closure parses every source and test file once
+# (~36 MB of Python, ~3 s of CPU uncontended after the adapter speedups). Under
+# scripts/run_tests_parallel.py the sliced CI runners run 8 files at once next
+# to 60 s browser/agent suites, so wall time for this CPU-bound work is not
+# bounded by the global 30 s hang guard. Only the tests that compute the
+# whole-repo closure get a wider budget; everything else keeps the default.
+WHOLE_REPO_CLOSURE_TIMEOUT = pytest.mark.timeout(120)
 PARITY_FIXTURES = json.loads(
     (ROOT / "ci/runtime-os/hermes-parity-fixtures.v1.json").read_text(encoding="utf-8")
 )
@@ -58,6 +65,7 @@ def test_main_and_nightly_require_full_proof() -> None:
     assert adapter.full_proof(["README.md"], "schedule", policy)[0] is True
 
 
+@WHOLE_REPO_CLOSURE_TIMEOUT
 def test_canonical_parity_and_historical_escape_fixtures() -> None:
     policy = adapter.load_policy()
     assert PARITY_FIXTURES["canonical_runtime_os"]["source_commit"] == policy["source_commit"]
@@ -118,6 +126,7 @@ def test_module_mapping_is_anchored_not_substring_based() -> None:
     assert unknown is True
 
 
+@WHOLE_REPO_CLOSURE_TIMEOUT
 def test_module_mapping_includes_direct_import_and_monkeypatch_consumers() -> None:
     selected, unknown = adapter.select_tests(["agent/rate_limit_tracker.py"])
     assert "tests/agent/test_rate_limit_tracker.py" in selected
@@ -126,6 +135,7 @@ def test_module_mapping_includes_direct_import_and_monkeypatch_consumers() -> No
     assert unknown is False
 
 
+@WHOLE_REPO_CLOSURE_TIMEOUT
 def test_module_mapping_closes_transitive_source_to_test_dependencies() -> None:
     selected, unknown = adapter.select_tests(["agent/file_safety.py"])
     assert "tests/agent/test_file_safety_credentials.py" in selected
