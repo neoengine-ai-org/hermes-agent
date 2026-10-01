@@ -10,6 +10,7 @@ import importlib.util
 import json
 import os
 import re
+import stat
 import sys
 from pathlib import Path
 from typing import Any
@@ -125,7 +126,14 @@ def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
     Unlike ``Path.rglob``, excluded directories (virtualenvs, ``.git``,
     ``__pycache__``) are never descended into.
     """
-    if not top.is_dir():
+    # Stat the root explicitly: ``Path.is_dir()`` swallows OSError (every
+    # errno on 3.12+), which would turn e.g. EIO into an empty, fail-open
+    # selection. Only a root that does not exist yields nothing.
+    try:
+        root_mode = os.stat(top).st_mode
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    if not stat.S_ISDIR(root_mode):
         return []
     skip = pruned | _ALWAYS_PRUNED
     found: list[Path] = []

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import importlib.util
 import json
 import os
@@ -251,6 +252,30 @@ def test_discovery_fails_closed_when_a_source_dir_vanishes(tmp_path, monkeypatch
         adapter.discover_python_sources()
 
 
+@pytest.mark.parametrize("error", [errno.EIO, errno.ELOOP, errno.EACCES])
+def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, error) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_stat = os.stat
+    roots = {os.fspath(tmp_path), os.fspath(tmp_path / "tests")}
+
+    def failing_stat(path, *args, **kwargs):
+        if os.fspath(path) in roots:
+            raise OSError(error, os.strerror(error), os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", failing_stat)
+    with pytest.raises(OSError):
+        adapter.discover_python_sources()
+    with pytest.raises(OSError):
+        adapter.discover_tests()
+
+
+def test_discovery_of_missing_root_is_empty(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    assert adapter.discover_tests() == []
+
+
 def test_discovery_skips_unreadable_dirs_like_rglob(tmp_path, monkeypatch) -> None:
     _write_tree(tmp_path, ["agent/core.py", "locked/hidden.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
@@ -287,7 +312,22 @@ def test_node_iteration_visits_exactly_the_ast_walk_node_set() -> None:
         "scripts/ci_risk_classifier.py",
         "tests/ci/test_runtime_os_adapter.py",
     ]
-    for relative in paths:
-        tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+    sources = [(ROOT / relative).read_text(encoding="utf-8") for relative in paths]
+    sources.append(
+        "match event:\n"
+        "    case {'kind': 'agent.core', **rest} if rest:\n"
+        "        import agent.core as core\n"
+        "    case [first, *others] | (first, *others):\n"
+        "        from gateway import run\n"
+        "    case Point(x=0, y=y) as point:\n"
+        "        value = f'{point!r:>{y}} tools.registry'\n"
+        "    case _:\n"
+        "        pass\n"
+        "async def go(xs):\n"
+        "    async with ctx() as c:\n"
+        "        return [y async for y in xs if (z := y)] + [lambda *a, k=1, **kw: a]\n"
+    )
+    for source in sources:
+        tree = ast.parse(source)
         walked = sorted(map(id, ast.walk(tree)))
-        assert sorted(map(id, adapter._iter_nodes(tree))) == walked, relative
+        assert sorted(map(id, adapter._iter_nodes(tree))) == walked
