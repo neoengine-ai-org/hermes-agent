@@ -9,7 +9,8 @@ run-name: Runtime OS candidate ${{ github.event.pull_request.head.sha }} on ${{ 
 # and references no secrets, but GitHub loads this file from the PR merge ref:
 # a repository writer can edit it, exactly as they can already run any
 # workflow from a pushed branch. As defined here it runs on GitHub-hosted
-# ephemeral runners rather than the shared, persistent self-hosted host. The privileged ci-runtime-os-advisory.yml
+# ephemeral runners rather than the shared, persistent self-hosted host.
+# The privileged ci-runtime-os-advisory.yml
 # therefore refuses proof from a PR that modifies this file, and treats the
 # result as test evidence only, never policy, review, or admission authority.
 
@@ -218,21 +219,24 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
         run: |
-          source .venv/bin/activate
-          python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
           # The restored environment must leave the checkout clean (same query
-          # as the receipt validator); fail before running any test otherwise.
+          # as the receipt validator). Checked before anything imports or
+          # runs candidate code, so candidate code cannot mask residue.
           dirty="$(git status --porcelain=v1 --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf 'DIRTY_CHECKOUT after environment restore:\n%s\n' "$dirty" >&2
             exit 1
           fi
+          source .venv/bin/activate
+          python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
           # Same per-file runner and environment contract as tests.yml's
           # required slices (prebuilt .venv with all+dev extras). run_tests.sh
           # is the Stage-0 bootstrap-proof wrapper: it rebuilds an
           # unfingerprinted .venv from uv.lock without dev extras.
           IFS=: read -r -a selected <<< "$SELECTED_FILES"
-          python scripts/run_tests_parallel.py -j 4 "${selected[@]}"
+          # Hermetic locale/hash settings the V1 wrapper also pinned.
+          env TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONHASHSEED=0 \
+            python scripts/run_tests_parallel.py -j 4 "${selected[@]}"
 
   e2e:
     name: Runtime OS e2e

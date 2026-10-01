@@ -263,21 +263,24 @@ jobs:
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
         run: |
-          source .venv/bin/activate
-          python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
           # The restored environment must leave the checkout clean (same query
-          # as the receipt validator); fail before running any test otherwise.
+          # as the receipt validator). Checked before anything imports or
+          # runs candidate code, so candidate code cannot mask residue.
           dirty="$(git status --porcelain=v1 --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf 'DIRTY_CHECKOUT after environment restore:\n%s\n' "$dirty" >&2
             exit 1
           fi
+          source .venv/bin/activate
+          python -c 'import os, subprocess, sys; raise SystemExit(subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *os.environ["SELECTED_FILES"].split(":")]).returncode)'
           # Same per-file runner and environment contract as tests.yml's
           # required slices (prebuilt .venv with all+dev extras). run_tests.sh
           # is the Stage-0 bootstrap-proof wrapper: it rebuilds an
           # unfingerprinted .venv from uv.lock without dev extras.
           IFS=: read -r -a selected <<< "$SELECTED_FILES"
-          python scripts/run_tests_parallel.py -j 4 "${selected[@]}"
+          # Hermetic locale/hash settings the V1 wrapper also pinned.
+          env TZ=UTC LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONHASHSEED=0 \
+            python scripts/run_tests_parallel.py -j 4 "${selected[@]}"
 
       - name: Upload protected-main duration sample
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -450,7 +453,10 @@ jobs:
     name: Hermes CI required
     if: always()
     needs: [preflight, environment, test, e2e, candidate-proof]
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    # GitHub-hosted: always() runs even for fork PRs (preflight skipped),
+    # so this must never land on the shared self-hosted pool; it still
+    # fails closed because preflight did not succeed.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Aggregate immutable policy proof
@@ -480,7 +486,10 @@ jobs:
     name: Review evidence required
     if: always()
     needs: [preflight, hermes-required]
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    # GitHub-hosted: always() runs even for fork PRs (preflight skipped),
+    # so this must never land on the shared self-hosted pool; it still
+    # fails closed because preflight did not succeed.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Discard residue from earlier jobs on this shared runner
@@ -626,7 +635,10 @@ jobs:
     name: Merge admission
     if: always()
     needs: [hermes-required, review-evidence]
-    runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
+    # GitHub-hosted: always() runs even for fork PRs (preflight skipped),
+    # so this must never land on the shared self-hosted pool; it still
+    # fails closed because preflight did not succeed.
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Verify live exact-head admission state

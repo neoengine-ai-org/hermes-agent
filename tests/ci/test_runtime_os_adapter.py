@@ -6,6 +6,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "_runtime_os_adapter_test", ROOT / "scripts/ci/runtime_os_adapter.py"
@@ -188,9 +190,41 @@ def test_python_source_discovery_skips_generated_environment_trees(monkeypatch, 
         ".bootstrap-proof-venv/lib/python3.11/site-packages/dep.py",
         "ci-fast/bin/.python/cpython-3.11.16-linux-x86_64-gnu/lib/python3.11/ast.py",
         "tests/test_module.py",
+        "pkg/ci-fast/nested_source.py",
     ):
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("import os\n", encoding="utf-8")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    assert adapter.discover_python_sources() == ["pkg/module.py"]
+    # Only the repository-root generated trees are skipped.
+    assert adapter.discover_python_sources() == ["pkg/ci-fast/nested_source.py", "pkg/module.py"]
+
+
+def _plan_args(tmp_path, files: list[str]):
+    body = tmp_path / "body.md"
+    body.write_text("", encoding="utf-8")
+    return argparse.Namespace(
+        changed_files_json=json.dumps(files),
+        event_name="push",
+        ref="refs/heads/main",
+        body_file=str(body),
+        additions=0,
+        pr_number="unknown",
+        repo="neoengine-ai-org/hermes-agent",
+    )
+
+
+def test_full_proof_with_zero_unit_tests_fails_closed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "discover_tests", lambda: [])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="zero unit test files"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+def test_colon_in_selected_test_path_fails_closed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        adapter, "discover_tests", lambda: ["tests/test_a.py:tests/test_b.py", "tests/test_c.py"]
+    )
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="cannot contain ':'"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))

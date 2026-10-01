@@ -114,16 +114,17 @@ def discover_tests() -> list[str]:
 
 
 def discover_python_sources() -> list[str]:
-    # Generated interpreter/environment trees are not repository source: the
-    # bootstrap proof venv and the restored CI environment (which carries a
-    # whole CPython stdlib under ci-fast/) would otherwise be AST-parsed.
-    excluded = {".git", ".venv", "tests", "venv", ".bootstrap-proof-venv", "ci-fast"}
-    return sorted(
-        str(path.relative_to(CANDIDATE_ROOT))
-        for path in CANDIDATE_ROOT.rglob("*.py")
-        if path.is_file()
-        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
-    )
+    excluded = {".git", ".venv", "tests", "venv"}
+    # Generated interpreter/environment trees at the repository root are not
+    # source: the bootstrap proof venv and the restored CI environment (which
+    # carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
+    generated_roots = {".bootstrap-proof-venv", "ci-fast"}
+    sources = []
+    for path in CANDIDATE_ROOT.rglob("*.py"):
+        parts = path.relative_to(CANDIDATE_ROOT).parts
+        if path.is_file() and not (set(parts) & excluded) and parts[0] not in generated_roots:
+            sources.append(str(path.relative_to(CANDIDATE_ROOT)))
+    return sorted(sources)
 
 
 def _module_name(path: str) -> str:
@@ -291,6 +292,15 @@ def plan(args: argparse.Namespace) -> int:
     if unknown:
         run_full, reason = True, "unknown_executable_fails_closed"
     tests = discover_tests() if run_full else selected
+    # The matrix travels colon-joined; a path containing ':' would split into
+    # decoy paths and the real file would never run.
+    ambiguous = sorted(path for path in tests if ":" in path)
+    if ambiguous:
+        raise ValueError(f"test paths cannot contain ':': {ambiguous}")
+    # Full proof means every unit slice plus e2e; an empty unit set would let
+    # e2e alone satisfy it.
+    if run_full and not tests:
+        raise ValueError("full proof selected zero unit test files")
     matrix = slice_matrix(tests)
     review_key = "R4-R5" if classification.risk_class in {"R4", "R5"} else "R3" if classification.risk_class == "R3" else "R0-R2"
     result = {

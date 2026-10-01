@@ -3,6 +3,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -280,7 +281,10 @@ def test_slice_script_enforces_clean_checkout_then_runs_selected_files(tmp_path:
         record.unlink()
         result = _run_slice_script(workflow, repo, record)
         assert result.returncode != 0 and "DIRTY_CHECKOUT" in result.stderr, workflow.name
-        assert not record.exists() or "run_tests_parallel.py" not in record.read_text(encoding="utf-8")
+        # Nothing ran before the cleanliness check: not even collection.
+        assert not record.exists(), workflow.name
+        script = _step_run(workflow, "test", "Run selected files with interpreter isolation")
+        assert script.index("git status --porcelain=v1") < script.index("source .venv/bin/activate")
     help_text = subprocess.run(
         [sys.executable, str(ROOT / "scripts/run_tests_parallel.py"), "--help"],
         capture_output=True,
@@ -313,3 +317,115 @@ def test_e2e_proof_selects_the_repository_e2e_suite() -> None:
     assert collected.returncode == 0, collected.stdout + collected.stderr
     assert "no tests collected" not in collected.stdout
     assert sum("::" in line for line in collected.stdout.splitlines()) > 0
+
+
+_WAITER_HARNESS = r"""
+const fs = require('fs');
+const scenario = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+let now = 1000000;
+Date.now = () => now;
+global.setTimeout = (fn, ms) => { now += ms; fn(); return 0; };
+let poll = 0;
+const calls = [];
+const github = {
+  rest: { actions: { listWorkflowRuns: 'listWorkflowRuns' } },
+  paginate: async (endpoint, params) => {
+    calls.push({ endpoint, params });
+    const runs = scenario.polls[Math.min(poll, scenario.polls.length - 1)];
+    poll += 1;
+    return runs;
+  },
+};
+const context = { repo: { owner: 'neoengine-ai-org', repo: 'hermes-agent' } };
+const out = { failed: null, info: [] };
+const core = { info: (m) => out.info.push(m), setFailed: (m) => { out.failed = m; } };
+Object.assign(process.env, scenario.env);
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+new AsyncFunction('github', 'context', 'core', 'require', scenario.script)(github, context, core, require)
+  .then(() => { out.calls = calls; out.polls = poll; console.log(JSON.stringify(out)); })
+  .catch((error) => { console.error(error); process.exit(3); });
+"""
+
+_HEAD = "a" * 40
+_BASE = "b" * 40
+
+
+def _run(run_id: int, conclusion: str | None, **overrides: object) -> dict[str, object]:
+    run: dict[str, object] = {
+        "id": run_id,
+        "head_sha": _HEAD,
+        "event": "pull_request",
+        "display_title": f"Runtime OS candidate {_HEAD} on {_BASE}",
+        "head_repository": {"full_name": "neoengine-ai-org/hermes-agent"},
+        "pull_requests": [{"number": 100}],
+        "status": "completed" if conclusion else "in_progress",
+        "conclusion": conclusion,
+        "html_url": f"https://example.invalid/runs/{run_id}",
+        "run_attempt": 1,
+    }
+    run.update(overrides)
+    return run
+
+
+def _waiter(tmp_path: Path, polls: list[list[dict[str, object]]], definition_changed: str = "false") -> dict:
+    import json
+    import shutil
+
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required to execute the github-script waiter")
+    step = _jobs(WORKFLOW)["candidate-proof"]["steps"][0]
+    env = {key: str(value) for key, value in step["env"].items() if "${{" not in str(value)}
+    env.update(EXPECTED_HEAD=_HEAD, EXPECTED_PR="100", EXPECTED_BASE=_BASE, DEFINITION_CHANGED=definition_changed)
+    scenario = tmp_path / "scenario.json"
+    scenario.write_text(json.dumps({"script": step["with"]["script"], "env": env, "polls": polls}), encoding="utf-8")
+    harness = tmp_path / "harness.js"
+    harness.write_text(_WAITER_HARNESS, encoding="utf-8")
+    result = subprocess.run([node, str(harness), str(scenario)], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout)
+
+
+def test_waiter_accepts_only_the_exact_bound_successful_run(tmp_path: Path) -> None:
+    out = _waiter(tmp_path, [[_run(1, "success")]])
+    assert out["failed"] is None
+    params = out["calls"][0]["params"]
+    assert params["workflow_id"] == CANDIDATE.name
+    assert params["event"] == "pull_request" and params["head_sha"] == _HEAD
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [_run(1, "success", display_title=f"Runtime OS candidate {_HEAD} on {'c' * 40}")],
+        [_run(1, "success", pull_requests=[{"number": 100}, {"number": 101}])],
+        [_run(1, "success", pull_requests=[{"number": 101}])],
+        [_run(1, "success", pull_requests=[])],
+        [_run(1, "success", head_repository={"full_name": "attacker/hermes-agent"})],
+        [_run(1, "success", head_sha="d" * 40)],
+        [_run(1, "success", event="pull_request_target")],
+    ],
+)
+def test_waiter_rejects_runs_not_bound_to_this_pr_head_and_base(tmp_path: Path, runs) -> None:
+    out = _waiter(tmp_path, [runs])
+    assert out["failed"] and "No candidate proof run bound to PR #100" in out["failed"]
+
+
+def test_waiter_uses_the_latest_run_and_fails_on_its_failure(tmp_path: Path) -> None:
+    out = _waiter(tmp_path, [[_run(1, "success"), _run(2, "failure")]])
+    assert out["failed"] and "concluded failure" in out["failed"]
+
+
+def test_waiter_lets_a_superseded_cancelled_run_settle(tmp_path: Path) -> None:
+    out = _waiter(
+        tmp_path,
+        [[_run(1, "cancelled")], [_run(1, "cancelled"), _run(2, None)], [_run(1, "cancelled"), _run(2, "success")]],
+    )
+    assert out["failed"] is None and out["polls"] == 3
+
+
+def test_waiter_fails_closed_when_the_pr_edits_the_candidate_definition(tmp_path: Path) -> None:
+    for flag in ("true", ""):
+        out = _waiter(tmp_path, [[_run(1, "success")]], definition_changed=flag)
+        assert out["failed"] and "self-defined" in out["failed"]
+        assert out["calls"] == []
