@@ -15,7 +15,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-TRUST_ROOT = Path(__file__).resolve().parents[2]
+_SCRIPT = Path(os.path.abspath(__file__))
+# Refuse to run through a symlink inside the repository (the script, scripts/ci
+# or scripts): resolve() would follow it and load the classifier and policy
+# from an unpinned location.
+if any(part.is_symlink() for part in (_SCRIPT, _SCRIPT.parent, _SCRIPT.parent.parent)):
+    raise SystemExit("runtime_os_adapter must not run through a symlinked path")
+TRUST_ROOT = _SCRIPT.parents[2].resolve()
 CANDIDATE_ROOT = Path(os.environ.get("RUNTIME_OS_CANDIDATE_ROOT", TRUST_ROOT)).resolve()
 LOCK_PATH = TRUST_ROOT / "ci/runtime-os/policy-bundle.lock.json"
 EXPECTED_POLICY_VERSION = "2.1.0"
@@ -124,40 +130,39 @@ def _is_regular_file(path: Path) -> bool:
         return False
 
 
-def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
-    """List files under ``top`` matching ``pattern``, pruning excluded dirs.
+def _walk_py_files(start: Path, prune) -> list[Path]:
+    """Regular ``*.py`` files under ``start``, failing closed.
 
-    Unlike ``Path.rglob``, excluded directories (virtualenvs, ``.git``,
-    ``__pycache__``) are never descended into, and any error listing or
-    classifying an entry of a non-excluded directory (including
-    PermissionError) raises. Matching names are returned regardless of type;
-    callers filter with ``_is_regular_file``.
+    Directories for which ``prune(parts)`` is true (``parts`` relative to
+    ``CANDIDATE_ROOT``) and every ``__pycache__`` are never descended into, so
+    the bytecode caches that parallel test processes create and delete
+    mid-walk can never break discovery. Any other error listing or
+    classifying an entry (including PermissionError, or a non-cache
+    directory that vanished) raises: it could hold sources or tests, and
+    skipping it would silently narrow selection. ``os.walk`` is not used
+    because it swallows ``DirEntry.is_dir()`` errors and treats the entry as
+    a file.
     """
     # Stat the root explicitly: ``Path.is_dir()`` swallows OSError (every
     # errno on 3.12+), which would turn e.g. EIO into an empty, fail-open
     # selection. Only a root that does not exist yields nothing.
     try:
-        root_mode = os.stat(top).st_mode
+        root_mode = os.stat(start).st_mode
     except (FileNotFoundError, NotADirectoryError):
         return []
     if not stat.S_ISDIR(root_mode):
         return []
-    skip = pruned | _ALWAYS_PRUNED
     found: list[Path] = []
-    pending = [top]
+    pending = [start]
     while pending:
         directory = pending.pop()
-        # Listing errors (including PermissionError) propagate: an unreadable
-        # or vanished non-pruned directory could hold sources or tests, so
-        # skipping it would silently narrow selection. ``os.walk`` is not used
-        # because it swallows ``DirEntry.is_dir()`` errors and treats the entry
-        # as a file.
+        relative = directory.relative_to(CANDIDATE_ROOT).parts
         with os.scandir(directory) as scanner:
             entries = sorted(scanner, key=lambda entry: entry.name)
         for entry in entries:
-            if fnmatch.fnmatchcase(entry.name, pattern):
+            if fnmatch.fnmatchcase(entry.name, "*.py"):
                 found.append(directory / entry.name)
-            if entry.name in skip:
+            if entry.name in _ALWAYS_PRUNED or prune(relative + (entry.name,)):
                 continue
             try:
                 # Like 3.11 ``rglob``: recurse into real directories only,
@@ -167,25 +172,33 @@ def _walk_files(top: Path, pruned: set[str], pattern: str) -> list[Path]:
                 continue  # entry vanished after listing
             if is_directory:
                 pending.append(directory / entry.name)
-    return found
+    return [path for path in found if _is_regular_file(path)]
 
 
 def discover_tests() -> list[str]:
     skip_parts = {"integration", "e2e", "docker"}
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in _walk_files(CANDIDATE_ROOT / "tests", skip_parts, "test_*.py")
-        if _is_regular_file(path) and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
+        for path in _walk_py_files(CANDIDATE_ROOT / "tests", lambda parts: parts[-1] in skip_parts)
+        if path.name.startswith("test_")
+        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
     )
 
 
 def discover_python_sources() -> list[str]:
     excluded = {".git", ".venv", "tests", "venv"}
+    # Generated interpreter/environment trees at the repository root are not
+    # source: the bootstrap proof venv and the restored CI environment (which
+    # carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
+    generated_roots = {".bootstrap-proof-venv", "ci-fast"}
+
+    def prune(parts: tuple[str, ...]) -> bool:
+        return parts[-1] in excluded or (len(parts) == 1 and parts[0] in generated_roots)
+
     return sorted(
         str(path.relative_to(CANDIDATE_ROOT))
-        for path in _walk_files(CANDIDATE_ROOT, excluded, "*.py")
-        if _is_regular_file(path)
-        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
+        for path in _walk_py_files(CANDIDATE_ROOT, prune)
+        if not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
     )
 
 
@@ -212,9 +225,16 @@ def _iter_nodes(tree: ast.AST):
                 stack.append(value)
 
 
-@functools.lru_cache(maxsize=None)
 def _module_references(path: str) -> frozenset[str]:
-    source = (CANDIDATE_ROOT / path).read_text(encoding="utf-8")
+    return _references_under(CANDIDATE_ROOT, path)
+
+
+# Parse results are cached per (root, relative path): the checkout is assumed
+# not to change while one process plans, and keying by root keeps results for
+# one candidate tree from ever answering for another.
+@functools.lru_cache(maxsize=None)
+def _references_under(root: Path, path: str) -> frozenset[str]:
+    source = (root / path).read_text(encoding="utf-8")
     tree = ast.parse(source, filename=path)
     references: set[str] = set()
     for node in _iter_nodes(tree):
@@ -247,23 +267,52 @@ def _imports_module(path: str, module_name: str) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=None)
 def _reference_prefixes(path: str) -> frozenset[str]:
-    """Every dotted-boundary prefix of every reference in ``path``.
+    """Every dotted prefix of every reference: ``a.b.c`` -> ``a``, ``a.b``, ``a.b.c``.
 
-    ``module in _reference_prefixes(path)`` is exactly
-    ``_imports_module(path, module)``: a reference equals ``module`` or starts
-    with ``module + "."`` iff ``module`` is one of its dot-boundary prefixes.
+    ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
     """
+    return _prefixes_under(CANDIDATE_ROOT, path)
+
+
+@functools.lru_cache(maxsize=None)
+def _prefixes_under(root: Path, path: str) -> frozenset[str]:
     prefixes: set[str] = set()
-    for reference in _module_references(path):
+    for reference in _references_under(root, path):
         parts = reference.split(".")
-        prefixes.update(".".join(parts[:index]) for index in range(1, len(parts) + 1))
+        prefixes.update(".".join(parts[: index + 1]) for index in range(len(parts)))
     return frozenset(prefixes)
 
 
-def _imports_any_module(path: str, module_names: set[str]) -> bool:
-    return not _reference_prefixes(path).isdisjoint(module_names)
+def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
+    """Transitive importer closure of ``changed_module`` over repository sources.
+
+    Breadth-first over a prefix -> importer index; the same least fixpoint the
+    pairwise rescan computed, in time linear in the references. Also returns
+    sources that could not be parsed; any such source outside the closure
+    marks the plan unknown (unlike the old order-dependent rescan, a parse
+    failure that shares its module name with an impacted source does not).
+    """
+    importers: dict[str, list[str]] = {}
+    parse_failures: list[str] = []
+    for source_path in discover_python_sources():
+        try:
+            prefixes = _reference_prefixes(source_path)
+        except (OSError, SyntaxError, UnicodeError):
+            parse_failures.append(source_path)
+            continue
+        for prefix in prefixes:
+            importers.setdefault(prefix, []).append(source_path)
+    impacted = {changed_module}
+    queue = [changed_module]
+    while queue:
+        module = queue.pop()
+        for source_path in importers.get(module, ()):
+            source_module = _module_name(source_path)
+            if source_module not in impacted:
+                impacted.add(source_module)
+                queue.append(source_module)
+    return impacted, parse_failures
 
 
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
@@ -272,7 +321,6 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
     executable_suffixes = set(classifier.EXECUTABLE_SUFFIXES)
     selected: set[str] = set()
     unknown_executable = False
-    source_paths: list[str] | None = None
     for raw in files:
         path = raw.replace("\\", "/").removeprefix("./")
         candidate = CANDIDATE_ROOT / path
@@ -286,29 +334,16 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
             continue
         if suffix == ".py" and not path.startswith("tests/"):
             stem = candidate.stem.removeprefix("test_")
-            impacted_modules = {_module_name(path)}
-            if source_paths is None:
-                source_paths = discover_python_sources()
-            changed = True
-            while changed:
-                changed = False
-                for source_path in source_paths:
-                    source_module = _module_name(source_path)
-                    if source_module in impacted_modules:
-                        continue
-                    try:
-                        if _imports_any_module(source_path, impacted_modules):
-                            impacted_modules.add(source_module)
-                            changed = True
-                    except (OSError, SyntaxError, UnicodeError):
-                        unknown_executable = True
+            impacted_modules, parse_failures = _impacted_closure(_module_name(path))
+            if any(_module_name(source) not in impacted_modules for source in parse_failures):
+                unknown_executable = True
             matches: list[str] = []
             for test in all_tests:
                 if Path(test).stem == f"test_{stem}":
                     matches.append(test)
                     continue
                 try:
-                    if _imports_any_module(test, impacted_modules):
+                    if _reference_prefixes(test) & impacted_modules:
                         matches.append(test)
                 except (OSError, SyntaxError, UnicodeError):
                     unknown_executable = True
@@ -387,6 +422,17 @@ def plan(args: argparse.Namespace) -> int:
     if unknown:
         run_full, reason = True, "unknown_executable_fails_closed"
     tests = discover_tests() if run_full else selected
+    # The matrix travels colon-joined; a path containing ':' would split into
+    # decoy paths and the real file would never run.
+    ambiguous = sorted(
+        path for path in tests if ":" in path or any(ord(char) < 32 for char in path)
+    )
+    if ambiguous:
+        raise ValueError(f"test paths cannot contain ':' or control characters: {ambiguous}")
+    # Full proof means every unit slice plus e2e; an empty unit set would let
+    # e2e alone satisfy it.
+    if run_full and not tests:
+        raise ValueError("full proof selected zero unit test files")
     matrix = slice_matrix(tests)
     review_key = "R4-R5" if classification.risk_class in {"R4", "R5"} else "R3" if classification.risk_class == "R3" else "R0-R2"
     result = {

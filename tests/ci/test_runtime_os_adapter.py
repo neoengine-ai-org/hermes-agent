@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "_runtime_os_adapter_test", ROOT / "scripts/ci/runtime_os_adapter.py"
@@ -206,6 +207,140 @@ def test_plan_emits_complete_workflow_output_contract(tmp_path, monkeypatch) -> 
     }
 
 
+def test_python_source_discovery_skips_generated_environment_trees(monkeypatch, tmp_path) -> None:
+    for relative in (
+        "pkg/module.py",
+        ".venv/lib/python3.11/site-packages/dep.py",
+        ".bootstrap-proof-venv/lib/python3.11/site-packages/dep.py",
+        "ci-fast/bin/.python/cpython-3.11.16-linux-x86_64-gnu/lib/python3.11/ast.py",
+        "tests/test_module.py",
+        "pkg/ci-fast/nested_source.py",
+    ):
+        target = tmp_path / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("import os\n", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    # Only the repository-root generated trees are skipped.
+    assert adapter.discover_python_sources() == ["pkg/ci-fast/nested_source.py", "pkg/module.py"]
+
+
+def _plan_args(tmp_path, files: list[str]):
+    body = tmp_path / "body.md"
+    body.write_text("", encoding="utf-8")
+    return argparse.Namespace(
+        changed_files_json=json.dumps(files),
+        event_name="push",
+        ref="refs/heads/main",
+        body_file=str(body),
+        additions=0,
+        pr_number="unknown",
+        repo="neoengine-ai-org/hermes-agent",
+    )
+
+
+def test_full_proof_with_zero_unit_tests_fails_closed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "discover_tests", lambda: [])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="zero unit test files"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+def test_colon_in_selected_test_path_fails_closed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        adapter, "discover_tests", lambda: ["tests/test_a.py:tests/test_b.py", "tests/test_c.py"]
+    )
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="cannot contain ':'"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+def test_newline_in_selected_test_path_fails_closed(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(adapter, "discover_tests", lambda: ["tests/test_a.py\ntests/test_b.py"])
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="control characters"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+def _pairwise_fixpoint(changed_module: str) -> set[str]:
+    # The original quadratic rescan, kept as an oracle for the indexed BFS.
+    impacted = {changed_module}
+    changed = True
+    while changed:
+        changed = False
+        for source_path in adapter.discover_python_sources():
+            module = adapter._module_name(source_path)
+            if module in impacted:
+                continue
+            try:
+                if any(adapter._imports_module(source_path, name) for name in impacted):
+                    impacted.add(module)
+                    changed = True
+            except (OSError, SyntaxError, UnicodeError):
+                pass
+    return impacted
+
+
+def test_indexed_closure_matches_pairwise_fixpoint(monkeypatch, tmp_path) -> None:
+    files = {
+        "pkg/a.py": "x = 1\n",
+        "pkg/b.py": "from pkg import a\n",
+        "pkg/c.py": "import pkg.b as b\n",
+        "pkg/d.py": "TARGET = 'pkg.c.helper'\n",
+        "pkg/e.py": "from pkg.f import g\n",
+        "pkg/f.py": "from pkg import e\n",
+        "pkg/g.py": "import pkgx\n",
+        "pkg/broken.py": "def (:\n",
+        "other/z.py": "from pkg.d import TARGET\n",
+    }
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text, encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    for changed in ("pkg.a", "pkg.e", "pkg.g", "pkg", "pkgx", "other.z"):
+        impacted, failures = adapter._impacted_closure(changed)
+        assert impacted == _pairwise_fixpoint(changed), changed
+        assert failures == ["pkg/broken.py"]
+    assert adapter._impacted_closure("pkg.a")[0] == {"pkg.a", "pkg.b", "pkg.c", "pkg.d", "other.z"}
+
+
+def test_discovery_tolerates_directories_vanishing_mid_walk(monkeypatch, tmp_path) -> None:
+    # Parallel test processes create and delete tests/__pycache__ while the
+    # adapter walks the tree; bytecode caches are never descended into, so
+    # their disappearance cannot break discovery. Any other vanished directory
+    # fails closed (test_discovery_fails_closed_when_a_source_dir_vanishes).
+    for relative in ("tests/test_kept.py", "tests/__pycache__/x.pyc", "pkg/mod.py", "pkg/__pycache__/y.pyc"):
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text("", encoding="utf-8")
+    real_scandir = os.scandir
+
+    def vanishing_scandir(path="."):
+        if Path(path).name == "__pycache__":
+            raise FileNotFoundError(2, "No such file or directory", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    monkeypatch.setattr(os, "scandir", vanishing_scandir)
+    assert adapter.discover_tests() == ["tests/test_kept.py"]
+    assert adapter.discover_python_sources() == ["pkg/mod.py"]
+
+
+
+def test_discovery_still_raises_on_non_vanish_errors(monkeypatch, tmp_path) -> None:
+    (tmp_path / "tests/locked").mkdir(parents=True)
+    (tmp_path / "tests/test_a.py").write_text("", encoding="utf-8")
+    real_scandir = os.scandir
+
+    def denied_scandir(path="."):
+        if Path(path).name == "locked":
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    monkeypatch.setattr(os, "scandir", denied_scandir)
+    with pytest.raises(PermissionError):
+        adapter.discover_tests()
+
+
 def _write_tree(root: Path, files: list[str]) -> None:
     for relative in files:
         target = root / relative
@@ -234,26 +369,6 @@ def test_discovery_prunes_excluded_dirs_without_descending(tmp_path, monkeypatch
         return real_scandir(path, *args, **kwargs)
 
     monkeypatch.setattr(os, "scandir", guarded_scandir)
-    assert adapter.discover_python_sources() == ["agent/core.py"]
-    assert adapter.discover_tests() == ["tests/test_core.py"]
-
-
-def test_discovery_never_scans_bytecode_caches(tmp_path, monkeypatch) -> None:
-    # Parallel test files share the checkout; ``hermes update`` tests and
-    # fresh interpreters delete/recreate ``__pycache__`` concurrently, which
-    # made Python 3.11 rglob raise FileNotFoundError on tests/__pycache__.
-    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
-    (tmp_path / "tests/__pycache__").mkdir()
-    (tmp_path / "agent/__pycache__").mkdir()
-    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
-
-    def racing_scandir(path=".", *args, **kwargs):
-        if Path(os.fspath(path)).name == "__pycache__":
-            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
-        return real_scandir(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "scandir", racing_scandir)
     assert adapter.discover_python_sources() == ["agent/core.py"]
     assert adapter.discover_tests() == ["tests/test_core.py"]
 
@@ -295,21 +410,6 @@ def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, err
 def test_discovery_of_missing_root_is_empty(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     assert adapter.discover_tests() == []
-
-
-def test_discovery_fails_closed_on_unreadable_dir(tmp_path, monkeypatch) -> None:
-    _write_tree(tmp_path, ["agent/core.py", "locked/hidden.py"])
-    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
-
-    def denied_scandir(path=".", *args, **kwargs):
-        if Path(os.fspath(path)).name == "locked":
-            raise PermissionError(13, "Permission denied", os.fspath(path))
-        return real_scandir(path, *args, **kwargs)
-
-    monkeypatch.setattr(os, "scandir", denied_scandir)
-    with pytest.raises(PermissionError):
-        adapter.discover_python_sources()
 
 
 @pytest.mark.parametrize("error", [errno.EIO, errno.EACCES, errno.ELOOP])
@@ -407,7 +507,7 @@ def test_prefix_index_matches_reference_import_semantics() -> None:
         except (OSError, SyntaxError, UnicodeError):
             continue
         for module in modules:
-            assert adapter._imports_any_module(path, {module}) is adapter._imports_module(
+            assert (module in adapter._reference_prefixes(path)) is adapter._imports_module(
                 path, module
             ), (path, module)
 
