@@ -8,6 +8,12 @@ from pathlib import Path
 
 import pytest
 
+# The first select_tests() call in this process AST-parses every repository
+# source and test (~1.9k files, ~4s on a quiet machine). Under tests.yml's
+# 8-worker slices on 2-vCPU hosted runners that one-time parse can approach
+# the global 30s per-test cap, so this file gets a larger, still bounded cap.
+pytestmark = pytest.mark.timeout(120)
+
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location(
     "_runtime_os_adapter_test", ROOT / "scripts/ci/runtime_os_adapter.py"
@@ -235,3 +241,49 @@ def test_newline_in_selected_test_path_fails_closed(monkeypatch, tmp_path) -> No
     monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
     with pytest.raises(ValueError, match="control characters"):
         adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+def _pairwise_fixpoint(changed_module: str) -> set[str]:
+    # The original quadratic rescan, kept as an oracle for the indexed BFS.
+    impacted = {changed_module}
+    changed = True
+    while changed:
+        changed = False
+        for source_path in adapter.discover_python_sources():
+            module = adapter._module_name(source_path)
+            if module in impacted:
+                continue
+            try:
+                if any(adapter._imports_module(source_path, name) for name in impacted):
+                    impacted.add(module)
+                    changed = True
+            except (OSError, SyntaxError, UnicodeError):
+                pass
+    return impacted
+
+
+def test_indexed_closure_matches_pairwise_fixpoint(monkeypatch, tmp_path) -> None:
+    files = {
+        "pkg/a.py": "x = 1\n",
+        "pkg/b.py": "from pkg import a\n",
+        "pkg/c.py": "import pkg.b as b\n",
+        "pkg/d.py": "TARGET = 'pkg.c.helper'\n",
+        "pkg/e.py": "from pkg.f import g\n",
+        "pkg/f.py": "from pkg import e\n",
+        "pkg/g.py": "import pkgx\n",
+        "pkg/broken.py": "def (:\n",
+        "other/z.py": "from pkg.d import TARGET\n",
+    }
+    for relative, text in files.items():
+        (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / relative).write_text(text, encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    adapter._module_references.cache_clear()
+    adapter._reference_prefixes.cache_clear()
+    for changed in ("pkg.a", "pkg.e", "pkg.g", "pkg", "pkgx", "other.z"):
+        impacted, failures = adapter._impacted_closure(changed)
+        assert impacted == _pairwise_fixpoint(changed), changed
+        assert failures == ["pkg/broken.py"]
+    assert adapter._impacted_closure("pkg.a")[0] == {"pkg.a", "pkg.b", "pkg.c", "pkg.d", "other.z"}
+    adapter._module_references.cache_clear()
+    adapter._reference_prefixes.cache_clear()

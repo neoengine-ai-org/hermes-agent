@@ -167,6 +167,48 @@ def _imports_module(path: str, module_name: str) -> bool:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _reference_prefixes(path: str) -> frozenset[str]:
+    """Every dotted prefix of every reference: ``a.b.c`` -> ``a``, ``a.b``, ``a.b.c``.
+
+    ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
+    """
+    prefixes: set[str] = set()
+    for reference in _module_references(path):
+        parts = reference.split(".")
+        prefixes.update(".".join(parts[: index + 1]) for index in range(len(parts)))
+    return frozenset(prefixes)
+
+
+def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
+    """Transitive importer closure of ``changed_module`` over repository sources.
+
+    Breadth-first over a prefix -> importer index; the same least fixpoint the
+    pairwise rescan computed, in time linear in the references. Also returns
+    sources that could not be parsed.
+    """
+    importers: dict[str, list[str]] = {}
+    parse_failures: list[str] = []
+    for source_path in discover_python_sources():
+        try:
+            prefixes = _reference_prefixes(source_path)
+        except (OSError, SyntaxError, UnicodeError):
+            parse_failures.append(source_path)
+            continue
+        for prefix in prefixes:
+            importers.setdefault(prefix, []).append(source_path)
+    impacted = {changed_module}
+    queue = [changed_module]
+    while queue:
+        module = queue.pop()
+        for source_path in importers.get(module, ()):
+            source_module = _module_name(source_path)
+            if source_module not in impacted:
+                impacted.add(source_module)
+                queue.append(source_module)
+    return impacted, parse_failures
+
+
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
     classifier = load_classifier()
@@ -186,34 +228,16 @@ def select_tests(files: list[str]) -> tuple[list[str], bool]:
             continue
         if suffix == ".py" and not path.startswith("tests/"):
             stem = candidate.stem.removeprefix("test_")
-            impacted_modules = {_module_name(path)}
-            source_paths = discover_python_sources()
-            changed = True
-            while changed:
-                changed = False
-                for source_path in source_paths:
-                    source_module = _module_name(source_path)
-                    if source_module in impacted_modules:
-                        continue
-                    try:
-                        if any(
-                            _imports_module(source_path, module)
-                            for module in impacted_modules
-                        ):
-                            impacted_modules.add(source_module)
-                            changed = True
-                    except (OSError, SyntaxError, UnicodeError):
-                        unknown_executable = True
+            impacted_modules, parse_failures = _impacted_closure(_module_name(path))
+            if any(_module_name(source) not in impacted_modules for source in parse_failures):
+                unknown_executable = True
             matches: list[str] = []
             for test in all_tests:
                 if Path(test).stem == f"test_{stem}":
                     matches.append(test)
                     continue
                 try:
-                    if any(
-                        _imports_module(test, module)
-                        for module in impacted_modules
-                    ):
+                    if _reference_prefixes(test) & impacted_modules:
                         matches.append(test)
                 except (OSError, SyntaxError, UnicodeError):
                     unknown_executable = True
