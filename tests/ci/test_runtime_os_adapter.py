@@ -392,15 +392,18 @@ def test_discovery_fails_closed_when_a_source_dir_vanishes(tmp_path, monkeypatch
 def test_discovery_fails_closed_when_root_stat_errors(tmp_path, monkeypatch, error) -> None:
     _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_stat = os.stat
     roots = {os.fspath(tmp_path), os.fspath(tmp_path / "tests")}
 
-    def failing_stat(path, *args, **kwargs):
-        if os.fspath(path) in roots:
-            raise OSError(error, os.strerror(error), os.fspath(path))
-        return real_stat(path, *args, **kwargs)
+    def failing(real):
+        def fail_on_roots(path, *args, **kwargs):
+            if os.fspath(path) in roots:
+                raise OSError(error, os.strerror(error), os.fspath(path))
+            return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", failing_stat)
+        return fail_on_roots
+
+    monkeypatch.setattr(os, "stat", failing(os.stat))
+    monkeypatch.setattr(os, "lstat", failing(os.lstat))
     with pytest.raises(OSError):
         adapter.discover_python_sources()
     with pytest.raises(OSError):
@@ -542,21 +545,49 @@ def test_discovery_fails_closed_when_a_listed_entry_vanishes_before_classificati
             discover()
 
 
-def test_discovery_never_descends_into_bytecode_caches(tmp_path, monkeypatch) -> None:
-    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
-    for cache in ("agent/__pycache__", "tests/__pycache__"):
-        (tmp_path / cache).mkdir()
-        (tmp_path / cache / "core.cpython-311.pyc").write_bytes(b"")
+def test_discovery_includes_tracked_python_inside_bytecode_caches(tmp_path, monkeypatch) -> None:
+    # __pycache__ is still walked: a tracked *.py hidden in one must not drop
+    # out of selection (only its disappearance mid-walk is tolerated).
+    _write_tree(
+        tmp_path,
+        ["agent/core.py", "agent/__pycache__/hidden.py", "tests/__pycache__/test_hidden.py"],
+    )
+    (tmp_path / "agent/__pycache__/core.cpython-311.pyc").write_bytes(b"")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_scandir = os.scandir
+    assert adapter.discover_python_sources() == ["agent/__pycache__/hidden.py", "agent/core.py"]
+    assert adapter.discover_tests() == ["tests/__pycache__/test_hidden.py"]
 
-    def guarded_scandir(path=".", *args, **kwargs):
-        assert Path(os.fspath(path)).name != "__pycache__", path
-        return real_scandir(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "scandir", guarded_scandir)
+def test_discovery_tolerates_bytecode_cache_entries_vanishing(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "agent/__pycache__/stale.py", "tests/test_core.py"])
+    (tmp_path / "tests/__pycache__").mkdir()
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir, real_stat, real_lstat = os.scandir, os.stat, os.lstat
+
+    def cache_entry_vanishes(path=".", *args, **kwargs):
+        return _ScannerWithFailingEntry(real_scandir(path, *args, **kwargs), "__pycache__", errno.ENOENT)
+
+    monkeypatch.setattr(os, "scandir", cache_entry_vanishes)
     assert adapter.discover_python_sources() == ["agent/core.py"]
     assert adapter.discover_tests() == ["tests/test_core.py"]
+
+    def gone(path):
+        return Path(os.fspath(path)).name == "stale.py"
+
+    def stat_gone(path, *args, **kwargs):
+        if gone(path):
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_gone(path, *args, **kwargs):
+        if gone(path):
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", real_scandir)
+    monkeypatch.setattr(os, "stat", stat_gone)
+    monkeypatch.setattr(os, "lstat", lstat_gone)
+    assert adapter.discover_python_sources() == ["agent/core.py"]
 
 
 def test_reference_cache_is_keyed_by_candidate_root(tmp_path, monkeypatch) -> None:
@@ -566,9 +597,59 @@ def test_reference_cache_is_keyed_by_candidate_root(tmp_path, monkeypatch) -> No
         (root / "pkg/mod.py").write_text(f"import {target}\n", encoding="utf-8")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", first)
     assert "agent.alpha" in adapter._module_references("pkg/mod.py")
+    assert "agent.alpha" in adapter._reference_prefixes("pkg/mod.py")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", second)
     assert "agent.beta" in adapter._module_references("pkg/mod.py")
-    assert "agent.alpha" not in adapter._reference_prefixes("pkg/mod.py")
+    assert "agent.alpha" not in adapter._module_references("pkg/mod.py")
+    prefixes = adapter._reference_prefixes("pkg/mod.py")
+    assert "agent.beta" in prefixes and "agent.alpha" not in prefixes
+
+
+@pytest.mark.parametrize("root", ["tests", "."])
+def test_discovery_refuses_a_symlinked_root(tmp_path, monkeypatch, root) -> None:
+    # tests -> decoy would let a candidate replace the full-proof test set.
+    real = tmp_path / "real"
+    _write_tree(real, ["agent/core.py", "decoy/test_only.py"])
+    if root == "tests":
+        (real / "tests").symlink_to(real / "decoy", target_is_directory=True)
+        monkeypatch.setattr(adapter, "CANDIDATE_ROOT", real)
+        with pytest.raises(ValueError, match="symlink"):
+            adapter.discover_tests()
+    else:
+        link = tmp_path / "link"
+        link.symlink_to(real, target_is_directory=True)
+        monkeypatch.setattr(adapter, "CANDIDATE_ROOT", link)
+        with pytest.raises(ValueError, match="symlink"):
+            adapter.discover_python_sources()
+
+
+def test_collection_hook_builds_index_only_when_adapter_tests_run() -> None:
+    import importlib.util as _util
+    from types import SimpleNamespace
+
+    spec = _util.spec_from_file_location("_tests_ci_conftest", ROOT / "tests/ci/conftest.py")
+    assert spec and spec.loader
+    hook_module = _util.module_from_spec(spec)
+    spec.loader.exec_module(hook_module)
+    calls: list[str] = []
+
+    class _Module:
+        def _build_repository_reference_index(self) -> None:
+            calls.append("built")
+
+    adapter_item = SimpleNamespace(module=_Module(), path=Path("tests/ci/test_runtime_os_adapter.py"))
+    adapter_item_2 = SimpleNamespace(module=adapter_item.module, path=adapter_item.path)
+    other_item = SimpleNamespace(module=_Module(), path=Path("tests/ci/test_other.py"))
+
+    def session(items, collect_only=False):
+        return SimpleNamespace(config=SimpleNamespace(option=SimpleNamespace(collectonly=collect_only)), items=items)
+
+    hook_module.pytest_collection_finish(session([adapter_item, adapter_item_2], collect_only=True))
+    assert calls == []
+    hook_module.pytest_collection_finish(session([other_item]))
+    assert calls == []
+    hook_module.pytest_collection_finish(session([other_item, adapter_item, adapter_item_2]))
+    assert calls == ["built"]
 
 
 def test_prefix_index_matches_reference_import_semantics() -> None:

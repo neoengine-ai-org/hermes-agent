@@ -112,24 +112,36 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
-# Bytecode caches never hold ``*.py`` sources, and other processes sharing
-# the checkout (parallel test files, ``hermes update``) create and delete them
-# at any moment, so they are never descended into.
-_ALWAYS_PRUNED = {"__pycache__"}
+# Parallel test processes (and ``hermes update``) create and delete bytecode
+# caches in the shared checkout at any moment. A ``__pycache__`` directory, or
+# anything inside one, disappearing mid-walk is the only tolerated race; it is
+# still descended into, so a tracked ``*.py`` placed inside one is discovered.
+_BYTECODE_CACHE = "__pycache__"
+
+
+def _vanished_cache_entry(parts: tuple[str, ...]) -> bool:
+    return _BYTECODE_CACHE in parts
 
 
 def _is_regular_file(path: Path) -> bool:
     """``Path.is_file()`` for a listed path, failing closed.
 
-    A dangling symlink is not a file (as with ``Path.is_file()``). A listed
-    path that has vanished, and any other error (EIO, ELOOP, EACCES, ...),
-    raises: it may have been a source or test, so dropping it would silently
-    narrow selection.
+    A dangling symlink is not a file (as with ``Path.is_file()``), and nor is
+    a file inside a bytecode cache that was cleared mid-walk. Any other
+    listed path that has vanished, and any other error (EIO, ELOOP, EACCES,
+    ...), raises: it may have been a source or test, so dropping it would
+    silently narrow selection.
     """
     try:
         return stat.S_ISREG(os.stat(path).st_mode)
     except FileNotFoundError:
-        if stat.S_ISLNK(os.lstat(path).st_mode):  # lstat raises if it vanished
+        try:
+            link = stat.S_ISLNK(os.lstat(path).st_mode)
+        except FileNotFoundError:
+            if _vanished_cache_entry(path.relative_to(CANDIDATE_ROOT).parts[:-1]):
+                return False
+            raise
+        if link:
             return False
         raise
 
@@ -138,22 +150,25 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     """Regular ``*.py`` files under ``start``, failing closed.
 
     Directories for which ``prune(parts)`` is true (``parts`` relative to
-    ``CANDIDATE_ROOT``) and every ``__pycache__`` are never descended into, so
-    the bytecode caches that parallel test processes create and delete
-    mid-walk can never break discovery. Any other error listing or
-    classifying an entry (including PermissionError, or a non-cache entry
-    that vanished) raises: it could hold sources or tests, and
-    skipping it would silently narrow selection. ``os.walk`` is not used
+    ``CANDIDATE_ROOT``) are never descended into. A ``__pycache__`` directory
+    (or an entry inside one) that disappears mid-walk is skipped. Any other
+    error listing or classifying an entry (PermissionError, a non-cache
+    entry that vanished, EIO, ...) raises: it could hold sources or tests,
+    and skipping it would silently narrow selection. ``os.walk`` is not used
     because it swallows ``DirEntry.is_dir()`` errors and treats the entry as
     a file.
     """
     # Stat the root explicitly: ``Path.is_dir()`` swallows OSError (every
     # errno on 3.12+), which would turn e.g. EIO into an empty, fail-open
-    # selection. Only a root that does not exist yields nothing.
+    # selection. Only a root that does not exist yields nothing. A symlinked
+    # root is refused rather than followed: ``tests -> decoy`` would otherwise
+    # let a candidate replace the full-proof test set with its own.
     try:
-        root_mode = os.stat(start).st_mode
+        root_mode = os.lstat(start).st_mode
     except (FileNotFoundError, NotADirectoryError):
         return []
+    if stat.S_ISLNK(root_mode):
+        raise ValueError(f"discovery root must not be a symlink: {start}")
     if not stat.S_ISDIR(root_mode):
         return []
     found: list[Path] = []
@@ -161,17 +176,28 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     while pending:
         directory = pending.pop()
         relative = directory.relative_to(CANDIDATE_ROOT).parts
-        with os.scandir(directory) as scanner:
-            entries = sorted(scanner, key=lambda entry: entry.name)
+        try:
+            with os.scandir(directory) as scanner:
+                entries = sorted(scanner, key=lambda entry: entry.name)
+        except FileNotFoundError:
+            if _vanished_cache_entry(relative):
+                continue
+            raise
         for entry in entries:
+            parts = relative + (entry.name,)
             if fnmatch.fnmatchcase(entry.name, "*.py"):
                 found.append(directory / entry.name)
-            if entry.name in _ALWAYS_PRUNED or prune(relative + (entry.name,)):
+            if prune(parts):
                 continue
             # Like 3.11 ``rglob``: recurse into real directories only, never
-            # through directory symlinks. Any error, including ENOENT for an
-            # entry that vanished after listing, propagates.
-            if entry.is_dir(follow_symlinks=False):
+            # through directory symlinks.
+            try:
+                is_directory = entry.is_dir(follow_symlinks=False)
+            except FileNotFoundError:
+                if _vanished_cache_entry(parts):
+                    continue
+                raise
+            if is_directory:
                 pending.append(directory / entry.name)
     return [path for path in found if _is_regular_file(path)]
 
