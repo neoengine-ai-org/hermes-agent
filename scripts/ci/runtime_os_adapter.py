@@ -123,22 +123,23 @@ def _vanished_cache_entry(parts: tuple[str, ...]) -> bool:
     return _BYTECODE_CACHE in parts
 
 
-def _is_regular_file(path: Path) -> bool:
-    """``Path.is_file()`` for a listed path, failing closed.
+def _is_regular_entry(name: str, directory_fd: int, parts: tuple[str, ...]) -> bool:
+    """``Path.is_file()`` for an entry of an open directory, failing closed.
 
-    A dangling symlink is not a file (as with ``Path.is_file()``), and nor is
-    a file inside a bytecode cache that was cleared mid-walk. Any other
-    listed path that has vanished, and any other error (EIO, ELOOP, EACCES,
+    Classified through the directory's descriptor, never by re-resolving a
+    path. A dangling symlink is not a file (as with ``Path.is_file()``), and
+    nor is a file inside a bytecode cache that was cleared mid-walk. Any
+    other entry that vanished, and any other error (EIO, ELOOP, EACCES,
     ...), raises: it may have been a source or test, so dropping it would
     silently narrow selection.
     """
     try:
-        return stat.S_ISREG(os.stat(path).st_mode)
+        return stat.S_ISREG(os.stat(name, dir_fd=directory_fd).st_mode)
     except FileNotFoundError:
         try:
-            link = stat.S_ISLNK(os.lstat(path).st_mode)
+            link = stat.S_ISLNK(os.lstat(name, dir_fd=directory_fd).st_mode)
         except FileNotFoundError:
-            if _vanished_cache_entry(path.relative_to(CANDIDATE_ROOT).parts[:-1]):
+            if _vanished_cache_entry(parts[:-1]):
                 return False
             raise
         if link:
@@ -182,7 +183,10 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     Every directory, the root included, is opened with ``O_NOFOLLOW`` relative
     to its parent's descriptor and listed through that descriptor, so a
     directory swapped for a symlink (e.g. ``tests -> decoy``) after it was
-    classified can never be traversed. Only a missing root yields nothing; a
+    classified can never be traversed, and every file is classified through
+    its directory's descriptor. ``_read_candidate`` reads sources the same
+    way, so a swap after discovery cannot redirect parsing either. Only a
+    missing root yields nothing; a
     root that exists but is not a directory, or is a symlink, raises.
     ``os.walk`` is not used because it swallows ``DirEntry.is_dir()`` errors
     and treats the entry as a file.
@@ -201,7 +205,9 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
             entries = sorted(scanner, key=lambda entry: entry.name)
         for entry in entries:
             parts = relative + (entry.name,)
-            if fnmatch.fnmatchcase(entry.name, "*.py"):
+            if fnmatch.fnmatchcase(entry.name, "*.py") and _is_regular_entry(
+                entry.name, directory_fd, parts
+            ):
                 found.append(directory / entry.name)
             if prune(parts):
                 continue
@@ -227,7 +233,7 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
         walk(root_fd, start, root_parts)
     finally:
         os.close(root_fd)
-    return [path for path in found if _is_regular_file(path)]
+    return found
 
 
 def discover_tests() -> list[str]:
@@ -280,6 +286,33 @@ def _iter_nodes(tree: ast.AST):
                 stack.append(value)
 
 
+def _read_candidate(root: Path, path: str) -> str:
+    """Read ``root/path`` as text without following a directory symlink.
+
+    Each directory component is opened with ``O_NOFOLLOW`` relative to its
+    parent's descriptor, so a directory swapped for a symlink after discovery
+    raises instead of silently redirecting the parse to other content. Text
+    decoding matches ``Path.read_text(encoding="utf-8")``.
+    """
+    parts = Path(path).parts
+    directory_fd = _open_directory(root, ())
+    if directory_fd is None:
+        raise FileNotFoundError(2, "No such file or directory", str(root))
+    try:
+        for index, name in enumerate(parts[:-1]):
+            child_fd = _open_directory(name, parts[: index + 1], dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = child_fd
+            if directory_fd is None:
+                raise FileNotFoundError(2, "No such file or directory", str(root / path))
+        file_fd = os.open(parts[-1], os.O_RDONLY, dir_fd=directory_fd)
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+    with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
 def _module_references(path: str) -> frozenset[str]:
     return _references_under(CANDIDATE_ROOT, path)
 
@@ -289,7 +322,7 @@ def _module_references(path: str) -> frozenset[str]:
 # one candidate tree from ever answering for another.
 @functools.lru_cache(maxsize=None)
 def _references_under(root: Path, path: str) -> frozenset[str]:
-    source = (root / path).read_text(encoding="utf-8")
+    source = _read_candidate(root, path)
     tree = ast.parse(source, filename=path)
     references: set[str] = set()
     for node in _iter_nodes(tree):

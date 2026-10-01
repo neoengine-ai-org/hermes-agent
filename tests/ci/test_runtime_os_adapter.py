@@ -420,6 +420,31 @@ def test_discovery_of_missing_root_is_empty(tmp_path, monkeypatch) -> None:
     assert adapter.discover_tests() == []
 
 
+@pytest.mark.parametrize("swapped", ["agent", "tests"])
+def test_parse_never_follows_a_directory_swapped_after_discovery(tmp_path, monkeypatch, swapped) -> None:
+    # Discovery returns paths; a directory swapped for a symlink to a decoy
+    # afterwards must make the read fail closed, not parse the decoy.
+    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
+    (tmp_path / "decoy").mkdir()
+    (tmp_path / "decoy/core.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "decoy/test_core.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    discovered = adapter.discover_python_sources() + adapter.discover_tests()
+    assert discovered == ["agent/core.py", "decoy/core.py", "decoy/test_core.py", "tests/test_core.py"]
+    (tmp_path / swapped).rename(tmp_path / f"{swapped}.moved")
+    (tmp_path / swapped).symlink_to(tmp_path / "decoy", target_is_directory=True)
+    target = "agent/core.py" if swapped == "agent" else "tests/test_core.py"
+    with pytest.raises(ValueError, match="symlink"):
+        adapter._module_references(target)
+
+
+def test_candidate_read_matches_read_text(tmp_path) -> None:
+    (tmp_path / "pkg").mkdir()
+    payload = "import agent.core\r\nNAME = 'tools.registry'\r\n# caf\u00e9\n"
+    (tmp_path / "pkg/mod.py").write_bytes(payload.encode("utf-8"))
+    assert adapter._read_candidate(tmp_path, "pkg/mod.py") == (tmp_path / "pkg/mod.py").read_text(encoding="utf-8")
+
+
 def test_discovery_fails_closed_when_root_is_not_a_directory(tmp_path, monkeypatch) -> None:
     (tmp_path / "tests").write_text("not a directory", encoding="utf-8")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
@@ -496,8 +521,11 @@ class _ScannerWithFailingEntry:
         return self._scanner.__exit__(*exc)
 
     def __iter__(self):
-        for entry in self._scanner:
-            yield _FailingDirEntry(entry, self._error) if entry.name == self._name else entry
+        return self
+
+    def __next__(self):
+        entry = next(self._scanner)
+        return _FailingDirEntry(entry, self._error) if entry.name == self._name else entry
 
 
 @pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])

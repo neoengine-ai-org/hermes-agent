@@ -4,7 +4,7 @@
   "files": {
     ".github/workflows/auto-arm-auto-merge.yml": "397e1554eed3a7190654df3a50f11c385842e1d690317430b70c6e48b8ff3443",
     ".github/workflows/ci-runtime-os-advisory.yml": "857e928b1f4036c0685a41a5a93cf4e77e3cdef9fa569eb6d5f4260460dfd706",
-    "scripts/ci/runtime_os_adapter.py": "3cd5b07fe81bdd19119641d8805f604dba00f577ecd4c1fc411a1e1d4aab5874",
+    "scripts/ci/runtime_os_adapter.py": "9c3b1f9fc6841f7b7520bb3fc6b3f6c16824b61a936fb353330aac585de336f9",
     "scripts/ci_risk_classifier.py": "6104b46b1b7d470ab8d8bd21070e6c48ce3745670243419735ead1b877c22ad6",
     "scripts/ci_risk_classifier_core.py": "7c1cbf9544ff9365a7fbf62ae7475a87d64a1a39be64062e5c0f1a2b252691ff",
     "scripts/review_receipt_validator.py": "9e9786705b5be06b9eb7e177e8c51fe075f4ec2634cd482838ec3d3d46dc1c2b",
