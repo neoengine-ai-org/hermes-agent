@@ -491,11 +491,84 @@ def test_discovery_does_not_follow_directory_symlinks(tmp_path, monkeypatch) -> 
     ]
 
 
-def test_discovery_skips_files_that_vanish_or_dangle(tmp_path, monkeypatch) -> None:
+def test_discovery_skips_dangling_symlinks_like_is_file(tmp_path, monkeypatch) -> None:
     _write_tree(tmp_path, ["agent/core.py"])
     (tmp_path / "agent/dangling.py").symlink_to(tmp_path / "missing.py")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
     assert adapter.discover_python_sources() == ["agent/core.py"]
+
+
+def test_discovery_fails_closed_when_a_listed_file_vanishes(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "agent/gone.py", "tests/test_gone.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_stat, real_lstat = os.stat, os.lstat
+
+    def vanished(path):
+        return Path(os.fspath(path)).name in {"gone.py", "test_gone.py"}
+
+    def stat_gone(path, *args, **kwargs):
+        if vanished(path):
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_stat(path, *args, **kwargs)
+
+    def lstat_gone(path, *args, **kwargs):
+        if vanished(path):
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(path))
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", stat_gone)
+    monkeypatch.setattr(os, "lstat", lstat_gone)
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_python_sources()
+    with pytest.raises(FileNotFoundError):
+        adapter.discover_tests()
+
+
+def test_discovery_fails_closed_when_a_listed_entry_vanishes_before_classification(
+    tmp_path, monkeypatch
+) -> None:
+    # A source subtree removed between listing and DirEntry.is_dir() must not
+    # silently drop out of selection.
+    _write_tree(tmp_path, ["agent/core.py", "gateway/run.py", "tests/unit/test_run.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+    for name, discover in (("gateway", adapter.discover_python_sources), ("unit", adapter.discover_tests)):
+
+        def vanishing_scandir(path=".", *args, _name=name, **kwargs):
+            return _ScannerWithFailingEntry(real_scandir(path, *args, **kwargs), _name, errno.ENOENT)
+
+        monkeypatch.setattr(os, "scandir", vanishing_scandir)
+        with pytest.raises(FileNotFoundError):
+            discover()
+
+
+def test_discovery_never_descends_into_bytecode_caches(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/core.py", "tests/test_core.py"])
+    for cache in ("agent/__pycache__", "tests/__pycache__"):
+        (tmp_path / cache).mkdir()
+        (tmp_path / cache / "core.cpython-311.pyc").write_bytes(b"")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    real_scandir = os.scandir
+
+    def guarded_scandir(path=".", *args, **kwargs):
+        assert Path(os.fspath(path)).name != "__pycache__", path
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", guarded_scandir)
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+    assert adapter.discover_tests() == ["tests/test_core.py"]
+
+
+def test_reference_cache_is_keyed_by_candidate_root(tmp_path, monkeypatch) -> None:
+    first, second = tmp_path / "first", tmp_path / "second"
+    for root, target in ((first, "agent.alpha"), (second, "agent.beta")):
+        (root / "pkg").mkdir(parents=True)
+        (root / "pkg/mod.py").write_text(f"import {target}\n", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", first)
+    assert "agent.alpha" in adapter._module_references("pkg/mod.py")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", second)
+    assert "agent.beta" in adapter._module_references("pkg/mod.py")
+    assert "agent.alpha" not in adapter._reference_prefixes("pkg/mod.py")
 
 
 def test_prefix_index_matches_reference_import_semantics() -> None:

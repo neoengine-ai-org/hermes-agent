@@ -58,18 +58,25 @@ def _protect_checkout_bytecode_cache(monkeypatch):
     against that same checkout, so the deletion races their tree walks
     (e.g. ``scripts/ci/runtime_os_adapter.py`` discovery hit
     ``FileNotFoundError: .../tests/__pycache__``). Calls aimed at the live
-    checkout become a no-op; any other root (``tmp_path``) still runs the
-    real implementation.
+    checkout, or anywhere inside it, become a no-op; any other root
+    (``tmp_path``) still runs the real implementation.
     """
     try:
         from hermes_cli import main as _cli_main
     except Exception:
         return
     real_clear = _cli_main._clear_bytecode_cache
-    checkout = _cli_main.PROJECT_ROOT.resolve()
+    # Derive the checkout independently of the PROJECT_ROOT the guarded code
+    # uses, so a wrong or patched PROJECT_ROOT cannot steer the real rmtree
+    # back at the shared tree.
+    checkouts = {
+        Path(__file__).resolve().parents[2],
+        Path(_cli_main.PROJECT_ROOT).resolve(),
+    }
 
     def _guarded_clear(root):
-        if Path(root).resolve() == checkout:
+        resolved = Path(root).resolve()
+        if any(resolved == checkout or checkout in resolved.parents for checkout in checkouts):
             return 0
         return real_clear(root)
 

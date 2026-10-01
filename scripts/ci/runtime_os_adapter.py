@@ -119,15 +119,19 @@ _ALWAYS_PRUNED = {"__pycache__"}
 
 
 def _is_regular_file(path: Path) -> bool:
-    """``Path.is_file()`` without swallowing errors other than ENOENT.
+    """``Path.is_file()`` for a listed path, failing closed.
 
-    A path that vanished between listing and stat, or a dangling symlink,
-    is not a file (as before); EIO, ELOOP, EACCES, ... propagate.
+    A dangling symlink is not a file (as with ``Path.is_file()``). A listed
+    path that has vanished, and any other error (EIO, ELOOP, EACCES, ...),
+    raises: it may have been a source or test, so dropping it would silently
+    narrow selection.
     """
     try:
         return stat.S_ISREG(os.stat(path).st_mode)
     except FileNotFoundError:
-        return False
+        if stat.S_ISLNK(os.lstat(path).st_mode):  # lstat raises if it vanished
+            return False
+        raise
 
 
 def _walk_py_files(start: Path, prune) -> list[Path]:
@@ -137,8 +141,8 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     ``CANDIDATE_ROOT``) and every ``__pycache__`` are never descended into, so
     the bytecode caches that parallel test processes create and delete
     mid-walk can never break discovery. Any other error listing or
-    classifying an entry (including PermissionError, or a non-cache
-    directory that vanished) raises: it could hold sources or tests, and
+    classifying an entry (including PermissionError, or a non-cache entry
+    that vanished) raises: it could hold sources or tests, and
     skipping it would silently narrow selection. ``os.walk`` is not used
     because it swallows ``DirEntry.is_dir()`` errors and treats the entry as
     a file.
@@ -164,13 +168,10 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
                 found.append(directory / entry.name)
             if entry.name in _ALWAYS_PRUNED or prune(relative + (entry.name,)):
                 continue
-            try:
-                # Like 3.11 ``rglob``: recurse into real directories only,
-                # never through directory symlinks.
-                is_directory = entry.is_dir(follow_symlinks=False)
-            except FileNotFoundError:
-                continue  # entry vanished after listing
-            if is_directory:
+            # Like 3.11 ``rglob``: recurse into real directories only, never
+            # through directory symlinks. Any error, including ENOENT for an
+            # entry that vanished after listing, propagates.
+            if entry.is_dir(follow_symlinks=False):
                 pending.append(directory / entry.name)
     return [path for path in found if _is_regular_file(path)]
 

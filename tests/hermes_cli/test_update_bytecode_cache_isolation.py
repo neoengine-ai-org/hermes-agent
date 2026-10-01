@@ -27,3 +27,14 @@ def test_clear_bytecode_cache_still_clears_isolated_roots(tmp_path) -> None:
     assert cli_main._clear_bytecode_cache(tmp_path) == 1
     assert not (tmp_path / "pkg" / "__pycache__").exists()
     assert (tmp_path / ".venv" / "lib" / "__pycache__").exists()
+
+
+def test_guard_covers_checkout_subtrees_and_ignores_redirected_project_root(monkeypatch, tmp_path) -> None:
+    def _forbidden_rmtree(path, *args, **kwargs):
+        raise AssertionError(f"rmtree reached the shared checkout: {path}")
+
+    monkeypatch.setattr(shutil, "rmtree", _forbidden_rmtree)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", tmp_path)
+    checkout = cli_main.Path(__file__).resolve().parents[2]
+    assert cli_main._clear_bytecode_cache(checkout) == 0
+    assert cli_main._clear_bytecode_cache(checkout / "tests") == 0
