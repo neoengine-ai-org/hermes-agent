@@ -94,7 +94,7 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
                 assert step["with"]["ref"] == "${{ github.event.merge_group.head_sha || github.sha }}"
     assert "Checkout same-repository candidate" not in text
     assert 'git -C .runtime-os-trusted fetch --no-tags --no-recurse-submodules origin "$HEAD_SHA"' in text
-    assert "--no-ext-diff --no-textconv --no-renames --name-only" in text
+    assert "--no-ext-diff --no-textconv --no-renames -z --name-only" in text
     waiter = jobs["candidate-proof"]
     assert waiter["name"] == "Await unprivileged candidate proof"
     assert waiter["permissions"] == {"actions": "read"}
@@ -109,8 +109,8 @@ def test_privileged_workflow_never_executes_pull_request_head() -> None:
     assert "process.env.DEFINITION_CHANGED !== 'false'" in script
     assert "run.display_title === expectedTitle" in script
     assert "Runtime OS candidate ${head} on ${process.env.EXPECTED_BASE}" in script
-    assert "grep -qxF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt" in text
-    assert '--no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt' in text
+    assert "grep -qxzF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt" in text
+    assert '--no-renames -z --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt' in text
     for job_id in ("preflight", "review-evidence"):
         cleanup = [
             s for s in jobs[job_id]["steps"]

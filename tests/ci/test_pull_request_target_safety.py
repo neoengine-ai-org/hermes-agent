@@ -117,7 +117,7 @@ CHECKSUM_LINE = re.compile(
 # Python puts its directory first on sys.path and a new sibling module could
 # shadow a stdlib import without changing any pinned file.
 TRUSTED_SCRIPT_RUN = re.compile(
-    r"(?<![\w.-])(?:\S*/)?python[\d.]*(?P<flags>(?:\s+-X\s+\S+|\s+-\w+)*)\s+[\"']?(?:\./)?"
+    r"(?<![\w.-])(?:\S*/)?python[\d.]*(?P<flags>(?:\s+-X\s+\S+|\s+-X\S+|\s+-\w+)*)\s+[\"']?(?:\./)?"
     r"(?P<script>(?:\.runtime-os-[\w-]+|trusted)/[^\s\"']+\.py)"
 )
 # Scripts the privileged jobs execute from trusted checkouts; pinned too.
@@ -577,12 +577,20 @@ def _job_violations(
         if URL_INSTALL.search(script):
             violations.append(f"{label} installs packages from a URL")
         for match in TRUSTED_SCRIPT_RUN.finditer(script):
-            flags = match["flags"].split()
+            flags = [flag.removeprefix("-X") for flag in match["flags"].split()]
             if "-I" not in flags:
                 violations.append(f"{label} runs {match['script']} without python -I")
-            if not any(flag.startswith("pycache_prefix=") for flag in flags):
+            prefixes = [
+                flag.split("=", 1)[1].strip("\"'")
+                for flag in flags
+                if flag.startswith("pycache_prefix=")
+            ]
+            # The prefix must be fresh per-job temp space, never the workspace.
+            if not prefixes or not all(
+                re.match(r"^\$\{?RUNNER_TEMP\}?/", prefix) for prefix in prefixes
+            ):
                 violations.append(
-                    f"{label} runs {match['script']} without -X pycache_prefix"
+                    f"{label} runs {match['script']} without -X pycache_prefix under $RUNNER_TEMP"
                 )
         if FOREIGN_DOWNLOAD.search(script):
             violations.append(
@@ -696,20 +704,44 @@ def _repository_scan() -> tuple[list[str], list[str], dict[str, str]]:
         violations.extend(
             pull_request_target_violations(workflow, path.name, reach=reach)
         )
-        reached_files = set(reach["files"])
-        for reached in list(reached_files):
-            if Path(reached).name in {"action.yml", "action.yaml"}:
-                # Files beside a composite action run via $GITHUB_ACTION_PATH.
-                reached_files.update(
-                    item for item in Path(reached).parent.rglob("*") if item.is_file()
-                )
-        for reached in reached_files:
-            relative = Path(reached).resolve().relative_to(ROOT).as_posix()
+        pinned_paths, symlinks = _privileged_file_set(reach["files"])
+        violations.extend(
+            f"{path.name}: privileged set contains a symlink: {link}"
+            for link in symlinks
+        )
+        for reached in pinned_paths:
+            relative = Path(reached).relative_to(ROOT).as_posix()
             files[relative] = hashlib.sha256(Path(reached).read_bytes()).hexdigest()
     if "ci-runtime-os-advisory.yml" in scanned:
-        for relative in PRIVILEGED_SCRIPTS:
+        # The scripts the advisory executes, and this guard itself, so that
+        # weakening the scanner also requires a reviewed re-pin.
+        for relative in (
+            *PRIVILEGED_SCRIPTS,
+            "tests/ci/test_pull_request_target_safety.py",
+        ):
+            if (ROOT / relative).is_symlink():
+                violations.append(f"privileged set contains a symlink: {relative}")
             files[relative] = hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
     return scanned, violations, files
+
+
+def _privileged_file_set(reached: set[Any]) -> tuple[set[Path], list[str]]:
+    """Expand reached files with every entry of each composite action's
+    directory. Symlinks are reported, never followed or hashed: a link's
+    target could change without changing any pinned byte."""
+    paths: set[Path] = set()
+    symlinks: list[str] = []
+    for item in {Path(path) for path in reached}:
+        candidates = [item]
+        if item.name in {"action.yml", "action.yaml"}:
+            # Files beside a composite action run via $GITHUB_ACTION_PATH.
+            candidates.extend(item.parent.rglob("*"))
+        for candidate in candidates:
+            if candidate.is_symlink():
+                symlinks.append(candidate.as_posix())
+            elif candidate.is_file():
+                paths.add(candidate)
+    return paths, sorted(symlinks)
 
 
 def test_no_pull_request_target_workflow_checks_out_pull_request_head() -> None:
@@ -1743,3 +1775,48 @@ def test_env_taint_is_transitive_into_action_inputs() -> None:
     }
     violations = pull_request_target_violations(workflow, "synthetic", root=None)
     assert any("event-derived env.INDIRECT_PATH" in v for v in violations), violations
+
+
+def test_symlinks_in_the_privileged_set_are_reported(tmp_path: Path) -> None:
+    action = tmp_path / ".github/actions/co"
+    (action / "real").mkdir(parents=True)
+    (action / "action.yml").write_text(
+        "runs:\n  using: composite\n  steps: []\n", encoding="utf-8"
+    )
+    (action / "real/helper.sh").write_text("echo hi\n", encoding="utf-8")
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "helper.sh").write_text("echo changed\n", encoding="utf-8")
+    (action / "link").symlink_to(shared, target_is_directory=True)
+    (action / "file-link.sh").symlink_to(shared / "helper.sh")
+    paths, symlinks = _privileged_file_set({action / "action.yml"})
+    assert {p.relative_to(action).as_posix() for p in paths} == {
+        "action.yml",
+        "real/helper.sh",
+    }
+    assert [Path(link).name for link in symlinks] == ["file-link.sh", "link"]
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        "python3 -I -Xpycache_prefix=/x trusted/scripts/review_receipt_validator.py",
+        "python3 -I -X pycache_prefix=. trusted/scripts/review_receipt_validator.py",
+        'python3 -I -X pycache_prefix="$GITHUB_WORKSPACE/p" trusted/scripts/review_receipt_validator.py',
+    ],
+)
+def test_pycache_prefix_must_be_runner_temp(run: str) -> None:
+    violations = pull_request_target_violations(
+        _prt([{"run": run}]), "synthetic", root=None
+    )
+    assert any("under $RUNNER_TEMP" in v for v in violations), violations
+
+
+def test_runner_temp_pycache_prefix_is_accepted() -> None:
+    run = 'python3 -I -X pycache_prefix="$RUNNER_TEMP/runtime-os-pycache" trusted/scripts/review_receipt_validator.py'
+    violations = pull_request_target_violations(
+        _prt([{"run": run}]), "synthetic", root=None
+    )
+    assert not [v for v in violations if "pycache_prefix" in v or "python -I" in v], (
+        violations
+    )

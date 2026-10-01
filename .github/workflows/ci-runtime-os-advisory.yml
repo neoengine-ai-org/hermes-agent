@@ -145,21 +145,22 @@ jobs:
               echo "::error::base or head commit unavailable; refusing ambiguous change selection"
               exit 2
             fi
-            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
+            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "$BASE_SHA" "$HEAD_SHA" > changed-files.txt
             # The candidate run executes its workflow definition from the PR
             # merge ref; it is only base-defined while the PR's own commits
             # (merge-base diff) leave it alone.
-            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
-            if grep -qxF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
+            git -C .runtime-os-trusted diff --no-ext-diff --no-textconv --no-renames -z --name-only "${BASE_SHA}...${HEAD_SHA}" > pr-own-changes.txt
+            if grep -qxzF .github/workflows/ci-runtime-os-candidate.yml pr-own-changes.txt; then
               echo "candidate_definition_changed=true" >> "$GITHUB_OUTPUT"
             else
               echo "candidate_definition_changed=false" >> "$GITHUB_OUTPUT"
             fi
           else
             export RUNTIME_OS_CANDIDATE_ROOT="$GITHUB_WORKSPACE/candidate"
-            git -C candidate ls-files > changed-files.txt
+            git -C candidate ls-files -z > changed-files.txt
           fi
-          python3 -c 'import json; print(json.dumps(open("changed-files.txt", encoding="utf-8").read().splitlines()))' > changed-files.json
+          # NUL-separated (-z): paths are never C-quoted, so odd names classify.
+          python3 -c 'import json; print(json.dumps([p for p in open("changed-files.txt", encoding="utf-8", newline="").read().split("\0") if p]))' > changed-files.json
           printf '%s' "$PR_BODY" > pr-body.md
           # -I: isolated mode drops the script directory from sys.path, so a
           # new module beside the pinned script cannot shadow a stdlib import.
@@ -314,6 +315,9 @@ jobs:
     runs-on: [self-hosted, Linux, x64, neoengine-shared-linux, qwen-ops]
     timeout-minutes: 5
     steps:
+      - name: Discard workspace residue before merging samples
+        run: find "$GITHUB_WORKSPACE" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+
       - name: Download exact-run duration samples
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
