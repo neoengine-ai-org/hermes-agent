@@ -438,6 +438,41 @@ def test_parse_never_follows_a_directory_swapped_after_discovery(tmp_path, monke
         adapter._module_references(target)
 
 
+def test_parse_refuses_a_file_replaced_after_discovery(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/victim.py", "agent/decoy.py"])
+    (tmp_path / "agent/decoy.py").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    assert adapter.discover_python_sources() == ["agent/decoy.py", "agent/victim.py"]
+    # Same path, different file: in-place replacement after discovery.
+    os.replace(tmp_path / "agent/decoy.py", tmp_path / "agent/victim.py")
+    with pytest.raises(ValueError, match="changed after discovery"):
+        adapter._module_references("agent/victim.py")
+
+
+def test_parse_refuses_a_file_swapped_for_a_symlink(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/victim.py"])
+    (tmp_path / "decoy.txt").write_text("x = 1\n", encoding="utf-8")
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    assert adapter.discover_python_sources() == ["agent/victim.py"]
+    (tmp_path / "agent/victim.py").unlink()
+    (tmp_path / "agent/victim.py").symlink_to(tmp_path / "decoy.txt")
+    with pytest.raises(ValueError, match="symlink"):
+        adapter._module_references("agent/victim.py")
+
+
+def test_parse_cache_is_keyed_by_discovered_file_identity(tmp_path, monkeypatch) -> None:
+    _write_tree(tmp_path, ["agent/victim.py"])
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
+    adapter.discover_python_sources()
+    assert "agent.core" in adapter._module_references("agent/victim.py")
+    replacement = tmp_path / "replacement.py"
+    replacement.write_text("import gateway.run\n", encoding="utf-8")
+    os.replace(replacement, tmp_path / "agent/victim.py")
+    adapter.discover_python_sources()  # re-discovery records the new identity
+    references = adapter._module_references("agent/victim.py")
+    assert "gateway.run" in references and "agent.core" not in references
+
+
 def test_candidate_read_matches_read_text(tmp_path) -> None:
     (tmp_path / "pkg").mkdir()
     payload = "import agent.core\r\nNAME = 'tools.registry'\r\n# caf\u00e9\n"
@@ -482,14 +517,14 @@ def test_discovery_never_traverses_a_directory_swapped_for_a_symlink(
 def test_discovery_fails_closed_when_a_file_stat_errors(tmp_path, monkeypatch, error) -> None:
     _write_tree(tmp_path, ["agent/core.py", "agent/broken.py", "tests/test_broken.py"])
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    real_stat = os.stat
+    real_lstat = os.lstat
 
-    def failing_stat(path, *args, **kwargs):
+    def failing_lstat(path, *args, **kwargs):
         if Path(os.fspath(path)).name in {"broken.py", "test_broken.py"}:
             raise OSError(error, os.strerror(error), os.fspath(path))
-        return real_stat(path, *args, **kwargs)
+        return real_lstat(path, *args, **kwargs)
 
-    monkeypatch.setattr(os, "stat", failing_stat)
+    monkeypatch.setattr(os, "lstat", failing_lstat)
     with pytest.raises(OSError):
         adapter.discover_python_sources()
     with pytest.raises(OSError):
@@ -551,20 +586,27 @@ def test_discovery_fails_closed_when_entry_classification_errors(
 def test_discovery_does_not_follow_directory_symlinks(tmp_path, monkeypatch) -> None:
     _write_tree(tmp_path, ["agent/core.py", "elsewhere/linked.py"])
     (tmp_path / "agent/linked_dir").symlink_to(tmp_path / "elsewhere", target_is_directory=True)
-    (tmp_path / "agent/linked_file.py").symlink_to(tmp_path / "agent/core.py")
     monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    assert adapter.discover_python_sources() == [
-        "agent/core.py",
-        "agent/linked_file.py",
-        "elsewhere/linked.py",
-    ]
+    assert adapter.discover_python_sources() == ["agent/core.py", "elsewhere/linked.py"]
 
 
-def test_discovery_skips_dangling_symlinks_like_is_file(tmp_path, monkeypatch) -> None:
-    _write_tree(tmp_path, ["agent/core.py"])
-    (tmp_path / "agent/dangling.py").symlink_to(tmp_path / "missing.py")
-    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", tmp_path)
-    assert adapter.discover_python_sources() == ["agent/core.py"]
+@pytest.mark.parametrize("target", ["inside", "dangling", "escaping"])
+def test_discovery_refuses_python_file_symlinks(tmp_path, monkeypatch, target) -> None:
+    # A *.py symlink can dangle in the planner's checkout layout yet resolve
+    # in the execution layout (or escape the tree); neither following nor
+    # skipping it is safe, so discovery refuses it.
+    root = tmp_path / "candidate"
+    _write_tree(root, ["agent/core.py", "tests/test_kept.py"])
+    (tmp_path / "outside.py").write_text("import agent.core\n", encoding="utf-8")
+    destination = {
+        "inside": root / "agent/core.py",
+        "dangling": root / "missing.py",
+        "escaping": tmp_path / "outside.py",
+    }[target]
+    (root / "tests/test_layout.py").symlink_to(destination)
+    monkeypatch.setattr(adapter, "CANDIDATE_ROOT", root)
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_tests()
 
 
 def test_discovery_fails_closed_when_a_listed_file_vanishes(tmp_path, monkeypatch) -> None:

@@ -1,4 +1,4 @@
-"""Fixtures shared across hermes_cli kanban tests."""
+"""Fixtures shared across hermes_cli tests (kanban dispatch, update paths)."""
 
 from __future__ import annotations
 

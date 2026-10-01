@@ -123,28 +123,34 @@ def _vanished_cache_entry(parts: tuple[str, ...]) -> bool:
     return _BYTECODE_CACHE in parts
 
 
-def _is_regular_entry(name: str, directory_fd: int, parts: tuple[str, ...]) -> bool:
-    """``Path.is_file()`` for an entry of an open directory, failing closed.
+# (root, relative path) -> (st_dev, st_ino) of every regular file the latest
+# discovery returned; reads verify they open that same file.
+_DISCOVERED_IDENTITY: dict[tuple[Path, str], tuple[int, int]] = {}
 
-    Classified through the directory's descriptor, never by re-resolving a
-    path. A dangling symlink is not a file (as with ``Path.is_file()``), and
-    nor is a file inside a bytecode cache that was cleared mid-walk. Any
-    other entry that vanished, and any other error (EIO, ELOOP, EACCES,
-    ...), raises: it may have been a source or test, so dropping it would
-    silently narrow selection.
+
+def _classify_python_entry(name: str, directory_fd: int, parts: tuple[str, ...]) -> tuple[int, int] | None:
+    """Identity of a regular ``*.py`` entry of an open directory, else ``None``.
+
+    Classified through the directory's descriptor with ``lstat``, never by
+    re-resolving a path. A ``*.py`` symlink is refused (``ValueError``): it
+    can dangle in one checkout layout and resolve in another, or escape the
+    tree, so neither following nor skipping it is safe. A non-regular entry
+    (e.g. a directory named ``x.py``) and a file inside a bytecode cache that
+    was cleared mid-walk are not files. Any other entry that vanished, and
+    any other error (EIO, EACCES, ...), raises: it may have been a source
+    or test, so dropping it would silently narrow selection.
     """
     try:
-        return stat.S_ISREG(os.stat(name, dir_fd=directory_fd).st_mode)
+        info = os.lstat(name, dir_fd=directory_fd)
     except FileNotFoundError:
-        try:
-            link = stat.S_ISLNK(os.lstat(name, dir_fd=directory_fd).st_mode)
-        except FileNotFoundError:
-            if _vanished_cache_entry(parts[:-1]):
-                return False
-            raise
-        if link:
-            return False
+        if _vanished_cache_entry(parts[:-1]):
+            return None
         raise
+    if stat.S_ISLNK(info.st_mode):
+        raise ValueError(f"discovery refuses Python file symlinks: {'/'.join(parts)}")
+    if not stat.S_ISREG(info.st_mode):
+        return None
+    return info.st_dev, info.st_ino
 
 
 def _open_directory(name: str | Path, parts: tuple[str, ...], dir_fd: int | None = None) -> int | None:
@@ -180,12 +186,13 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
     entry that vanished, EIO, ...) raises: it could hold sources or tests,
     and skipping it would silently narrow selection.
 
-    Every directory, the root included, is opened with ``O_NOFOLLOW`` relative
-    to its parent's descriptor and listed through that descriptor, so a
-    directory swapped for a symlink (e.g. ``tests -> decoy``) after it was
-    classified can never be traversed, and every file is classified through
-    its directory's descriptor. ``_read_candidate`` reads sources the same
-    way, so a swap after discovery cannot redirect parsing either. Only a
+    The root is opened with ``O_NOFOLLOW`` and every subdirectory with
+    ``O_NOFOLLOW`` relative to its parent's descriptor, and each is listed
+    through its descriptor, so a directory swapped for a symlink (e.g.
+    ``tests -> decoy``) can never be traversed. Every ``*.py`` file is
+    classified through its directory's descriptor and its identity recorded;
+    ``_read_candidate`` reopens it without following symlinks and verifies
+    that identity, so a swap after discovery cannot redirect parsing. Only a
     missing root yields nothing; a
     root that exists but is not a directory, or is a symlink, raises.
     ``os.walk`` is not used because it swallows ``DirEntry.is_dir()`` errors
@@ -205,10 +212,11 @@ def _walk_py_files(start: Path, prune) -> list[Path]:
             entries = sorted(scanner, key=lambda entry: entry.name)
         for entry in entries:
             parts = relative + (entry.name,)
-            if fnmatch.fnmatchcase(entry.name, "*.py") and _is_regular_entry(
-                entry.name, directory_fd, parts
-            ):
-                found.append(directory / entry.name)
+            if fnmatch.fnmatchcase(entry.name, "*.py"):
+                identity = _classify_python_entry(entry.name, directory_fd, parts)
+                if identity is not None:
+                    found.append(directory / entry.name)
+                    _DISCOVERED_IDENTITY[(CANDIDATE_ROOT, "/".join(parts))] = identity
             if prune(parts):
                 continue
             # Like 3.11 ``rglob``: recurse into real directories only, never
@@ -286,13 +294,14 @@ def _iter_nodes(tree: ast.AST):
                 stack.append(value)
 
 
-def _read_candidate(root: Path, path: str) -> str:
-    """Read ``root/path`` as text without following a directory symlink.
+def _read_candidate(root: Path, path: str, expected: tuple[int, int] | None = None) -> str:
+    """Read ``root/path`` as text without following any symlink.
 
-    Each directory component is opened with ``O_NOFOLLOW`` relative to its
-    parent's descriptor, so a directory swapped for a symlink after discovery
-    raises instead of silently redirecting the parse to other content. Text
-    decoding matches ``Path.read_text(encoding="utf-8")``.
+    Each directory component and the file itself are opened with
+    ``O_NOFOLLOW`` relative to the parent's descriptor; when discovery
+    recorded the file's identity, the opened file must be that same file.
+    A swap after discovery therefore raises instead of silently redirecting
+    the parse. Text decoding matches ``Path.read_text(encoding="utf-8")``.
     """
     parts = Path(path).parts
     directory_fd = _open_directory(root, ())
@@ -305,24 +314,36 @@ def _read_candidate(root: Path, path: str) -> str:
             directory_fd = child_fd
             if directory_fd is None:
                 raise FileNotFoundError(2, "No such file or directory", str(root / path))
-        file_fd = os.open(parts[-1], os.O_RDONLY, dir_fd=directory_fd)
+        try:
+            file_fd = os.open(parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+        except OSError as error:
+            try:
+                is_link = stat.S_ISLNK(os.lstat(parts[-1], dir_fd=directory_fd).st_mode)
+            except OSError:
+                is_link = False
+            if is_link:
+                raise ValueError(f"refusing to read a Python file symlink: {path}") from error
+            raise
     finally:
         if directory_fd is not None:
             os.close(directory_fd)
     with os.fdopen(file_fd, "r", encoding="utf-8") as handle:
+        opened = os.fstat(handle.fileno())
+        if expected is not None and (opened.st_dev, opened.st_ino) != expected:
+            raise ValueError(f"{path} changed after discovery")
         return handle.read()
 
 
 def _module_references(path: str) -> frozenset[str]:
-    return _references_under(CANDIDATE_ROOT, path)
+    return _references_under(CANDIDATE_ROOT, path, _DISCOVERED_IDENTITY.get((CANDIDATE_ROOT, path)))
 
 
-# Parse results are cached per (root, relative path): the checkout is assumed
-# not to change while one process plans, and keying by root keeps results for
-# one candidate tree from ever answering for another.
+# Parse results are cached per (root, relative path, discovered file identity):
+# keying by root keeps one candidate tree from answering for another, and by
+# identity keeps a file replaced after discovery from reusing a stale parse.
 @functools.lru_cache(maxsize=None)
-def _references_under(root: Path, path: str) -> frozenset[str]:
-    source = _read_candidate(root, path)
+def _references_under(root: Path, path: str, identity: tuple[int, int] | None) -> frozenset[str]:
+    source = _read_candidate(root, path, identity)
     tree = ast.parse(source, filename=path)
     references: set[str] = set()
     for node in _iter_nodes(tree):
@@ -360,13 +381,13 @@ def _reference_prefixes(path: str) -> frozenset[str]:
 
     ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
     """
-    return _prefixes_under(CANDIDATE_ROOT, path)
+    return _prefixes_under(CANDIDATE_ROOT, path, _DISCOVERED_IDENTITY.get((CANDIDATE_ROOT, path)))
 
 
 @functools.lru_cache(maxsize=None)
-def _prefixes_under(root: Path, path: str) -> frozenset[str]:
+def _prefixes_under(root: Path, path: str, identity: tuple[int, int] | None) -> frozenset[str]:
     prefixes: set[str] = set()
-    for reference in _references_under(root, path):
+    for reference in _references_under(root, path, identity):
         parts = reference.split(".")
         prefixes.update(".".join(parts[: index + 1]) for index in range(len(parts)))
     return frozenset(prefixes)
