@@ -879,6 +879,38 @@ def test_listed_arm_that_reads_closed_but_armed_fails_closed(gh):
     assert "CLOSED but still armed (indeterminate)" in r.stdout + r.stderr
 
 
+@needs_node
+def test_rescan_evidence_with_unchanged_updated_at_is_still_evaluated(gh):
+    # The first walk sees a clean timeline; the stabilising rescan returns the same
+    # PR and updatedAt but its timeline now shows a native auto-merge enable.
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    merged_at = gh.merged[0]["mergedAt"]
+    enable_at = (datetime.strptime(merged_at, fmt).replace(tzinfo=timezone.utc) - timedelta(minutes=5)).strftime(fmt)
+
+    def reveal(page):
+        if page == 1:
+            gh.merged[0]["events"] = [("AutoMergeEnabledEvent", enable_at), ("MergedEvent", merged_at)]
+    gh.after_audit_page = reveal
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+    assert r.stdout.count("::error::PR #9 merged via native auto-merge") == 1
+
+
+@needs_node
+def test_rescan_malformed_timeline_with_unchanged_updated_at_fails_closed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+
+    def corrupt(page):
+        if page == 1:
+            gh.merged[0]["has_previous"] = True
+    gh.after_audit_page = corrupt
+    r = run(gh)
+    assert r.returncode != 0
+    assert "PR #9: auto-merge timeline incomplete" in r.stdout + r.stderr
+
+
 def test_audit_query_shape():
     compact = re.sub(r"\s+", " ", _script())
     for needle in (

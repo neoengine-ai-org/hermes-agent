@@ -389,11 +389,14 @@ jobs:
           // moves to the top, possibly ahead of the cursor, and gets an updatedAt at
           // or after the walk's first-node updatedAt (GitHub's own clock). Each
           // rescan therefore re-walks from the top down to the previous walk's
-          // first-node updatedAt and audits every (PR, updatedAt) pair not already
-          // audited. The audit is complete when a rescan finds no new pair; it
+          // first-node updatedAt and re-evaluates every returned in-window PR. The
+          // audit is complete when a rescan finds no new (PR, updatedAt) pair; it
           // throws (indeterminate) after MAX_AUDIT_RESCANS rescans that keep finding
           // new pairs, after MAX_PAGES pages in one walk, on an updatedAt ordering
-          // violation inside a walk, or when updatedAt precedes mergedAt.
+          // violation inside a walk, or when updatedAt precedes mergedAt. The
+          // argument assumes GitHub assigns updatedAt no earlier than the moment the
+          // change becomes visible to the API; a PR that becomes visible late is
+          // still in the window, so the next run's first walk sees it.
           const MAX_AUDIT_RESCANS = 5;
           async function walkMerged(floor, visit) {
             let cursor = null;
@@ -426,12 +429,17 @@ jobs:
             const audited = new Map(); // PR number -> updatedAt (ms) already audited
             const flagged = new Set();
             let fresh = 0;
+            // Every returned in-window node is validated and evaluated on every
+            // walk; the (PR, updatedAt) pair only measures stability and the
+            // flagged set only prevents a duplicate alarm. An unchanged updatedAt
+            // never skips the evidence a later response carries.
             const visit = (pr, updatedAt, mergedAt) => {
-              if (audited.get(pr.number) === updatedAt) return;
-              audited.set(pr.number, updatedAt);
-              fresh += 1;
-              if (mergedAt < cutoff || flagged.has(pr.number)) return;
-              if (mergedViaAutoMerge(pr, mergedAt)) {
+              if (audited.get(pr.number) !== updatedAt) {
+                audited.set(pr.number, updatedAt);
+                fresh += 1;
+              }
+              if (mergedAt < cutoff) return;
+              if (mergedViaAutoMerge(pr, mergedAt) && !flagged.has(pr.number)) {
                 flagged.add(pr.number);
                 const sha = pr.mergeCommit?.oid || pr.headRefOid;
                 console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
