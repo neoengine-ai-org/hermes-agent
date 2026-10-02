@@ -945,6 +945,41 @@ def test_rescan_malformed_timeline_on_a_lower_ranked_pr_fails_closed(gh):
     assert "PR #9: auto-merge timeline incomplete" in r.stdout + r.stderr
 
 
+@needs_node
+def test_pr_moved_during_the_stabilising_rescan_is_not_declared_stable(gh):
+    # Walk 1 (pages 1-2) sees target #9 clean on page 2. During walk 2, after its
+    # page 1, #9 gains an enable and is updated (moves ahead of the cursor), so
+    # walk 2's page 2 omits it. The membership change must force walk 3, which
+    # sees #9 at the top with its new evidence.
+    for i in range(50):
+        add_merged(gh, 100 + i, timedelta(minutes=20), [], updated_ago=timedelta(minutes=5))
+    add_merged(gh, 9, timedelta(minutes=30), [], updated_ago=timedelta(minutes=30))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    target = next(x for x in gh.merged if x["number"] == 9)
+    enable_at = (datetime.strptime(target["mergedAt"], fmt).replace(tzinfo=timezone.utc) - timedelta(minutes=5)).strftime(fmt)
+
+    def move(page):
+        if page == 3:  # page 1 of the stabilising rescan has just been served
+            target["events"] = [("AutoMergeEnabledEvent", enable_at), ("MergedEvent", target["mergedAt"])]
+            target["updatedAt"] = datetime.now(timezone.utc).strftime(fmt)
+    gh.after_audit_page = move
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+@needs_node
+def test_pr_repeated_within_one_walk_is_instability(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+
+    def duplicate(conn):
+        conn["nodes"] = conn["nodes"] + conn["nodes"]
+    gh.audit_conn_mutate = duplicate
+    r = run(gh)
+    assert r.returncode != 0
+    assert "kept changing across" in r.stdout + r.stderr
+
+
 def test_audit_query_shape():
     compact = re.sub(r"\s+", " ", _script())
     for needle in (

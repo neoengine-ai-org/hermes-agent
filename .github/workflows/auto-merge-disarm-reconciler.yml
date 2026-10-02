@@ -18,8 +18,8 @@ name: auto-merge-disarm-reconciler
 # Merge DETECTION is best-effort, separate from disarming: after the armed
 # passes, every run audits every MERGED PR whose mergedAt is within the last 2
 # hours (merged PRs paginated by updatedAt DESC until a node older than the
-# window is seen; the full window walk repeats until a walk finds no PR updated
-# since the previous one) and raises an ::error:: (nonzero, no comment, no mutation) for
+# window is seen; the full window walk repeats until two consecutive walks
+# return the same PR set) and raises an ::error:: (nonzero, no comment, no mutation) for
 # any whose latest auto-merge event at or before the merge was an enable, i.e.
 # it merged via native auto-merge. A PR that merged via native auto-merge more
 # than 2 hours before any run executes is NOT alarmed. The alarm names the PR's
@@ -388,9 +388,9 @@ jobs:
           // whose position did not change during the walk. A PR updated DURING a
           // walk moves to the top, possibly ahead of the cursor. The audit therefore
           // repeats the FULL window walk, validating and evaluating every returned
-          // in-window PR on every walk, until a walk finds no new (PR, updatedAt)
-          // pair; it throws (indeterminate) after MAX_AUDIT_RESCANS walks that keep
-          // finding new pairs, after MAX_PAGES pages in one walk, on an updatedAt
+          // in-window PR on every walk, until two consecutive walks return exactly
+          // the same (PR, updatedAt) set with no PR repeated within a walk; it
+          // throws (indeterminate) after MAX_AUDIT_RESCANS walks without that, after MAX_PAGES pages in one walk, on an updatedAt
           // ordering violation inside a walk, or when updatedAt precedes mergedAt.
           // The decision is taken on the final stable walk: evidence the API first
           // returns after that walk (e.g. a PR that becomes visible late) belongs to
@@ -422,31 +422,38 @@ jobs:
 
           async function auditRecentMerges(failures) {
             const cutoff = Date.now() - AUDIT_WINDOW_MS;
-            const audited = new Map(); // PR number -> updatedAt (ms) already audited
             const flagged = new Set();
-            let fresh = 0;
-            // Every returned in-window node is validated and evaluated on every
-            // walk; the (PR, updatedAt) pair only measures stability and the
-            // flagged set only prevents a duplicate alarm. An unchanged updatedAt
-            // never skips the evidence a later response carries.
-            const visit = (pr, updatedAt, mergedAt) => {
-              if (audited.get(pr.number) !== updatedAt) {
-                audited.set(pr.number, updatedAt);
-                fresh += 1;
-              }
-              if (mergedAt < cutoff) return;
-              if (mergedViaAutoMerge(pr, mergedAt) && !flagged.has(pr.number)) {
-                flagged.add(pr.number);
-                const sha = pr.mergeCommit?.oid || pr.headRefOid;
-                console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
-                failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
-              }
+            // One complete walk: every returned in-window node is validated and
+            // evaluated (an unchanged updatedAt never skips the evidence a later
+            // response carries); the flagged set only prevents a duplicate alarm.
+            // Returns the walk's (PR -> updatedAt) membership; a PR returned twice
+            // in one walk means the listing shifted, so the walk is unstable.
+            const walkOnce = async () => {
+              const members = new Map();
+              let duplicate = false;
+              await walkMerged(cutoff, (pr, updatedAt, mergedAt) => {
+                if (members.has(pr.number)) duplicate = true;
+                members.set(pr.number, updatedAt);
+                if (mergedAt < cutoff) return;
+                if (mergedViaAutoMerge(pr, mergedAt) && !flagged.has(pr.number)) {
+                  flagged.add(pr.number);
+                  const sha = pr.mergeCommit?.oid || pr.headRefOid;
+                  console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
+                  failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
+                }
+              });
+              return duplicate ? null : members;
             };
-            await walkMerged(cutoff, visit);
+            const sameMembers = (x, y) => x !== null && y !== null && x.size === y.size
+              && [...x].every(([number, updatedAt]) => y.get(number) === updatedAt);
+            // Stable only when two consecutive complete walks return exactly the
+            // same (PR, updatedAt) set with no duplicates: a PR that appears,
+            // disappears, moves, or repeats forces another walk.
+            let previous = await walkOnce();
             for (let rescan = 1; rescan <= MAX_AUDIT_RESCANS; rescan += 1) {
-              fresh = 0;
-              await walkMerged(cutoff, visit);
-              if (fresh === 0) return;
+              const current = await walkOnce();
+              if (sameMembers(previous, current)) return;
+              previous = current;
             }
             throw new Error(`recent-merge audit indeterminate: merged PRs kept changing across ${MAX_AUDIT_RESCANS} rescans`);
           }
