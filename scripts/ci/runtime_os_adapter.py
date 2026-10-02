@@ -198,13 +198,19 @@ def _candidate_tree() -> tuple[str, dict[str, tuple[str, str]]]:
     return commit, _tree_entries(CANDIDATE_ROOT, commit)
 
 
-def _tree_python_files(prefix: tuple[str, ...], prune) -> list[str]:
+def _tree_python_files(prefix: tuple[str, ...], prune, refuse_links_when_pruned: bool) -> list[str]:
     """Regular ``*.py`` blobs of the pinned commit under ``prefix``.
 
-    Entries below a directory for which ``prune(parts)`` is true are skipped.
-    Any other symlink (pytest could collect through it, and a link can
-    resolve differently in another checkout) or gitlink raises, as does a
-    ``prefix`` that is absent from, or not a directory in, the commit.
+    Python files below a directory for which ``prune(parts)`` is true are
+    skipped, but pruning never hides a link: a gitlink anywhere under
+    ``prefix`` raises (the execution checkout does not materialize
+    submodules, so its tests would silently be missing), and so does any
+    symlink outside pruned directories -- or anywhere, when
+    ``refuse_links_when_pruned`` (the test tree, whose pruned e2e,
+    integration and docker suites are collected by their own jobs) -- since
+    pytest could collect through it and a link can resolve differently in
+    another checkout. A ``prefix`` absent from, or not a directory in, the
+    commit raises too.
     """
     _, entries = _candidate_tree()
     label = "/".join(prefix)
@@ -220,13 +226,12 @@ def _tree_python_files(prefix: tuple[str, ...], prune) -> list[str]:
         if parts[: len(prefix)] != prefix:
             continue
         seen_prefix = True
-        if any(prune(parts[: index + 1]) for index in range(len(prefix), len(parts) - 1)):
-            continue
-        if mode == _SYMLINK_MODE:
-            raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
         if mode == _GITLINK_MODE:
             raise ValueError(f"runtime-OS discovery refuses submodule: {path}")
-        if mode in _REGULAR_MODES and path.endswith(".py"):
+        pruned = any(prune(parts[: index + 1]) for index in range(len(prefix), len(parts) - 1))
+        if mode == _SYMLINK_MODE and (refuse_links_when_pruned or not pruned):
+            raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+        if not pruned and mode in _REGULAR_MODES and path.endswith(".py"):
             found.append(path)
     if not seen_prefix:
         raise FileNotFoundError(errno.ENOENT, "Not present in the candidate commit", label)
@@ -252,7 +257,7 @@ def _prune_sources(parts: tuple[str, ...]) -> bool:
 def discover_tests() -> list[str]:
     return sorted(
         path
-        for path in _tree_python_files(("tests",), _prune_tests)
+        for path in _tree_python_files(("tests",), _prune_tests, refuse_links_when_pruned=True)
         if Path(path).name.startswith("test_") and not (set(Path(path).parts) & _TEST_SKIP_PARTS)
     )
 
@@ -260,7 +265,7 @@ def discover_tests() -> list[str]:
 def discover_python_sources() -> list[str]:
     return sorted(
         path
-        for path in _tree_python_files((), _prune_sources)
+        for path in _tree_python_files((), _prune_sources, refuse_links_when_pruned=False)
         if not (set(Path(path).parts) & _SOURCE_EXCLUDED)
     )
 
@@ -291,6 +296,14 @@ def _iter_nodes(tree: ast.AST):
 def _decode_source(data: bytes) -> str:
     """Decode exactly like ``Path.read_text(encoding="utf-8")`` (universal newlines)."""
     return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8").read()
+
+
+def _in_discoverable_universe(path: str) -> bool:
+    """Whether ``path`` lies where source or test discovery could return it."""
+    parts = tuple(path.split("/"))
+    if parts[0] == "tests":
+        return not any(_prune_tests(parts[: index + 1]) for index in range(1, len(parts) - 1))
+    return not any(_prune_sources(parts[: index + 1]) for index in range(len(parts) - 1))
 
 
 def _fetch_blobs(object_ids: list[str]) -> None:
@@ -324,7 +337,8 @@ def _blob_for(path: str) -> str:
     if mode not in _REGULAR_MODES:
         raise ValueError(f"{path} is not a regular file in the candidate commit")
     if object_id not in _REFERENCES_BY_BLOB and object_id not in _PENDING_BLOBS:
-        # Fetch every unparsed Python blob of the commit at once.
+        # Fetch every unparsed blob of the discoverable universe at once
+        # (pruned environments such as .venv are never fetched).
         _fetch_blobs(
             sorted(
                 {
@@ -332,6 +346,7 @@ def _blob_for(path: str) -> str:
                     for name, (entry_mode, oid) in entries.items()
                     if entry_mode in _REGULAR_MODES
                     and name.endswith(".py")
+                    and _in_discoverable_universe(name)
                     and oid not in _REFERENCES_BY_BLOB
                     and oid not in _PENDING_BLOBS
                 }

@@ -700,3 +700,80 @@ def test_p7_backslash_path_is_never_aliased_to_a_slash_path(tmp_path, monkeypatc
     selected, unknown = adapter.select_tests(["tests/unit\\test_a.py"])
     assert "tests/unit/test_a.py" not in selected
     assert unknown is True
+
+
+# --- Git-tree round 1 (7dbb6483): links inside pruned directories ------------
+
+
+def _add_gitlink(root: Path, path: str) -> None:
+    commit = _git(root, "rev-parse", "HEAD")
+    _git(root, "update-index", "--add", "--cacheinfo", f"160000,{commit},{path}")
+    _git(root, "commit", "-q", "-m", "gitlink")
+
+
+@pytest.mark.parametrize("pruned", ["e2e", "integration", "docker"])
+def test_g1_gitlink_inside_a_pruned_test_directory_is_refused(tmp_path, monkeypatch, pruned) -> None:
+    # The execution checkout does not materialize submodules, so a gitlinked
+    # tree under a pruned test directory would silently lack its tests while
+    # a full-proof plan succeeds. Pruning must not hide it.
+    root = _candidate(tmp_path, monkeypatch, {"tests/test_a.py": "", f"tests/{pruned}/test_real.py": ""})
+    _add_gitlink(root, f"tests/{pruned}/vendored")
+    with pytest.raises(ValueError, match="submodule"):
+        adapter.discover_tests()
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    with pytest.raises(ValueError, match="submodule"):
+        adapter.plan(_plan_args(tmp_path, ["pyproject.toml"]))
+
+
+@pytest.mark.parametrize("pruned", [".venv", "venv", "ci-fast"])
+def test_g1_gitlink_inside_a_pruned_source_directory_is_refused(tmp_path, monkeypatch, pruned) -> None:
+    root = _candidate(tmp_path, monkeypatch, {"agent/core.py": "", "tests/test_a.py": ""})
+    _add_gitlink(root, f"{pruned}/vendored")
+    with pytest.raises(ValueError, match="submodule"):
+        adapter.discover_python_sources()
+
+
+@pytest.mark.parametrize("pruned", ["e2e", "integration", "docker"])
+def test_g1_symlink_inside_a_pruned_test_directory_is_refused(tmp_path, monkeypatch, pruned) -> None:
+    # e2e/integration/docker suites are collected by their own jobs; a link
+    # there resolves differently per checkout, so it is refused like any
+    # other test-tree link.
+    _candidate(
+        tmp_path,
+        monkeypatch,
+        {"tests/test_a.py": "", f"tests/{pruned}/test_real.py": "", "outside/test_x.py": ""},
+        symlinks={f"tests/{pruned}/linked": "../../outside"},
+    )
+    with pytest.raises(ValueError, match="symlink"):
+        adapter.discover_tests()
+
+
+def test_g1_symlinks_inside_pruned_source_environments_are_ignored(tmp_path, monkeypatch) -> None:
+    # A committed virtualenv legitimately contains symlinks (bin/python);
+    # pruned source environments are never parsed, so their links are inert.
+    _candidate(
+        tmp_path,
+        monkeypatch,
+        {"agent/core.py": "", "tests/test_a.py": "", ".venv/lib/site.py": ""},
+        symlinks={".venv/bin/python": "/usr/bin/python3"},
+    )
+    assert adapter.discover_python_sources() == ["agent/core.py"]
+
+
+def test_g1_blob_batch_only_fetches_the_discovered_universe(tmp_path, monkeypatch) -> None:
+    _candidate(
+        tmp_path,
+        monkeypatch,
+        {"agent/core.py": "import os\n", "tests/test_a.py": "", ".venv/lib/big.py": "x = 1\n" * 1000},
+    )
+    fetched: list[str] = []
+    real_fetch = adapter._fetch_blobs
+
+    def recording_fetch(object_ids):
+        fetched.extend(object_ids)
+        return real_fetch(object_ids)
+
+    monkeypatch.setattr(adapter, "_fetch_blobs", recording_fetch)
+    adapter._module_references("agent/core.py")
+    venv_blob = adapter._candidate_tree()[1][".venv/lib/big.py"][1]
+    assert venv_blob not in fetched
