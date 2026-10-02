@@ -911,6 +911,40 @@ def test_rescan_malformed_timeline_with_unchanged_updated_at_fails_closed(gh):
     assert "PR #9: auto-merge timeline incomplete" in r.stdout + r.stderr
 
 
+@needs_node
+def test_rescan_evidence_on_a_lower_ranked_pr_is_still_evaluated(gh):
+    # A newer clean PR sorts above the target; the rescan reveals an enable on
+    # the lower-ranked PR with both updatedAt values unchanged.
+    add_merged(gh, 10, timedelta(minutes=5), [], updated_ago=timedelta(minutes=1))
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    target = next(x for x in gh.merged if x["number"] == 9)
+    enable_at = (datetime.strptime(target["mergedAt"], fmt).replace(tzinfo=timezone.utc) - timedelta(minutes=5)).strftime(fmt)
+
+    def reveal(page):
+        if page == 1:
+            target["events"] = [("AutoMergeEnabledEvent", enable_at), ("MergedEvent", target["mergedAt"])]
+    gh.after_audit_page = reveal
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+@needs_node
+def test_rescan_malformed_timeline_on_a_lower_ranked_pr_fails_closed(gh):
+    add_merged(gh, 10, timedelta(minutes=5), [], updated_ago=timedelta(minutes=1))
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    target = next(x for x in gh.merged if x["number"] == 9)
+
+    def corrupt(page):
+        if page == 1:
+            target["has_previous"] = True
+    gh.after_audit_page = corrupt
+    r = run(gh)
+    assert r.returncode != 0
+    assert "PR #9: auto-merge timeline incomplete" in r.stdout + r.stderr
+
+
 def test_audit_query_shape():
     compact = re.sub(r"\s+", " ", _script())
     for needle in (

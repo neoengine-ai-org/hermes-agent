@@ -18,8 +18,8 @@ name: auto-merge-disarm-reconciler
 # Merge DETECTION is best-effort, separate from disarming: after the armed
 # passes, every run audits every MERGED PR whose mergedAt is within the last 2
 # hours (merged PRs paginated by updatedAt DESC until a node older than the
-# window is seen, then re-walked from the top until no PR updated during a walk
-# remains unaudited) and raises an ::error:: (nonzero, no comment, no mutation) for
+# window is seen; the full window walk repeats until a walk finds no PR updated
+# since the previous one) and raises an ::error:: (nonzero, no comment, no mutation) for
 # any whose latest auto-merge event at or before the merge was an enable, i.e.
 # it merged via native auto-merge. A PR that merged via native auto-merge more
 # than 2 hours before any run executes is NOT alarmed. The alarm names the PR's
@@ -384,24 +384,21 @@ jobs:
           // Completeness argument. Merged PRs are listed ordered by updatedAt DESC.
           // A PR merged inside the window has updatedAt >= mergedAt >= cutoff, so a
           // walk from the top that continues until a page contains a node with
-          // updatedAt below its floor (or hasNextPage is false) sees every PR whose
-          // position did not change during the walk. A PR updated DURING a walk
-          // moves to the top, possibly ahead of the cursor, and gets an updatedAt at
-          // or after the walk's first-node updatedAt (GitHub's own clock). Each
-          // rescan therefore re-walks from the top down to the previous walk's
-          // first-node updatedAt and re-evaluates every returned in-window PR. The
-          // audit is complete when a rescan finds no new (PR, updatedAt) pair; it
-          // throws (indeterminate) after MAX_AUDIT_RESCANS rescans that keep finding
-          // new pairs, after MAX_PAGES pages in one walk, on an updatedAt ordering
-          // violation inside a walk, or when updatedAt precedes mergedAt. The
-          // argument assumes GitHub assigns updatedAt no earlier than the moment the
-          // change becomes visible to the API; a PR that becomes visible late is
-          // still in the window, so the next run's first walk sees it.
+          // updatedAt < cutoff (or hasNextPage is false) sees every in-window PR
+          // whose position did not change during the walk. A PR updated DURING a
+          // walk moves to the top, possibly ahead of the cursor. The audit therefore
+          // repeats the FULL window walk, validating and evaluating every returned
+          // in-window PR on every walk, until a walk finds no new (PR, updatedAt)
+          // pair; it throws (indeterminate) after MAX_AUDIT_RESCANS walks that keep
+          // finding new pairs, after MAX_PAGES pages in one walk, on an updatedAt
+          // ordering violation inside a walk, or when updatedAt precedes mergedAt.
+          // The decision is taken on the final stable walk: evidence the API first
+          // returns after that walk (e.g. a PR that becomes visible late) belongs to
+          // the next run, which re-audits everything still inside the window.
           const MAX_AUDIT_RESCANS = 5;
           async function walkMerged(floor, visit) {
             let cursor = null;
             let previousUpdated = Infinity;
-            let top = null;
             for (let page = 1; page <= MAX_PAGES; page += 1) {
               const data = await graphql(RECENT_MERGED, { owner, name: repoName, cursor });
               const conn = data.repository?.pullRequests;
@@ -414,12 +411,11 @@ jobs:
                 if (updatedAt > previousUpdated) throw new Error('recent-merge audit: updatedAt ordering violated (indeterminate)');
                 if (updatedAt < mergedAt) throw new Error(`recent-merge audit: PR #${pr.number} updatedAt precedes mergedAt (indeterminate)`);
                 previousUpdated = updatedAt;
-                if (top === null) top = updatedAt;
                 if (updatedAt < floor) { reachedFloor = true; continue; }
                 visit(pr, updatedAt, mergedAt);
               }
               cursor = nextCursor(conn.pageInfo, 'recent-merge audit');
-              if (reachedFloor || cursor === null) return top;
+              if (reachedFloor || cursor === null) return;
             }
             throw new Error(`recent-merge audit incomplete: exceeded ${MAX_PAGES} pages`);
           }
@@ -446,11 +442,10 @@ jobs:
                 failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
               }
             };
-            let top = await walkMerged(cutoff, visit);
+            await walkMerged(cutoff, visit);
             for (let rescan = 1; rescan <= MAX_AUDIT_RESCANS; rescan += 1) {
               fresh = 0;
-              const floor = Math.max(top ?? cutoff, cutoff);
-              top = await walkMerged(floor, visit);
+              await walkMerged(cutoff, visit);
               if (fresh === 0) return;
             }
             throw new Error(`recent-merge audit indeterminate: merged PRs kept changing across ${MAX_AUDIT_RESCANS} rescans`);
