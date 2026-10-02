@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
-import fnmatch
 import errno
 import hashlib
 import importlib.util
@@ -12,7 +11,7 @@ import io
 import json
 import os
 import re
-import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -114,204 +113,124 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
-# Bytecode caches: other processes sharing the checkout create ``__pycache__``
-# directories and atomically replace ``*.pyc`` files in them (temporary files
-# appear and vanish) while discovery runs. Only that churn is tolerated: a
-# non-Python, non-directory entry inside a cache may vanish mid-walk. Anything
-# that could be a tracked source or test -- a ``*.py`` entry, any directory,
-# the cache directory itself -- vanishing fails closed, because the execution
-# checkout would still contain it. Bytecode churn is also excluded from the
-# end-of-plan consistency check, so concurrent imports cannot trip it.
-_BYTECODE_CACHE = "__pycache__"
-_DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-_FILE_FLAGS = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+# Discovery and reads use the immutable git objects of the candidate commit --
+# the commit checked out at ``CANDIDATE_ROOT``, pinned to its full SHA once
+# per plan -- never the live filesystem. The test universe is exactly what the
+# execution checkout of that commit contains: untracked files and bytecode
+# caches do not exist in it, contents are content-addressed blobs, and a
+# concurrent change to the working tree cannot alter a plan.
+_REGULAR_MODES = {"100644", "100755"}
+_SYMLINK_MODE = "120000"
+_GITLINK_MODE = "160000"
+_GIT_ENVIRONMENT = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+}
 
-_Signature = tuple[int, int, int, int, int]  # st_dev, st_ino, st_size, st_mtime_ns, st_ctime_ns
-
-# Candidate root -> (st_dev, st_ino): bound at import for the configured root
-# (right after it is resolved), otherwise on first use; every later open must
-# reach that same directory.
-_ROOT_IDENTITY: dict[Path, tuple[int, int]] = {}
-# (root, relative path) -> signature of every regular ``*.py`` file, and
-# (root, relative path) -> identity of every non-cache directory, as the latest
-# discovery observed them. Reads must find exactly these objects.
-_DISCOVERED_FILES: dict[tuple[Path, str], _Signature] = {}
-_DISCOVERED_DIRECTORIES: dict[tuple[Path, str], tuple[int, int]] = {}
-
-
-def _signature(info: os.stat_result) -> _Signature:
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+# (root, commit) -> {path: (mode, object id)}; immutable for a given commit.
+_TREE_ENTRIES: dict[tuple[Path, str], dict[str, tuple[str, str]]] = {}
+# blob id -> raw bytes awaiting parse, and blob id -> parsed references /
+# dotted prefixes; content-addressed, so never stale.
+_PENDING_BLOBS: dict[str, bytes] = {}
+_REFERENCES_BY_BLOB: dict[str, frozenset[str]] = {}
+_PREFIXES_BY_BLOB: dict[str, frozenset[str]] = {}
+_PLAN: dict[str, object] | None = None
 
 
-def _open_nofollow(name: str, flags: int, dir_fd: int | None, label: str) -> int:
-    """``os.open`` relative to ``dir_fd`` that refuses a symlink (``ValueError``)."""
-    try:
-        return os.open(name, flags, dir_fd=dir_fd)
-    except FileNotFoundError:
-        raise
-    except OSError as error:
-        try:
-            is_link = stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode)
-        except OSError:
-            is_link = False
-        if is_link:
-            raise ValueError(f"runtime-OS discovery refuses symlink: {label}") from error
-        raise
+def _git(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    """Run plumbing git in ``root`` with a sanitized environment."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(_GIT_ENVIRONMENT)
+    completed = subprocess.run(
+        ["git", "-c", "core.fsmonitor=false", "-C", str(root), *args],
+        input=stdin,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"git {args[0]} failed in {root}: {detail}")
+    return completed.stdout
 
 
-def _open_root(root: Path) -> int:
-    """Open the candidate root through every component, checking its identity.
+def _resolve_candidate_commit(root: Path) -> str:
+    """Full SHA of the commit checked out at ``root`` (the repository top level)."""
+    if os.path.realpath(root) != str(root):
+        raise ValueError(f"candidate root must not be a symlink or contain one: {root}")
+    top_level = _git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()
+    if os.path.realpath(top_level) != str(root):
+        raise ValueError(f"candidate root must be the repository top level: {root} (found {top_level})")
+    commit = _git(root, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}").decode("ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise ValueError(f"unexpected commit id from git: {commit!r}")
+    return commit
 
-    Each component from ``/`` is opened with ``O_NOFOLLOW`` relative to its
-    parent's descriptor, so an ancestor replaced by a symlink raises; the
-    opened root must also be the directory bound for this root, so an
-    ancestor replaced by a different real directory raises too.
+
+def _tree_entries(root: Path, commit: str) -> dict[str, tuple[str, str]]:
+    key = (root, commit)
+    entries = _TREE_ENTRIES.get(key)
+    if entries is None:
+        entries = {}
+        for record in _git(root, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
+            if not record:
+                continue
+            header, _, raw_path = record.partition(b"\t")
+            mode, kind, object_id = header.decode("ascii").split(" ")
+            path = raw_path.decode("utf-8", "surrogateescape")
+            if kind not in {"blob", "commit"}:
+                raise ValueError(f"unexpected tree entry {kind} for {path!r}")
+            entries[path] = (mode, object_id)
+        _TREE_ENTRIES[key] = entries
+    return entries
+
+
+def _candidate_tree() -> tuple[str, dict[str, tuple[str, str]]]:
+    """The pinned candidate commit and its entries (one commit per plan)."""
+    if _PLAN is not None and _PLAN.get("root") == CANDIDATE_ROOT and _PLAN.get("commit"):
+        commit = str(_PLAN["commit"])
+    else:
+        commit = _resolve_candidate_commit(CANDIDATE_ROOT)
+        if _PLAN is not None:
+            _PLAN["root"], _PLAN["commit"] = CANDIDATE_ROOT, commit
+    return commit, _tree_entries(CANDIDATE_ROOT, commit)
+
+
+def _tree_python_files(prefix: tuple[str, ...], prune) -> list[str]:
+    """Regular ``*.py`` blobs of the pinned commit under ``prefix``.
+
+    Entries below a directory for which ``prune(parts)`` is true are skipped.
+    Any other symlink (pytest could collect through it, and a link can
+    resolve differently in another checkout) or gitlink raises, as does a
+    ``prefix`` that is absent from, or not a directory in, the commit.
     """
-    if not root.is_absolute():
-        raise ValueError(f"candidate root must be absolute: {root}")
-    directory_fd = os.open(root.anchor, _DIRECTORY_FLAGS)
-    try:
-        for name in root.parts[1:]:
-            child_fd = _open_nofollow(name, _DIRECTORY_FLAGS, directory_fd, str(root))
-            os.close(directory_fd)
-            directory_fd = child_fd
-        opened = os.fstat(directory_fd)
-        identity = (opened.st_dev, opened.st_ino)
-        if _ROOT_IDENTITY.setdefault(root, identity) != identity:
-            raise ValueError(f"candidate root changed after it was bound: {root}")
-    except BaseException:
-        os.close(directory_fd)
-        raise
-    return directory_fd
-
-
-def _bind_configured_root() -> None:
-    try:
-        os.close(_open_root(CANDIDATE_ROOT))
-    except FileNotFoundError:
-        pass  # bound on first use if it appears later
-
-
-_bind_configured_root()
-
-
-def _open_bound_child(parent_fd: int, name: str, label: str, info: os.stat_result | None = None) -> int:
-    """Open directory ``name`` of ``parent_fd``, bound to what was classified.
-
-    ``info`` is the entry's ``lstat`` (taken now when not given). A symlink
-    raises ``ValueError``, a non-directory ``NotADirectoryError``; the opened
-    descriptor must be that same directory, so a replacement between
-    classification and open raises.
-    """
-    if info is None:
-        info = os.lstat(name, dir_fd=parent_fd)
-    if stat.S_ISLNK(info.st_mode):
-        raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
-    if not stat.S_ISDIR(info.st_mode):
-        raise NotADirectoryError(errno.ENOTDIR, "Not a directory", label)
-    child_fd = _open_nofollow(name, _DIRECTORY_FLAGS, parent_fd, label)
-    opened = os.fstat(child_fd)
-    if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
-        os.close(child_fd)
-        raise ValueError(f"{label} changed during discovery")
-    return child_fd
-
-
-def _open_relative(root_fd: int, parts: tuple[str, ...]) -> int:
-    """Open directory ``parts`` below ``root_fd`` (consumed), bound and no-follow."""
-    directory_fd = root_fd
-    try:
-        for index, name in enumerate(parts):
-            child_fd = _open_bound_child(directory_fd, name, "/".join(parts[: index + 1]))
-            os.close(directory_fd)
-            directory_fd = child_fd
-    except BaseException:
-        os.close(directory_fd)
-        raise
-    return directory_fd
-
-
-def _walk_py_files(start: Path, prune) -> tuple[dict[str, _Signature], dict[str, tuple[int, int]]]:
-    """Snapshot of every regular ``*.py`` file and directory under ``start``.
-
-    Returns ``({relative file: signature}, {relative directory: identity})``.
-    Directories for which ``prune(parts)`` is true (``parts`` relative to
-    ``CANDIDATE_ROOT``) are never entered. The root is anchored by
-    ``_open_root``; ``start`` and every child directory are opened with
-    ``O_NOFOLLOW`` relative to the parent's descriptor and must be the same
-    directory that was listed (``d_ino``) and classified (``lstat``). A
-    non-pruned symlink that pytest could collect through (a ``*.py`` link, a
-    link to a directory, or a dangling link) raises, as does a
-    missing or non-directory ``start``, any listing or classification error,
-    and any vanished entry except bytecode churn (see ``_BYTECODE_CACHE``).
-    """
-    start_parts = start.relative_to(CANDIDATE_ROOT).parts
-    files: dict[str, _Signature] = {}
-    directories: dict[str, tuple[int, int]] = {}
-    directory_fd = _open_root(CANDIDATE_ROOT)
-    try:
-        for index, name in enumerate(start_parts):
-            label = "/".join(start_parts[: index + 1])
-            child_fd = _open_bound_child(directory_fd, name, label)
-            os.close(directory_fd)
-            directory_fd = child_fd
-            opened = os.fstat(directory_fd)
-            directories[label] = (opened.st_dev, opened.st_ino)
-
-        def walk(current_fd: int, relative: tuple[str, ...]) -> None:
-            in_cache = _BYTECODE_CACHE in relative
-            with os.scandir(current_fd) as scanner:
-                entries = sorted(scanner, key=lambda entry: entry.name)
-            for entry in entries:
-                parts = relative + (entry.name,)
-                label = "/".join(parts)
-                is_python = fnmatch.fnmatchcase(entry.name, "*.py")
-                try:
-                    info = os.lstat(entry.name, dir_fd=current_fd)
-                except FileNotFoundError:
-                    if in_cache and not is_python and not entry.is_dir(follow_symlinks=False):
-                        continue  # bytecode churn
-                    raise
-                if stat.S_ISLNK(info.st_mode):
-                    if prune(parts):
-                        continue
-                    # pytest collects through a link that is a *.py file or
-                    # leads to a directory; a dangling link's target could
-                    # appear as one. Only a link to an existing non-Python
-                    # file is inert (the end-of-plan re-walk re-checks it).
-                    if is_python:
-                        raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
-                    try:
-                        target = os.stat(entry.name, dir_fd=current_fd)
-                    except FileNotFoundError:
-                        raise ValueError(f"runtime-OS discovery refuses dangling symlink: {label}") from None
-                    if stat.S_ISDIR(target.st_mode):
-                        raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
-                    continue
-                if stat.S_ISREG(info.st_mode):
-                    if is_python:
-                        files[label] = _signature(info)
-                    continue
-                if not stat.S_ISDIR(info.st_mode) or prune(parts):
-                    continue
-                if entry.inode() != info.st_ino:
-                    raise ValueError(f"{label} changed during discovery")
-                child_fd = _open_bound_child(current_fd, entry.name, label, info)
-                try:
-                    if not (in_cache or entry.name == _BYTECODE_CACHE):
-                        directories[label] = (info.st_dev, info.st_ino)
-                    walk(child_fd, parts)
-                finally:
-                    os.close(child_fd)
-
-        walk(directory_fd, start_parts)
-    finally:
-        os.close(directory_fd)
-    for label, signature in files.items():
-        _DISCOVERED_FILES[(CANDIDATE_ROOT, label)] = signature
-    for label, identity in directories.items():
-        _DISCOVERED_DIRECTORIES[(CANDIDATE_ROOT, label)] = identity
-    return files, directories
+    _, entries = _candidate_tree()
+    label = "/".join(prefix)
+    if prefix and label in entries:
+        mode = entries[label][0]
+        if mode == _SYMLINK_MODE:
+            raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory in the candidate commit", label)
+    found: list[str] = []
+    seen_prefix = not prefix
+    for path, (mode, _) in entries.items():
+        parts = tuple(path.split("/"))
+        if parts[: len(prefix)] != prefix:
+            continue
+        seen_prefix = True
+        if any(prune(parts[: index + 1]) for index in range(len(prefix), len(parts) - 1)):
+            continue
+        if mode == _SYMLINK_MODE:
+            raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+        if mode == _GITLINK_MODE:
+            raise ValueError(f"runtime-OS discovery refuses submodule: {path}")
+        if mode in _REGULAR_MODES and path.endswith(".py"):
+            found.append(path)
+    if not seen_prefix:
+        raise FileNotFoundError(errno.ENOENT, "Not present in the candidate commit", label)
+    return found
 
 
 _TEST_SKIP_PARTS = {"integration", "e2e", "docker"}
@@ -330,32 +249,20 @@ def _prune_sources(parts: tuple[str, ...]) -> bool:
     return parts[-1] in _SOURCE_EXCLUDED or (len(parts) == 1 and parts[0] in _SOURCE_GENERATED_ROOTS)
 
 
-_SCOPES = {
-    "tests": (lambda: CANDIDATE_ROOT / "tests", _prune_tests),
-    "sources": (lambda: CANDIDATE_ROOT, _prune_sources),
-}
-
-
-def _discover(scope: str) -> dict[str, _Signature]:
-    """Discovery snapshot for ``scope``; one consistent snapshot per plan."""
-    if _PLAN is not None:
-        key = (CANDIDATE_ROOT, scope)
-        if key not in _PLAN["universes"]:  # type: ignore[operator]
-            _PLAN["universes"][key] = _walk_py_files(_SCOPES[scope][0](), _SCOPES[scope][1])  # type: ignore[index]
-        return _PLAN["universes"][key][0]  # type: ignore[index]
-    return _walk_py_files(_SCOPES[scope][0](), _SCOPES[scope][1])[0]
-
-
 def discover_tests() -> list[str]:
     return sorted(
         path
-        for path in _discover("tests")
+        for path in _tree_python_files(("tests",), _prune_tests)
         if Path(path).name.startswith("test_") and not (set(Path(path).parts) & _TEST_SKIP_PARTS)
     )
 
 
 def discover_python_sources() -> list[str]:
-    return sorted(path for path in _discover("sources") if not (set(Path(path).parts) & _SOURCE_EXCLUDED))
+    return sorted(
+        path
+        for path in _tree_python_files((), _prune_sources)
+        if not (set(Path(path).parts) & _SOURCE_EXCLUDED)
+    )
 
 
 def _module_name(path: str) -> str:
@@ -381,101 +288,66 @@ def _iter_nodes(tree: ast.AST):
                 stack.append(value)
 
 
-def _candidate_stat(root: Path, path: str) -> os.stat_result | None:
-    """``lstat`` of ``root/path`` through the anchored, bound no-follow chain.
-
-    ``None`` when it does not exist; a symlink anywhere on the path (the final
-    component included) raises ``ValueError``.
-    """
-    parts = Path(path).parts
-    try:
-        directory_fd = _open_relative(_open_root(root), parts[:-1])
-    except (FileNotFoundError, NotADirectoryError):
-        return None
-    try:
-        info = os.lstat(parts[-1], dir_fd=directory_fd)
-    except FileNotFoundError:
-        return None
-    finally:
-        os.close(directory_fd)
-    if stat.S_ISLNK(info.st_mode):
-        raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
-    return info
-
-
-def _read_candidate_bytes(root: Path, path: str) -> bytes:
-    """Read ``root/path`` exactly as the latest discovery observed it.
-
-    The root is anchored (once per plan); every directory on the path is
-    opened bound and no-follow and must be the directory discovery recorded;
-    the file is opened no-follow and its signature must match discovery's
-    both before and after the read, so a replacement, an in-place rewrite,
-    or a write during the read raises instead of being parsed.
-    """
-    parts = Path(path).parts
-    if _PLAN is not None and root == CANDIDATE_ROOT:
-        if _PLAN.get("root") is None:
-            _PLAN["root"] = _open_root(root)
-        directory_fd = os.dup(_PLAN["root"])  # type: ignore[arg-type]
-    else:
-        directory_fd = _open_root(root)
-    try:
-        for index, name in enumerate(parts[:-1]):
-            label = "/".join(parts[: index + 1])
-            child_fd = _open_bound_child(directory_fd, name, label)
-            os.close(directory_fd)
-            directory_fd = child_fd
-            expected = _DISCOVERED_DIRECTORIES.get((root, label))
-            opened = os.fstat(directory_fd)
-            if expected is not None and (opened.st_dev, opened.st_ino) != expected:
-                raise ValueError(f"{label} changed after discovery")
-        file_fd = _open_nofollow(parts[-1], _FILE_FLAGS, directory_fd, path)
-    finally:
-        os.close(directory_fd)
-    with os.fdopen(file_fd, "rb") as handle:
-        before = os.fstat(handle.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise ValueError(f"{path} is not a regular file")
-        expected_file = _DISCOVERED_FILES.get((root, path))
-        if expected_file is not None and _signature(before) != expected_file:
-            raise ValueError(f"{path} changed after discovery")
-        data = handle.read()
-        after = os.fstat(handle.fileno())
-    if _signature(after) != _signature(before) or len(data) != after.st_size:
-        raise ValueError(f"{path} changed while it was read")
-    return data
-
-
 def _decode_source(data: bytes) -> str:
     """Decode exactly like ``Path.read_text(encoding="utf-8")`` (universal newlines)."""
     return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8").read()
 
 
-def _read_candidate(root: Path, path: str) -> str:
-    return _decode_source(_read_candidate_bytes(root, path))
+def _fetch_blobs(object_ids: list[str]) -> None:
+    """Load blobs with one ``git cat-file --batch``, verifying id and type."""
+    if not object_ids:
+        return
+    output = _git(CANDIDATE_ROOT, "cat-file", "--batch", stdin="".join(f"{oid}\n" for oid in object_ids).encode("ascii"))
+    offset = 0
+    for object_id in object_ids:
+        newline = output.index(b"\n", offset)
+        header = output[offset:newline].decode("ascii").split(" ")
+        if len(header) != 3 or header[0] != object_id or header[1] != "blob":
+            raise ValueError(f"git returned {header!r} for blob {object_id}")
+        size = int(header[2])
+        start = newline + 1
+        _PENDING_BLOBS[object_id] = output[start : start + size]
+        if output[start + size : start + size + 1] != b"\n":
+            raise ValueError(f"malformed git cat-file output for blob {object_id}")
+        offset = start + size + 1
 
 
-# Parse results are cached by the SHA-256 of the exact bytes read, never by
-# path or inode, and every lookup re-reads the candidate against the current
-# discovery snapshot, so a stale parse can never answer for changed content.
-# Within one plan each file is read once and the root is anchored once.
-_REFERENCES_BY_DIGEST: dict[bytes, frozenset[str]] = {}
-_PREFIXES_BY_DIGEST: dict[bytes, frozenset[str]] = {}
-_PLAN: dict[str, object] | None = None
+def _blob_for(path: str) -> str:
+    """Blob id of ``path`` in the pinned commit; a symlink or non-file raises."""
+    _, entries = _candidate_tree()
+    entry = entries.get(path)
+    if entry is None:
+        raise FileNotFoundError(errno.ENOENT, "Not present in the candidate commit", path)
+    mode, object_id = entry
+    if mode == _SYMLINK_MODE:
+        raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+    if mode not in _REGULAR_MODES:
+        raise ValueError(f"{path} is not a regular file in the candidate commit")
+    if object_id not in _REFERENCES_BY_BLOB and object_id not in _PENDING_BLOBS:
+        # Fetch every unparsed Python blob of the commit at once.
+        _fetch_blobs(
+            sorted(
+                {
+                    oid
+                    for name, (entry_mode, oid) in entries.items()
+                    if entry_mode in _REGULAR_MODES
+                    and name.endswith(".py")
+                    and oid not in _REFERENCES_BY_BLOB
+                    and oid not in _PENDING_BLOBS
+                }
+                | {object_id}
+            )
+        )
+    return object_id
 
 
-def _candidate_digest(path: str) -> bytes:
-    key = (CANDIDATE_ROOT, path)
-    digests = _PLAN["digests"] if _PLAN is not None else None
-    if digests is not None and key in digests:  # type: ignore[operator]
-        return digests[key]  # type: ignore[index]
-    data = _read_candidate_bytes(CANDIDATE_ROOT, path)
-    digest = hashlib.sha256(data).digest()
-    if digest not in _REFERENCES_BY_DIGEST:
-        _REFERENCES_BY_DIGEST[digest] = _parse_references(_decode_source(data), path)
-    if digests is not None:
-        digests[key] = digest  # type: ignore[index]
-    return digest
+def _candidate_source(path: str) -> str:
+    object_id = _blob_for(path)
+    data = _PENDING_BLOBS.get(object_id)
+    if data is None:
+        _fetch_blobs([object_id])
+        data = _PENDING_BLOBS[object_id]
+    return _decode_source(data)
 
 
 def _parse_references(source: str, path: str) -> frozenset[str]:
@@ -504,7 +376,13 @@ def _parse_references(source: str, path: str) -> frozenset[str]:
 
 
 def _module_references(path: str) -> frozenset[str]:
-    return _REFERENCES_BY_DIGEST[_candidate_digest(path)]
+    object_id = _blob_for(path)
+    references = _REFERENCES_BY_BLOB.get(object_id)
+    if references is None:
+        references = _parse_references(_candidate_source(path), path)
+        _REFERENCES_BY_BLOB[object_id] = references
+        _PENDING_BLOBS.pop(object_id, None)
+    return references
 
 
 def _imports_module(path: str, module_name: str) -> bool:
@@ -520,14 +398,17 @@ def _reference_prefixes(path: str) -> frozenset[str]:
 
     ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
     """
-    digest = _candidate_digest(path)
-    prefixes = _PREFIXES_BY_DIGEST.get(digest)
+    object_id = _blob_for(path)
+    prefixes = _PREFIXES_BY_BLOB.get(object_id)
+    if prefixes is not None:
+        return prefixes
+    references = _module_references(path)
     if prefixes is None:
         expanded: set[str] = set()
-        for reference in _REFERENCES_BY_DIGEST[digest]:
+        for reference in references:
             parts = reference.split(".")
             expanded.update(".".join(parts[: index + 1]) for index in range(len(parts)))
-        prefixes = _PREFIXES_BY_DIGEST[digest] = frozenset(expanded)
+        prefixes = _PREFIXES_BY_BLOB[object_id] = frozenset(expanded)
     return prefixes
 
 
@@ -564,32 +445,16 @@ def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
 
 @contextlib.contextmanager
 def _plan_snapshot():
-    """One consistent plan: each scope discovered once, each file read once.
-
-    On success the plan re-walks every scope it used and requires the same
-    snapshot (every ``*.py`` file's identity, size and timestamps and every
-    non-cache directory's identity); a candidate tree that changed while it
-    was being planned -- an addition, removal, replacement or rewrite --
-    raises instead of yielding a selection that may no longer describe it.
-    """
+    """Pin one candidate commit for the whole plan (nested plans share it)."""
     global _PLAN
     if _PLAN is not None:
-        yield  # nested: the outer plan owns the snapshot and its check
+        yield
         return
-    plan: dict[str, object] = {"digests": {}, "universes": {}, "root": None}
-    _PLAN = plan
+    _PLAN = {}
     try:
         yield
-        _PLAN = None
-        for (root, scope), observed in plan["universes"].items():  # type: ignore[attr-defined]
-            if root != CANDIDATE_ROOT:
-                raise ValueError("candidate root changed during planning")
-            if _walk_py_files(_SCOPES[scope][0](), _SCOPES[scope][1]) != observed:
-                raise ValueError(f"candidate {scope} changed during planning")
     finally:
         _PLAN = None
-        if plan["root"] is not None:
-            os.close(plan["root"])  # type: ignore[arg-type]
 
 
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
@@ -611,15 +476,13 @@ def _select_tests(files: list[str]) -> tuple[list[str], bool]:
             continue
         path = raw.removeprefix("./")
         candidate = CANDIDATE_ROOT / path
-        if (
-            path.startswith("tests/")
-            and candidate.suffix in TEST_SUFFIXES
-            and candidate.name.startswith("test_")
-            and (info := _candidate_stat(CANDIDATE_ROOT, path)) is not None
-            and stat.S_ISREG(info.st_mode)
-        ):
-            selected.add(path)
-            continue
+        if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.name.startswith("test_"):
+            mode = _candidate_tree()[1].get(path, ("",))[0]
+            if mode == _SYMLINK_MODE:
+                raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+            if mode in _REGULAR_MODES:
+                selected.add(path)
+                continue
         suffix = candidate.suffix.lower()
         if suffix not in executable_suffixes and candidate.name not in EXECUTABLE_NAMES:
             if not classifier.is_documentation_file(path):
@@ -711,10 +574,11 @@ def plan(args: argparse.Namespace) -> int:
     classification = load_classifier().classify(files, body, additions=args.additions, pr_number=args.pr_number, repo=args.repo)
     review_classification = build_review_classification(classification)
     run_full, reason = full_proof(files, args.event_name, policy)
-    selected, unknown = select_tests(files)
-    if unknown:
-        run_full, reason = True, "unknown_executable_fails_closed"
-    tests = discover_tests() if run_full else selected
+    with _plan_snapshot():  # selection and full-proof discovery see one commit
+        selected, unknown = select_tests(files)
+        if unknown:
+            run_full, reason = True, "unknown_executable_fails_closed"
+        tests = discover_tests() if run_full else selected
     # The matrix travels colon-joined; a path containing ':' would split into
     # decoy paths and the real file would never run.
     ambiguous = sorted(
