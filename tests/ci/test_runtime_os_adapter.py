@@ -30,11 +30,12 @@ def _build_repository_reference_index() -> None:
 
     The whole-repo import closure must parse every source and test file
     (~36 MB of Python). Parse results are cached by git blob id, so the parse
-    happens once per process; ``tests/ci/conftest.py`` builds it from
-    ``pytest_collection_finish`` (only when tests from this module are
-    selected, never for ``--collect-only``) so that one-time cost sits under
-    the runner's per-file guard instead of being charged to whichever test
-    runs first under the 30 s per-test hang guard. Errors are not cached, so
+    happens once per process; ``tests/ci/conftest.py`` builds it lazily, as
+    the outermost ``pytest_runtest_protocol`` wrapper of the first test from
+    this module that the process runs (never for ``--collect-only``, nor in
+    an xdist worker scheduled none of them), so that one-time cost sits
+    under the runner's per-file guard instead of being charged to whichever
+    test runs first under the 30 s per-test hang guard. Errors are not cached, so
     files that fail to parse are re-raised to ``select_tests`` as before.
     """
     with adapter._plan_snapshot():  # one pinned commit: resolve HEAD once
@@ -507,33 +508,112 @@ def test_reference_cache_is_content_addressed_per_candidate_root(monkeypatch, tm
     assert "agent.beta" in prefixes and "agent.alpha" not in prefixes
 
 
-def test_collection_hook_builds_index_only_when_adapter_tests_run() -> None:
-    import importlib.util as _util
+def _load_ci_conftest():
+    spec = importlib.util.spec_from_file_location("_tests_ci_conftest", ROOT / "tests/ci/conftest.py")
+    assert spec and spec.loader
+    hook_module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook_module)
+    return hook_module
+
+
+def test_runtest_hook_builds_index_once_and_only_for_adapter_tests() -> None:
     from types import SimpleNamespace
 
-    spec = _util.spec_from_file_location("_tests_ci_conftest", ROOT / "tests/ci/conftest.py")
-    assert spec and spec.loader
-    hook_module = _util.module_from_spec(spec)
-    spec.loader.exec_module(hook_module)
+    hook_module = _load_ci_conftest()
     calls: list[str] = []
 
     class _Module:
         def _build_repository_reference_index(self) -> None:
             calls.append("built")
 
-    adapter_item = SimpleNamespace(module=_Module(), path=Path("tests/ci/test_runtime_os_adapter.py"))
-    adapter_item_2 = SimpleNamespace(module=adapter_item.module, path=adapter_item.path)
+    adapter_module = _Module()
+    adapter_item = SimpleNamespace(module=adapter_module, path=Path("tests/ci/test_runtime_os_adapter.py"))
     other_item = SimpleNamespace(module=_Module(), path=Path("tests/ci/test_other.py"))
 
-    def session(items, collect_only=False):
-        return SimpleNamespace(config=SimpleNamespace(option=SimpleNamespace(collectonly=collect_only)), items=items)
+    def run(item) -> None:
+        wrapper = hook_module.pytest_runtest_protocol(item, None)
+        next(wrapper)  # everything before the yield runs before inner wrappers
+        with pytest.raises(StopIteration):
+            wrapper.send(True)
 
-    hook_module.pytest_collection_finish(session([adapter_item, adapter_item_2], collect_only=True))
+    run(other_item)
     assert calls == []
-    hook_module.pytest_collection_finish(session([other_item]))
-    assert calls == []
-    hook_module.pytest_collection_finish(session([other_item, adapter_item, adapter_item_2]))
+    run(adapter_item)
+    run(SimpleNamespace(module=adapter_module, path=adapter_item.path))
     assert calls == ["built"]
+
+
+_HOOK_PROBE_TEST = """
+import os, time
+from pathlib import Path
+
+def _build_repository_reference_index():
+    with Path(os.environ["INDEX_BUILD_LOG"]).open("a", encoding="utf-8") as handle:
+        handle.write(f"{os.getpid()}\\n")
+    time.sleep(1.5)
+
+def test_adapter_one():
+    pass
+
+def test_adapter_two():
+    pass
+"""
+
+
+def _run_hook_probe(tmp_path, *extra: str) -> tuple[subprocess.CompletedProcess, list[str]]:
+    """Run pytest on a probe tree using the real tests/ci/conftest.py hook.
+
+    The probe's index build sleeps 1.5 s under a 0.5 s per-test timeout, so a
+    build charged to any test's timer fails that test.
+    """
+    probe = tmp_path / "probe"
+    probe.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / "tests/ci/conftest.py", probe / "conftest.py")
+    (probe / "pytest.ini").write_text("[pytest]\n", encoding="utf-8")
+    (probe / "test_runtime_os_adapter.py").write_text(_HOOK_PROBE_TEST, encoding="utf-8")
+    (probe / "test_other.py").write_text(
+        "".join(f"def test_other_{index}():\n    pass\n\n" for index in range(8)), encoding="utf-8"
+    )
+    log = tmp_path / "builds.log"
+    log.unlink(missing_ok=True)
+    environment = {**os.environ, "INDEX_BUILD_LOG": str(log)}
+    environment.pop("PYTEST_ADDOPTS", None)
+    completed = subprocess.run(
+        [
+            sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-c", str(probe / "pytest.ini"),
+            "--rootdir", str(probe), "--timeout=0.5", "--timeout-method=signal", *extra, str(probe),
+        ],
+        capture_output=True,
+        text=True,
+        env=environment,
+        cwd=probe,
+        timeout=25,
+        check=False,
+    )
+    builds = log.read_text(encoding="utf-8").split() if log.exists() else []
+    return completed, builds
+
+
+def test_index_build_runs_outside_the_per_test_timeout(tmp_path) -> None:
+    pytest.importorskip("pytest_timeout")
+    completed, builds = _run_hook_probe(tmp_path)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert len(builds) == 1
+    completed, builds = _run_hook_probe(tmp_path, "-k", "other")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert builds == []
+    completed, builds = _run_hook_probe(tmp_path, "--collect-only")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert builds == []
+
+
+def test_xdist_workers_without_adapter_tests_skip_the_index_build(tmp_path) -> None:
+    pytest.importorskip("pytest_timeout")
+    pytest.importorskip("xdist")
+    # loadfile pins the adapter module to one worker; the others never build.
+    completed, builds = _run_hook_probe(tmp_path, "-n", "3", "--dist", "loadfile")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert len(builds) == 1
 
 
 def test_prefix_index_matches_reference_import_semantics() -> None:
@@ -635,6 +715,45 @@ def test_p1_plan_pins_one_commit_even_if_head_moves_mid_plan(tmp_path, monkeypat
     assert adapter.select_tests(["pkg/old.py"]) == (["tests/unit/test_probe.py"], False)
     monkeypatch.setattr(adapter, "_impacted_closure", real_closure)
     assert "tests/unit/test_added.py" in adapter.select_tests(["pkg/old.py"])[0]
+
+
+def test_p1_plan_full_proof_discovery_uses_the_selection_commit(tmp_path, monkeypatch) -> None:
+    # plan() selects, then (full proof) rediscovers tests; HEAD moving between
+    # the two must not change the commit full-proof discovery reads.
+    root = _probe_candidate(tmp_path, monkeypatch)
+    output = tmp_path / "github-output"
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    real_select, real_discover = adapter.select_tests, adapter.discover_tests
+    selection_commit: list[str] = []
+    discovery_commits: list[str] = []
+
+    def select_then_commit(files):
+        result = real_select(files)
+        selection_commit.append(str(adapter._PLAN["commit"]))
+        _commit(root, {"tests/unit/test_added.py": "import pkg.old\n"})
+        return result
+
+    def recording_discover():
+        discovered = real_discover()
+        discovery_commits.append(str(adapter._PLAN["commit"]))
+        return discovered
+
+    monkeypatch.setattr(adapter, "select_tests", select_then_commit)
+    monkeypatch.setattr(adapter, "discover_tests", recording_discover)
+    # A push to main forces full proof; selection still reads the tree first.
+    assert adapter.plan(_plan_args(tmp_path, ["pkg/old.py"])) == 0
+    plan_output = json.loads(output.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1])
+    assert plan_output["full_proof"] is True
+    # Selection's own discovery, then plan()'s full-proof discovery after HEAD moved.
+    assert len(discovery_commits) == 2
+    assert set(discovery_commits) == set(selection_commit)
+    assert selection_commit[0] != _git(root, "rev-parse", "HEAD")
+    planned = ":".join(entry["files"] for entry in plan_output["matrix"]["include"]).split(":")
+    assert sorted(planned) == ["tests/unit/test_new.py", "tests/unit/test_probe.py"]
+    # A fresh plan sees the moved HEAD.
+    monkeypatch.setattr(adapter, "select_tests", real_select)
+    monkeypatch.setattr(adapter, "discover_tests", real_discover)
+    assert "tests/unit/test_added.py" in adapter.discover_tests()
 
 
 def test_p2_tracked_test_inside_bytecode_cache_is_selected(tmp_path, monkeypatch) -> None:
@@ -777,3 +896,52 @@ def test_g1_blob_batch_only_fetches_the_discovered_universe(tmp_path, monkeypatc
     adapter._module_references("agent/core.py")
     venv_blob = adapter._candidate_tree()[1][".venv/lib/big.py"][1]
     assert venv_blob not in fetched
+
+
+def test_g1_blob_batch_skips_non_test_helpers_under_tests(tmp_path, monkeypatch) -> None:
+    helpers = {
+        "tests/conftest.py": "x = 1\n" * 5000,
+        "tests/fixtures/big_fixture.py": "y = 2\n" * 5000,
+        "tests/unit/helpers.py": "z = 3\n" * 5000,
+        "tests/e2e/test_pruned.py": "import agent.core\n",
+    }
+    _candidate(
+        tmp_path,
+        monkeypatch,
+        {
+            # Unique contents: the parse cache is process-wide and keyed by blob id.
+            "agent/__init__.py": "# g1 helper-scope package\n",
+            "agent/core.py": "import os  # g1 helper-scope module\n",
+            # Selected through its import, not by its file stem, so it is read.
+            "tests/unit/test_g1_probe.py": "import agent.core  # g1 helper-scope probe\n",
+            **helpers,
+        },
+    )
+    fetched: list[str] = []
+    real_fetch = adapter._fetch_blobs
+
+    def recording_fetch(object_ids):
+        fetched.extend(object_ids)
+        return real_fetch(object_ids)
+
+    monkeypatch.setattr(adapter, "_fetch_blobs", recording_fetch)
+    assert adapter.select_tests(["agent/core.py"]) == (["tests/unit/test_g1_probe.py"], False)
+    entries = adapter._candidate_tree()[1]
+    assert not {entries[path][1] for path in helpers} & set(fetched)
+    assert entries["tests/unit/test_g1_probe.py"][1] in fetched
+    # A helper read directly is still fetched (and parsed) on demand.
+    assert "os" not in adapter._module_references("tests/conftest.py")
+    assert entries["tests/conftest.py"][1] in fetched
+
+
+def test_blob_batch_universe_is_exactly_what_discovery_returns() -> None:
+    with adapter._plan_snapshot():
+        _, entries = adapter._candidate_tree()
+        universe = {
+            path
+            for path, (mode, _) in entries.items()
+            if mode in adapter._REGULAR_MODES and path.endswith(".py") and adapter._in_discoverable_universe(path)
+        }
+        discovered = set(adapter.discover_python_sources()) | set(adapter.discover_tests())
+    assert universe == discovered
+    assert "tests/ci/conftest.py" not in universe
