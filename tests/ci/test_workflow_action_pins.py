@@ -146,7 +146,9 @@ def test_discovery_is_not_empty() -> None:
     # An empty parametrize list is a pytest skip, not a failure.
     assert WORKFLOWS, "no workflows discovered"
     assert COMPOSITE_ACTIONS, "no composite actions discovered"
-    assert "auto-arm-auto-merge.yml" in {path.name for path in PRT_WORKFLOWS}
+    # The privileged pull_request_target canary; #99 replaced the old auto-arm
+    # workflow with this disarm-only reconciler.
+    assert "auto-merge-disarm-reconciler.yml" in {path.name for path in PRT_WORKFLOWS}
     assert sum(len(_collect_uses(path)[0]) for path in WORKFLOWS) > 0
 
 
