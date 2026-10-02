@@ -18,7 +18,8 @@ name: auto-merge-disarm-reconciler
 # Merge DETECTION is best-effort, separate from disarming: after the armed
 # passes, every run audits every MERGED PR whose mergedAt is within the last 2
 # hours (merged PRs paginated by updatedAt DESC until a node older than the
-# window is seen) and raises an ::error:: (nonzero, no comment, no mutation) for
+# window is seen, then re-walked from the top until no PR updated during a walk
+# remains unaudited) and raises an ::error:: (nonzero, no comment, no mutation) for
 # any whose latest auto-merge event at or before the merge was an enable, i.e.
 # it merged via native auto-merge. A PR that merged via native auto-merge more
 # than 2 hours before any run executes is NOT alarmed. The alarm names the PR's
@@ -26,8 +27,9 @@ name: auto-merge-disarm-reconciler
 #
 # Fail closed (invariant d): any API response that cannot prove the state it is
 # read for (missing/mistyped pageInfo, node fields, autoMergeRequest, mergedAt,
-# updatedAt, timeline items, or a truncated timeline) throws and fails the run;
-# it is never treated as clean.
+# updatedAt, timeline items, or a truncated timeline), and any PR that reads as
+# not OPEN while still armed, throws and fails the run; it is never treated as
+# clean.
 #
 # Evidence rule: GitHub's own AutoMergeDisabledEvent in the PR timeline (actor
 # and time) is the authoritative durable record of a disarm. The PR comment is a
@@ -290,7 +292,12 @@ jobs:
               console.log(`::error::PR #${live.number} head ${live.headRefOid}: native auto-merge merged before disarm`);
               throw new Error(`PR #${live.number}: merged before disarm (drift alarm)`);
             }
-            if (live.state !== 'OPEN' || live.autoMergeRequest === null) return 'skip';
+            if (live.autoMergeRequest === null) return 'skip';
+            if (live.state !== 'OPEN') {
+              // Not open yet still armed (e.g. closed after the armed listing saw it):
+              // it cannot be proven disarmed and later listings would not show it.
+              throw new Error(`PR #${live.number}: ${live.state} but still armed (indeterminate)`);
+            }
             await graphql(DISARM, { id: live.id });
             const after = await fetchPr(live.number);
             if (after.state === 'MERGED') {
@@ -374,45 +381,71 @@ jobs:
 
           // Detection only: no comment, no mutation.
           //
-          // Completeness argument: merged PRs are listed ordered by updatedAt DESC.
-          // A PR merged inside the window has updatedAt >= mergedAt >= cutoff, so it
-          // must appear before any node whose updatedAt < cutoff. Pagination therefore
-          // continues until a page contains a node with updatedAt < cutoff, or
-          // hasNextPage is false; every in-window merge has then been seen. The walk
-          // is bounded by MAX_PAGES and throws if exceeded. updatedAt must be
-          // non-increasing across the walk; a violation means the ordering the
-          // argument rests on does not hold, so it throws. Residual: a PR updated
-          // again mid-walk moves ahead of the cursor and is missed by THIS run; it is
-          // still in the window for the next run.
-          async function auditRecentMerges(failures) {
-            const cutoff = Date.now() - AUDIT_WINDOW_MS;
+          // Completeness argument. Merged PRs are listed ordered by updatedAt DESC.
+          // A PR merged inside the window has updatedAt >= mergedAt >= cutoff, so a
+          // walk from the top that continues until a page contains a node with
+          // updatedAt below its floor (or hasNextPage is false) sees every PR whose
+          // position did not change during the walk. A PR updated DURING a walk
+          // moves to the top, possibly ahead of the cursor, and gets an updatedAt at
+          // or after the walk's first-node updatedAt (GitHub's own clock). Each
+          // rescan therefore re-walks from the top down to the previous walk's
+          // first-node updatedAt and audits every (PR, updatedAt) pair not already
+          // audited. The audit is complete when a rescan finds no new pair; it
+          // throws (indeterminate) after MAX_AUDIT_RESCANS rescans that keep finding
+          // new pairs, after MAX_PAGES pages in one walk, on an updatedAt ordering
+          // violation inside a walk, or when updatedAt precedes mergedAt.
+          const MAX_AUDIT_RESCANS = 5;
+          async function walkMerged(floor, visit) {
             let cursor = null;
             let previousUpdated = Infinity;
+            let top = null;
             for (let page = 1; page <= MAX_PAGES; page += 1) {
               const data = await graphql(RECENT_MERGED, { owner, name: repoName, cursor });
               const conn = data.repository?.pullRequests;
               if (!isObject(conn) || !Array.isArray(conn.nodes)) throw new Error('recent-merge audit: incomplete response');
-              let reachedCutoff = false;
+              let reachedFloor = false;
               for (const pr of conn.nodes) {
                 if (!isObject(pr) || !Number.isInteger(pr.number)) throw new Error('recent-merge audit: malformed node (indeterminate)');
                 const updatedAt = parseTime(pr.updatedAt, `PR #${pr.number} updatedAt`);
                 const mergedAt = parseTime(pr.mergedAt, `PR #${pr.number} mergedAt`);
                 if (updatedAt > previousUpdated) throw new Error('recent-merge audit: updatedAt ordering violated (indeterminate)');
-                // The completeness argument needs updatedAt >= mergedAt.
                 if (updatedAt < mergedAt) throw new Error(`recent-merge audit: PR #${pr.number} updatedAt precedes mergedAt (indeterminate)`);
                 previousUpdated = updatedAt;
-                if (updatedAt < cutoff) reachedCutoff = true;
-                if (mergedAt < cutoff) continue;
-                if (mergedViaAutoMerge(pr, mergedAt)) {
-                  const sha = pr.mergeCommit?.oid || pr.headRefOid;
-                  console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
-                  failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
-                }
+                if (top === null) top = updatedAt;
+                if (updatedAt < floor) { reachedFloor = true; continue; }
+                visit(pr, updatedAt, mergedAt);
               }
               cursor = nextCursor(conn.pageInfo, 'recent-merge audit');
-              if (reachedCutoff || cursor === null) return;
+              if (reachedFloor || cursor === null) return top;
             }
             throw new Error(`recent-merge audit incomplete: exceeded ${MAX_PAGES} pages`);
+          }
+
+          async function auditRecentMerges(failures) {
+            const cutoff = Date.now() - AUDIT_WINDOW_MS;
+            const audited = new Map(); // PR number -> updatedAt (ms) already audited
+            const flagged = new Set();
+            let fresh = 0;
+            const visit = (pr, updatedAt, mergedAt) => {
+              if (audited.get(pr.number) === updatedAt) return;
+              audited.set(pr.number, updatedAt);
+              fresh += 1;
+              if (mergedAt < cutoff || flagged.has(pr.number)) return;
+              if (mergedViaAutoMerge(pr, mergedAt)) {
+                flagged.add(pr.number);
+                const sha = pr.mergeCommit?.oid || pr.headRefOid;
+                console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
+                failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
+              }
+            };
+            let top = await walkMerged(cutoff, visit);
+            for (let rescan = 1; rescan <= MAX_AUDIT_RESCANS; rescan += 1) {
+              fresh = 0;
+              const floor = Math.max(top ?? cutoff, cutoff);
+              top = await walkMerged(floor, visit);
+              if (fresh === 0) return;
+            }
+            throw new Error(`recent-merge audit indeterminate: merged PRs kept changing across ${MAX_AUDIT_RESCANS} rescans`);
           }
 
           const MAX_PASSES = 3;

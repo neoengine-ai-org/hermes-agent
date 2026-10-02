@@ -55,6 +55,9 @@ class FakeGitHub:
         self.post_fail_count = 0
         self.merge_on_reread = set()  # armed in the list, MERGED by the time it is re-read
         self.merge_on_disarm = set()  # auto-merge completes between the live read and the disable
+        self.close_on_reread = set()  # armed in the list, CLOSED (still armed) by the time it is re-read
+        self.audit_pages = 0
+        self.after_audit_page = None  # fn(page_count) run after each RecentMerged page is built
         self.after_first_page = None
         self.merged = []  # dicts: number, mergedAt, sha, events[(type, time)]
         self.audit_fail = False
@@ -122,6 +125,8 @@ def _handler(fake: FakeGitHub):
                 n = v["number"]
                 if n in fake.merge_on_reread:
                     fake.prs[n]["state"] = "merged"
+                if n in fake.close_on_reread:
+                    fake.prs[n]["state"] = "closed"
                 pr = fake.pr_gql(n) if n in fake.prs else None
                 if pr is not None and fake.pr_mutate:
                     fake.pr_mutate(pr)
@@ -148,6 +153,9 @@ def _handler(fake: FakeGitHub):
                         "nodes": nodes}
                 if fake.audit_conn_mutate:
                     fake.audit_conn_mutate(conn)
+                fake.audit_pages += 1
+                if fake.after_audit_page:
+                    fake.after_audit_page(fake.audit_pages)
                 return self._send(200, {"data": {"repository": {"pullRequests": conn}}})
             if "query ArmedList" in query:
                 fake.calls.append(("GQL", "ArmedList"))
@@ -270,11 +278,20 @@ def test_dispatch_with_number_is_also_repository_complete(gh):
 
 
 @needs_node
-def test_closed_unmerged_pr_is_skipped_silently(gh):
+def test_closed_unarmed_pr_is_skipped_silently(gh):
+    add_pr(gh, 5, armed=False, state="closed")
+    r = run(gh, event="workflow_dispatch", pr_number="5")
+    assert r.returncode == 0 and 5 not in gh.comments
+    assert "::error::" not in r.stdout + r.stderr
+
+
+@needs_node
+def test_closed_but_armed_triggering_pr_fails_closed(gh):
+    # A closed PR that still reads as armed cannot be proven disarmed.
     add_pr(gh, 5, armed=True, state="closed")
     r = run(gh, event="workflow_dispatch", pr_number="5")
-    assert r.returncode == 0 and gh.prs[5]["armed"] and 5 not in gh.comments
-    assert "::error::" not in r.stdout + r.stderr
+    assert r.returncode != 0 and 5 not in gh.comments
+    assert "CLOSED but still armed (indeterminate)" in r.stdout + r.stderr
 
 
 @needs_node
@@ -717,7 +734,8 @@ def test_audit_paginates_past_first_page_to_find_auto_merge(gh):
     r = run(gh)
     assert r.returncode != 0
     assert f"::error::PR #9 merged via native auto-merge at {9:040x}" in r.stdout
-    assert sum(1 for c in gh.calls if c == ("GQL", "RecentMerged")) == 2
+    # main walk: 2 pages; one stabilising rescan from the top re-reads the same 2 pages
+    assert sum(1 for c in gh.calls if c == ("GQL", "RecentMerged")) == 4
 
 
 @needs_node
@@ -728,7 +746,8 @@ def test_audit_stops_at_first_page_containing_node_older_than_window(gh):
     add_merged(gh, 201, timedelta(hours=6), [("AutoMergeEnabledEvent", 5)], updated_ago=timedelta(hours=4))
     r = run(gh)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert sum(1 for c in gh.calls if c == ("GQL", "RecentMerged")) == 1
+    # main walk stops on page 1; one stabilising rescan reads page 1 again
+    assert sum(1 for c in gh.calls if c == ("GQL", "RecentMerged")) == 2
 
 
 @needs_node
@@ -814,6 +833,50 @@ def test_merge_between_live_read_and_disable_is_a_drift_alarm_not_a_disarm(gh):
     assert "native auto-merge merged before disarm" in r.stdout
     assert "ok: disarmed auto-merge for PR #1" not in r.stdout
     assert 1 not in gh.comments
+
+
+@needs_node
+def test_audit_pr_updated_mid_walk_is_caught_by_the_rescan(gh):
+    # The auto-merged PR sits on page 2; after page 1 is served it is updated
+    # (e.g. labeled), moving ahead of the cursor. The rescan must still audit it.
+    for i in range(50):
+        add_merged(gh, 100 + i, timedelta(minutes=20), [], updated_ago=timedelta(minutes=5))
+    add_merged(gh, 9, timedelta(minutes=119), [("AutoSquashEnabledEvent", 30)], updated_ago=timedelta(minutes=60))
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+
+    def bump(page):
+        if page == 1:
+            target = next(x for x in gh.merged if x["number"] == 9)
+            target["updatedAt"] = datetime.now(timezone.utc).strftime(fmt)
+    gh.after_audit_page = bump
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+@needs_node
+def test_audit_that_never_stabilises_is_indeterminate(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    tick = [0]
+
+    def churn(page):
+        tick[0] += 1
+        target = gh.merged[0]
+        target["updatedAt"] = (datetime.now(timezone.utc) + timedelta(seconds=tick[0])).strftime(fmt)
+    gh.after_audit_page = churn
+    r = run(gh)
+    assert r.returncode != 0
+    assert "kept changing across" in r.stdout + r.stderr
+
+
+@needs_node
+def test_listed_arm_that_reads_closed_but_armed_fails_closed(gh):
+    add_pr(gh, 1, armed=True)
+    gh.close_on_reread.add(1)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "CLOSED but still armed (indeterminate)" in r.stdout + r.stderr
 
 
 def test_audit_query_shape():
