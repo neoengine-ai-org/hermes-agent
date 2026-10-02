@@ -729,13 +729,13 @@ def test_p1_plan_full_proof_discovery_uses_the_selection_commit(tmp_path, monkey
 
     def select_then_commit(files):
         result = real_select(files)
-        selection_commit.append(str(adapter._PLAN["commit"]))
+        selection_commit.append(adapter._candidate_tree()[0])
         _commit(root, {"tests/unit/test_added.py": "import pkg.old\n"})
         return result
 
     def recording_discover():
         discovered = real_discover()
-        discovery_commits.append(str(adapter._PLAN["commit"]))
+        discovery_commits.append(adapter._candidate_tree()[0])
         return discovered
 
     monkeypatch.setattr(adapter, "select_tests", select_then_commit)
@@ -905,11 +905,13 @@ def test_g1_blob_batch_skips_non_test_helpers_under_tests(tmp_path, monkeypatch)
         "tests/unit/helpers.py": "z = 3\n" * 5000,
         "tests/e2e/test_pruned.py": "import agent.core\n",
     }
+    # Cold, test-local parse caches: what is fetched cannot depend on test order.
+    for cache in ("_PENDING_BLOBS", "_REFERENCES_BY_BLOB", "_PREFIXES_BY_BLOB"):
+        monkeypatch.setattr(adapter, cache, {})
     _candidate(
         tmp_path,
         monkeypatch,
         {
-            # Unique contents: the parse cache is process-wide and keyed by blob id.
             "agent/__init__.py": "# g1 helper-scope package\n",
             "agent/core.py": "import os  # g1 helper-scope module\n",
             # Selected through its import, not by its file stem, so it is read.

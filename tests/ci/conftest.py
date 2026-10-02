@@ -17,9 +17,11 @@ def pytest_runtest_protocol(item, nextitem):
     The one-time whole-repo parse runs just before the first adapter test
     this process actually runs, so an xdist worker that is never scheduled
     an adapter test (and ``--collect-only`` or a ``-k`` selection without
-    one) never builds it. ``tryfirst`` makes this the outermost runtest
-    wrapper: the build finishes before pytest-timeout's wrapper starts the
-    30 s per-test timer, so it is not charged to that test's budget.
+    one) never builds it. This wrapper must run outside pytest-timeout's
+    ``pytest_runtest_protocol`` wrapper, so that the build finishes before
+    the 30 s per-test timer starts and is not charged to that test's
+    budget. Registration order already puts conftest wrappers outside
+    plugins; ``tryfirst`` keeps it there even if that order changes.
     """
     module = getattr(item, "module", None)
     if (
