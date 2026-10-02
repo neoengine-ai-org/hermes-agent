@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
+from types import ModuleType
+
+import pytest
+
 _RUNTIME_OS_ADAPTER_TESTS = "test_runtime_os_adapter.py"
+_INDEXED_MODULES: set[ModuleType] = set()
 
 
-def pytest_collection_finish(session):
-    """Build the runtime-OS adapter's real-repo reference index once.
+@pytest.hookimpl(wrapper=True, tryfirst=True)
+def pytest_runtest_protocol(item, nextitem):
+    """Build the runtime-OS adapter's real-repo reference index lazily.
 
-    Runs after collection and before any test, so the one-time whole-repo
-    parse is not charged to a single test's 30 s pytest-timeout budget. It is
-    skipped for ``--collect-only`` (e.g. scripts/run_tests_parallel.py's
-    test-count pass) and when ``-k``/node selection deselects every adapter
-    test.
+    The one-time whole-repo parse runs just before the first adapter test
+    this process actually runs, so an xdist worker that is never scheduled
+    an adapter test (and ``--collect-only`` or a ``-k`` selection without
+    one) never builds it. This wrapper must run outside pytest-timeout's
+    ``pytest_runtest_protocol`` wrapper, so that the build finishes before
+    the 30 s per-test timer starts and is not charged to that test's
+    budget. Registration order already puts conftest wrappers outside
+    plugins; ``tryfirst`` keeps it there even if that order changes.
     """
-    if session.config.option.collectonly:
-        return
-    modules = {
-        item.module
-        for item in session.items
-        if getattr(item, "module", None) is not None
+    module = getattr(item, "module", None)
+    if (
+        module is not None
         and item.path.name == _RUNTIME_OS_ADAPTER_TESTS
-    }
-    for module in modules:
+        and module not in _INDEXED_MODULES
+    ):
+        _INDEXED_MODULES.add(module)
         module._build_repository_reference_index()
+    return (yield)

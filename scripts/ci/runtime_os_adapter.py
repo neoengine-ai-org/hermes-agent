@@ -228,7 +228,7 @@ def _tree_python_files(prefix: tuple[str, ...], prune, refuse_links_when_pruned:
         seen_prefix = True
         if mode == _GITLINK_MODE:
             raise ValueError(f"runtime-OS discovery refuses submodule: {path}")
-        pruned = any(prune(parts[: index + 1]) for index in range(len(prefix), len(parts) - 1))
+        pruned = _pruned(parts, len(prefix), prune)
         if mode == _SYMLINK_MODE and (refuse_links_when_pruned or not pruned):
             raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
         if not pruned and mode in _REGULAR_MODES and path.endswith(".py"):
@@ -246,6 +246,11 @@ _SOURCE_EXCLUDED = {".git", ".venv", "tests", "venv"}
 _SOURCE_GENERATED_ROOTS = {".bootstrap-proof-venv", "ci-fast"}
 
 
+def _pruned(parts: tuple[str, ...], start: int, prune) -> bool:
+    """Whether a directory of ``parts`` below its first ``start`` parts is pruned."""
+    return any(prune(parts[: index + 1]) for index in range(start, len(parts) - 1))
+
+
 def _prune_tests(parts: tuple[str, ...]) -> bool:
     return parts[-1] in _TEST_SKIP_PARTS
 
@@ -254,11 +259,19 @@ def _prune_sources(parts: tuple[str, ...]) -> bool:
     return parts[-1] in _SOURCE_EXCLUDED or (len(parts) == 1 and parts[0] in _SOURCE_GENERATED_ROOTS)
 
 
+def _is_test_file(path: str) -> bool:
+    return Path(path).name.startswith("test_") and not (set(Path(path).parts) & _TEST_SKIP_PARTS)
+
+
+def _is_source_file(path: str) -> bool:
+    return not (set(Path(path).parts) & _SOURCE_EXCLUDED)
+
+
 def discover_tests() -> list[str]:
     return sorted(
         path
         for path in _tree_python_files(("tests",), _prune_tests, refuse_links_when_pruned=True)
-        if Path(path).name.startswith("test_") and not (set(Path(path).parts) & _TEST_SKIP_PARTS)
+        if _is_test_file(path)
     )
 
 
@@ -266,7 +279,7 @@ def discover_python_sources() -> list[str]:
     return sorted(
         path
         for path in _tree_python_files((), _prune_sources, refuse_links_when_pruned=False)
-        if not (set(Path(path).parts) & _SOURCE_EXCLUDED)
+        if _is_source_file(path)
     )
 
 
@@ -299,11 +312,12 @@ def _decode_source(data: bytes) -> str:
 
 
 def _in_discoverable_universe(path: str) -> bool:
-    """Whether ``path`` lies where source or test discovery could return it."""
+    """Whether ``discover_tests()`` or ``discover_python_sources()`` could return
+    the regular ``*.py`` blob at ``path`` (same prune and filter predicates)."""
     parts = tuple(path.split("/"))
-    if parts[0] == "tests":
-        return not any(_prune_tests(parts[: index + 1]) for index in range(1, len(parts) - 1))
-    return not any(_prune_sources(parts[: index + 1]) for index in range(len(parts) - 1))
+    if parts[0] == "tests" and not _pruned(parts, 1, _prune_tests) and _is_test_file(path):
+        return True
+    return not _pruned(parts, 0, _prune_sources) and _is_source_file(path)
 
 
 def _fetch_blobs(object_ids: list[str]) -> None:
@@ -337,8 +351,9 @@ def _blob_for(path: str) -> str:
     if mode not in _REGULAR_MODES:
         raise ValueError(f"{path} is not a regular file in the candidate commit")
     if object_id not in _REFERENCES_BY_BLOB and object_id not in _PENDING_BLOBS:
-        # Fetch every unparsed blob of the discoverable universe at once
-        # (pruned environments such as .venv are never fetched).
+        # Fetch every unparsed blob discovery can return at once (pruned
+        # environments such as .venv, and non-test helpers under tests/ such
+        # as conftest.py, are fetched only when read directly).
         _fetch_blobs(
             sorted(
                 {
