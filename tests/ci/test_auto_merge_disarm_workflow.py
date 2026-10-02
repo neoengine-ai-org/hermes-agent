@@ -58,6 +58,11 @@ class FakeGitHub:
         self.merged = []  # dicts: number, mergedAt, sha, events[(type, time)]
         self.audit_fail = False
         self.rearm_each_list = set()  # re-armed every time a listing starts
+        # Response mutators for malformed-but-schema-valid API responses.
+        self.armed_list_mutate = None  # fn(connection dict) applied to every ArmedList page
+        self.pr_mutate = None  # fn(pr dict) applied to every PrByNumber read-back
+        self.audit_mutate = None  # fn(list of nodes) applied to every RecentMerged page
+        self.audit_conn_mutate = None  # fn(connection dict) applied to every RecentMerged page
 
     def actor(self):
         if self.user_login:
@@ -115,26 +120,32 @@ def _handler(fake: FakeGitHub):
                 if n in fake.merge_on_reread:
                     fake.prs[n]["state"] = "merged"
                 pr = fake.pr_gql(n) if n in fake.prs else None
+                if pr is not None and fake.pr_mutate:
+                    fake.pr_mutate(pr)
                 return self._send(200, {"data": {"repository": {"pullRequest": pr}}})
             if "query RecentMerged" in query:
                 fake.calls.append(("GQL", "RecentMerged"))
-                compact = re.sub(r"\s+", " ", query)
-                for needle in (
-                    "pullRequests(states: MERGED, first: 50, orderBy: { field: UPDATED_AT, direction: DESC })",
-                    "timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20)",
-                    "mergeCommit { oid }",
-                    "... on AutoSquashEnabledEvent { createdAt }",
-                    "... on AutoRebaseEnabledEvent { createdAt }",
-                ):
-                    assert needle in compact, f"audit query shape changed: {needle}"
                 if fake.audit_fail:
                     return self._send(200, {"errors": [{"message": "audit boom"}], "data": None})
+                m = re.search(r"pullRequests\(states: MERGED, first: (\d+)", re.sub(r"\s+", " ", query))
+                size = int(m.group(1)) if m else 50
+                ordered = sorted(fake.merged, key=lambda x: x["updatedAt"], reverse=True)
+                start = int(v.get("cursor") or 0)
+                page, more = ordered[start:start + size], start + size < len(ordered)
                 nodes = [{
-                    "number": m["number"], "mergedAt": m["mergedAt"], "headRefOid": m["sha"],
-                    "mergeCommit": {"oid": m["sha"]},
-                    "timelineItems": {"nodes": [{"__typename": t, "createdAt": c} for t, c in m["events"]]},
-                } for m in fake.merged]
-                return self._send(200, {"data": {"repository": {"pullRequests": {"nodes": nodes}}}})
+                    "number": x["number"], "mergedAt": x["mergedAt"], "updatedAt": x["updatedAt"],
+                    "headRefOid": x["sha"], "mergeCommit": {"oid": x["sha"]},
+                    "timelineItems": {
+                        "pageInfo": {"hasPreviousPage": x["has_previous"]},
+                        "nodes": [{"__typename": t, "createdAt": c} for t, c in x["events"]]},
+                } for x in page]
+                if fake.audit_mutate:
+                    fake.audit_mutate(nodes)
+                conn = {"pageInfo": {"hasNextPage": more, "endCursor": str(start + size) if more else None},
+                        "nodes": nodes}
+                if fake.audit_conn_mutate:
+                    fake.audit_conn_mutate(conn)
+                return self._send(200, {"data": {"repository": {"pullRequests": conn}}})
             if "query ArmedList" in query:
                 fake.calls.append(("GQL", "ArmedList"))
                 fake.list_pages += 1
@@ -146,9 +157,12 @@ def _handler(fake: FakeGitHub):
                 opens = [n for n in sorted(fake.prs) if fake.prs[n]["state"] == "open" and n > after]
                 page, more = opens[:100], len(opens) > 100
                 nodes = [{k: fake.pr_gql(n)[k] for k in ("id", "number", "autoMergeRequest")} for n in page]
-                resp = {"data": {"repository": {"pullRequests": {
+                conn = {
                     "pageInfo": {"hasNextPage": more, "endCursor": str(page[-1]) if page else None},
-                    "nodes": nodes}}}}
+                    "nodes": nodes}
+                if fake.armed_list_mutate:
+                    fake.armed_list_mutate(conn)
+                resp = {"data": {"repository": {"pullRequests": conn}}}
                 if fake.after_first_page:
                     cb, fake.after_first_page = fake.after_first_page, None
                     cb()
@@ -388,6 +402,14 @@ ARM_MERGE_PATTERNS = [
     r"ahmadnassri/action-dependabot-auto-merge",
     r"reitermarkus/automerge",
     r"auto-arm",
+    # approval paths: a disarm-only workflow never reviews, let alone approves
+    r"addPullRequestReview",
+    r"submitPullRequestReview",
+    r"pulls/\S*/reviews\b",
+    r"pulls\.createReview",
+    r"pulls\.submitReview",
+    r"gh\s+pr\s+review\b",
+    r"\bevent\s*[:=]\s*['\"]?APPROVE\b",
 ]
 
 
@@ -417,6 +439,15 @@ def test_arm_merge_patterns_detect_known_bad_forms():
         "peter-evans/enable-pull-request-automerge@v3",
         "ahmadnassri/action-dependabot-auto-merge@v2",
         "request('PUT /repos/o/r/pulls/1/merge')",
+        # approval paths
+        "addPullRequestReview(input: { pullRequestId: $id, event: APPROVE })",
+        "submitPullRequestReview(input: { pullRequestReviewId: $id, event: APPROVE })",
+        "gh api -X POST repos/o/r/pulls/1/reviews -f event=APPROVE",
+        "request('POST /repos/{owner}/{repo}/pulls/{pull_number}/reviews', { event: 'APPROVE' })",
+        "github.rest.pulls.createReview({ owner, repo, pull_number: 1, event: 'APPROVE' })",
+        "octokit.pulls.submitReview({ review_id: 2, event: 'APPROVE' })",
+        "gh pr review 1 --approve",
+        "gh pr review 1 -a",
     ]
     for sample in samples:
         assert any(re.search(p, sample) for p in ARM_MERGE_PATTERNS), sample
@@ -489,13 +520,16 @@ def _iso(delta):
     return (datetime.now(timezone.utc) - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def add_merged(fake, n, ago, events):
+def add_merged(fake, n, ago, events, updated_ago=None, has_previous=False):
     """events: list of (type, minutes-before-merge); merge itself is the MergedEvent."""
-    merged = datetime.now(timezone.utc) - ago
-    evs = [(t, (merged - timedelta(minutes=m)).strftime("%Y-%m-%dT%H:%M:%SZ")) for t, m in events]
-    evs.append(("MergedEvent", merged.strftime("%Y-%m-%dT%H:%M:%SZ")))
-    fake.merged.append({"number": n, "mergedAt": merged.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                        "sha": f"{n:040x}", "events": evs})
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    now = datetime.now(timezone.utc)
+    merged = now - ago
+    updated = now - (updated_ago if updated_ago is not None else ago)
+    evs = [(t, (merged - timedelta(minutes=m)).strftime(fmt)) for t, m in events]
+    evs.append(("MergedEvent", merged.strftime(fmt)))
+    fake.merged.append({"number": n, "mergedAt": merged.strftime(fmt), "updatedAt": updated.strftime(fmt),
+                        "sha": f"{n:040x}", "events": evs, "has_previous": has_previous})
 
 
 @needs_node
@@ -568,3 +602,188 @@ def test_squash_enabled_then_disabled_before_manual_merge_is_not_alarmed(gh):
 def test_latest_enable_after_disable_alarms_for_squash(gh):
     add_merged(gh, 9, timedelta(minutes=10), [("AutoMergeDisabledEvent", 8), ("AutoSquashEnabledEvent", 6)])
     assert run(gh).returncode != 0
+
+
+# ---- fail-closed on indeterminate API state (invariant d) ----
+
+@needs_node
+def test_armed_list_empty_pageinfo_fails_closed(gh):
+    add_pr(gh, 1, armed=True)
+    gh.armed_list_mutate = lambda conn: conn.__setitem__("pageInfo", {})
+    r = run(gh)
+    assert r.returncode != 0
+    assert "pageInfo.hasNextPage is not a boolean" in r.stdout + r.stderr
+
+
+@needs_node
+@pytest.mark.parametrize("mutate", [
+    lambda node: node.pop("autoMergeRequest"),
+    lambda node: node.__setitem__("autoMergeRequest", "yes"),
+    lambda node: node.__setitem__("number", "1"),
+    lambda node: node.pop("id"),
+], ids=["missing_autoMergeRequest", "string_autoMergeRequest", "string_number", "missing_id"])
+def test_armed_list_malformed_node_fails_closed(gh, mutate):
+    add_pr(gh, 1, armed=False)
+
+    def apply(conn):
+        for node in conn["nodes"]:
+            mutate(node)
+    gh.armed_list_mutate = apply
+    r = run(gh)
+    assert r.returncode != 0
+    assert "open PR listing" in r.stdout + r.stderr
+
+
+@needs_node
+@pytest.mark.parametrize("mutate", [
+    lambda pr: pr.pop("autoMergeRequest"),
+    lambda pr: pr.__setitem__("autoMergeRequest", 1),
+    lambda pr: pr.pop("state"),
+    lambda pr: pr.__setitem__("state", "WEIRD"),
+    lambda pr: pr.__setitem__("headRefOid", None),
+], ids=["missing_autoMergeRequest", "numeric_autoMergeRequest", "missing_state", "unknown_state", "null_head"])
+def test_pr_readback_unproven_state_fails_closed(gh, mutate):
+    add_pr(gh, 5, armed=False)
+    gh.pr_mutate = mutate
+    r = run(gh, event="workflow_dispatch", pr_number="5")
+    assert r.returncode != 0
+    assert "indeterminate" in r.stdout + r.stderr
+
+
+@needs_node
+def test_merged_never_armed_triggering_pr_is_not_a_drift_alarm(gh):
+    add_pr(gh, 5, armed=False, state="merged")
+    r = run(gh, event="pull_request_target", pr_event=pr_event(5))
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "::error::" not in r.stdout + r.stderr
+    assert not any(c == ("GQL", "Disarm") for c in gh.calls)
+
+
+@needs_node
+@pytest.mark.parametrize("mutate", [
+    lambda n: n.__setitem__("mergedAt", None),
+    lambda n: n.pop("mergedAt"),
+    lambda n: n.__setitem__("mergedAt", "not-a-date"),
+    lambda n: n.__setitem__("updatedAt", None),
+], ids=["mergedAt_null", "mergedAt_absent", "mergedAt_unparseable", "updatedAt_null"])
+def test_audit_unproven_merge_time_fails_closed(gh, mutate):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+
+    def apply(nodes):
+        for n in nodes:
+            mutate(n)
+    gh.audit_mutate = apply
+    r = run(gh)
+    assert r.returncode != 0
+    assert "not a parseable timestamp" in r.stdout + r.stderr
+
+
+@needs_node
+@pytest.mark.parametrize("mutate", [
+    lambda n: n.__setitem__("timelineItems", None),
+    lambda n: n["timelineItems"].__setitem__("nodes", None),
+    lambda n: n["timelineItems"].pop("pageInfo"),
+    lambda n: n["timelineItems"]["nodes"].append({"createdAt": "2026-01-01T00:00:00Z"}),
+    lambda n: n["timelineItems"]["nodes"].append({"__typename": "AutoMergeDisabledEvent", "createdAt": None}),
+], ids=["timeline_null", "nodes_null", "pageInfo_absent", "item_no_typename", "item_bad_createdAt"])
+def test_audit_unproven_timeline_fails_closed(gh, mutate):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+
+    def apply(nodes):
+        for n in nodes:
+            mutate(n)
+    gh.audit_mutate = apply
+    r = run(gh)
+    assert r.returncode != 0
+    assert "PR #9" in r.stdout + r.stderr
+
+
+@needs_node
+def test_audit_truncated_timeline_fails_closed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [], has_previous=True)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "auto-merge timeline incomplete" in r.stdout + r.stderr
+
+
+@needs_node
+def test_audit_paginates_past_first_page_to_find_auto_merge(gh):
+    for n in range(100, 150):  # 50 clean merges, updated more recently
+        add_merged(gh, n, timedelta(minutes=5), [], updated_ago=timedelta(minutes=1))
+    add_merged(gh, 9, timedelta(minutes=20), [("AutoMergeEnabledEvent", 5)])
+    r = run(gh)
+    assert r.returncode != 0
+    assert f"::error::PR #9 merged via native auto-merge at {9:040x}" in r.stdout
+    assert sum(1 for c in gh.calls if c == ("GQL", "RecentMerged")) == 2
+
+
+@needs_node
+def test_audit_stops_at_first_page_containing_node_older_than_window(gh):
+    for n in range(100, 149):
+        add_merged(gh, n, timedelta(minutes=5), [], updated_ago=timedelta(minutes=1))
+    add_merged(gh, 200, timedelta(hours=5), [], updated_ago=timedelta(hours=3))
+    add_merged(gh, 201, timedelta(hours=6), [("AutoMergeEnabledEvent", 5)], updated_ago=timedelta(hours=4))
+    r = run(gh)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert sum(1 for c in gh.calls if c == ("GQL", "RecentMerged")) == 1
+
+
+@needs_node
+@pytest.mark.parametrize("page_info", [{}, {"hasNextPage": "false"}, {"hasNextPage": True, "endCursor": None}],
+                         ids=["empty", "string_hasNextPage", "more_without_cursor"])
+def test_audit_pageinfo_unproven_fails_closed(gh, page_info):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    gh.audit_conn_mutate = lambda conn: conn.__setitem__("pageInfo", page_info)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "recent-merge audit: " in r.stdout + r.stderr
+
+
+@needs_node
+def test_audit_malformed_node_fails_closed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    gh.audit_mutate = lambda nodes: nodes.append("not-an-object")
+    r = run(gh)
+    assert r.returncode != 0
+    assert "recent-merge audit: malformed node" in r.stdout + r.stderr
+
+
+@needs_node
+def test_audit_updated_at_ordering_violation_fails_closed(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    add_merged(gh, 10, timedelta(minutes=20), [])
+    gh.audit_mutate = lambda nodes: nodes.reverse()
+    r = run(gh)
+    assert r.returncode != 0
+    assert "updatedAt ordering violated" in r.stdout + r.stderr
+
+
+@needs_node
+def test_disable_recorded_at_merge_time_does_not_hide_enable(gh):
+    # enable at T-2m; MergedEvent and AutoMergeDisabledEvent both at T-1m
+    add_merged(gh, 9, timedelta(minutes=1), [("AutoMergeEnabledEvent", 1), ("AutoMergeDisabledEvent", 0)])
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+@needs_node
+def test_enable_and_disable_tie_resolves_to_enabled(gh):
+    add_merged(gh, 9, timedelta(minutes=10), [("AutoMergeEnabledEvent", 3), ("AutoMergeDisabledEvent", 3)])
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+def test_audit_query_shape():
+    compact = re.sub(r"\s+", " ", _script())
+    for needle in (
+        "pullRequests(states: MERGED, first: ${AUDIT_PAGE_SIZE}, after: $cursor, orderBy: { field: UPDATED_AT, direction: DESC })",
+        "pageInfo { hasNextPage endCursor }",
+        "number mergedAt updatedAt headRefOid mergeCommit { oid }",
+        "timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 100)",
+        "pageInfo { hasPreviousPage }",
+        "... on AutoSquashEnabledEvent { createdAt }",
+        "... on AutoRebaseEnabledEvent { createdAt }",
+    ):
+        assert needle in compact, f"audit query shape changed: {needle}"

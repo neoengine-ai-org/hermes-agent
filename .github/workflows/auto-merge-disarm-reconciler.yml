@@ -16,13 +16,18 @@ name: auto-merge-disarm-reconciler
 # by the auto_merge_enabled event run and the 15-minute sweep.
 #
 # Merge DETECTION is best-effort, separate from disarming: after the armed
-# passes, every run audits the 50 most recently updated MERGED PRs whose
-# mergedAt is within the last 2 hours and raises an ::error:: (nonzero, no
-# comment, no mutation) for any whose latest auto-merge event before the merge
-# was an enable, i.e. it merged via native auto-merge. A PR that merged via
-# native auto-merge more than 2 hours before any run executes is NOT alarmed, nor
-# is one pushed out of the 50 most recently updated merged PRs. The alarm names
-# the PR's mergeCommit oid (falling back to headRefOid).
+# passes, every run audits every MERGED PR whose mergedAt is within the last 2
+# hours (merged PRs paginated by updatedAt DESC until a node older than the
+# window is seen) and raises an ::error:: (nonzero, no comment, no mutation) for
+# any whose latest auto-merge event at or before the merge was an enable, i.e.
+# it merged via native auto-merge. A PR that merged via native auto-merge more
+# than 2 hours before any run executes is NOT alarmed. The alarm names the PR's
+# mergeCommit oid (falling back to headRefOid).
+#
+# Fail closed (invariant d): any API response that cannot prove the state it is
+# read for (missing/mistyped pageInfo, node fields, autoMergeRequest, mergedAt,
+# updatedAt, timeline items, or a truncated timeline) throws and fails the run;
+# it is never treated as clean.
 #
 # Evidence rule: GitHub's own AutoMergeDisabledEvent in the PR timeline (actor
 # and time) is the authoritative durable record of a disarm. The PR comment is a
@@ -31,9 +36,12 @@ name: auto-merge-disarm-reconciler
 # when /user is known; when /user is unavailable it is simply posted. A POST
 # failure fails the run and nothing retries it later.
 #
-# Drift alarm (detection only): if an armed PR's live re-read is already MERGED,
-# the run emits an ::error:: and exits nonzero ("native auto-merge merged before
-# disarm"). Closed-but-unmerged PRs are skipped silently.
+# Drift alarm (detection only): if a PR taken from the armed listing is already
+# MERGED on its live re-read, the run emits an ::error:: and exits nonzero
+# ("native auto-merge merged before disarm"). A triggering PR (event or dispatch
+# input) that is MERGED but did not come from the armed listing is skipped; the
+# recent-merge audit decides whether it merged via native auto-merge.
+# Closed-but-unmerged PRs are skipped silently.
 #
 # Security: pull_request_target runs with base-repo privileges. This workflow
 # has no checkout step and never executes PR-head code; untrusted strings are
@@ -66,9 +74,8 @@ on:
 # triggered it, and a malformed trigger still performs the full sweep), so the
 # surviving run covers whatever the replaced run would have. That argument
 # covers DISARMING only. Detecting a PR that merged before any run got to it is
-# best-effort: the recent-merge audit detects it on any run while the PR remains
-# among the 50 most recently updated merged PRs and within the 2h window;
-# older merges are not alarmed. actionlint rejects `queue: max`, so it is not used.
+# best-effort: the recent-merge audit detects it on any run while the PR's merge
+# is within the 2h window; older merges are not alarmed. actionlint rejects `queue: max`, so it is not used.
 concurrency:
   group: hermes-auto-merge-disarm
   cancel-in-progress: false
@@ -187,26 +194,70 @@ jobs:
             disablePullRequestAutoMerge(input: { pullRequestId: $id }) { pullRequest { number } }
           }`;
 
-          // Cursor pagination over open PRs. Any incomplete page throws (fails the run).
+          const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+          const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+          // autoMergeRequest must be an OWN property that is null (unarmed) or an
+          // object (armed). Absent or mistyped means the state is unproven.
+          const armedState = (node, what) => {
+            if (!hasOwn(node, 'autoMergeRequest')) throw new Error(`${what}: autoMergeRequest absent (indeterminate)`);
+            const v = node.autoMergeRequest;
+            if (v === null) return false;
+            if (isObject(v)) return true;
+            throw new Error(`${what}: autoMergeRequest is neither null nor an object (indeterminate)`);
+          };
+          const parseTime = (v, what) => {
+            const t = typeof v === 'string' ? Date.parse(v) : NaN;
+            if (!Number.isFinite(t)) throw new Error(`${what}: not a parseable timestamp (indeterminate)`);
+            return t;
+          };
+          // pageInfo must carry a boolean hasNextPage, and an endCursor when it is true.
+          const nextCursor = (pageInfo, what) => {
+            if (!isObject(pageInfo) || typeof pageInfo.hasNextPage !== 'boolean') {
+              throw new Error(`${what}: pageInfo.hasNextPage is not a boolean (incomplete listing)`);
+            }
+            if (!pageInfo.hasNextPage) return null;
+            if (typeof pageInfo.endCursor !== 'string' || !pageInfo.endCursor) {
+              throw new Error(`${what}: hasNextPage without endCursor (incomplete listing)`);
+            }
+            return pageInfo.endCursor;
+          };
+
+          // Cursor pagination over open PRs. Any incomplete or malformed page throws (fails the run).
           async function listArmed() {
             const armed = [];
             let cursor = null;
             for (let page = 1; page <= MAX_PAGES; page += 1) {
               const data = await graphql(ARMED_LIST, { owner, name: repoName, cursor });
               const conn = data.repository?.pullRequests;
-              if (!conn || !Array.isArray(conn.nodes) || !conn.pageInfo) throw new Error('incomplete pullRequests page');
-              armed.push(...conn.nodes.filter((p) => p.autoMergeRequest));
-              if (!conn.pageInfo.hasNextPage) return armed;
-              if (!conn.pageInfo.endCursor) throw new Error('hasNextPage without endCursor: incomplete listing');
-              cursor = conn.pageInfo.endCursor;
+              if (!isObject(conn) || !Array.isArray(conn.nodes)) throw new Error('incomplete pullRequests page');
+              for (const node of conn.nodes) {
+                if (!isObject(node) || !Number.isInteger(node.number) || typeof node.id !== 'string') {
+                  throw new Error('open PR listing: malformed node (indeterminate)');
+                }
+                if (armedState(node, `open PR listing #${node.number}`)) armed.push(node);
+              }
+              cursor = nextCursor(conn.pageInfo, 'open PR listing');
+              if (cursor === null) return armed;
             }
             throw new Error(`open PR listing incomplete: exceeded ${MAX_PAGES} pages`);
           }
 
+          const PR_STATES = new Set(['OPEN', 'CLOSED', 'MERGED']);
+          // Live read-back. A response that cannot prove state/armed/head throws.
           async function fetchPr(number) {
             const data = await graphql(PR_BY_NUMBER, { owner, name: repoName, number });
             const pr = data.repository?.pullRequest;
             if (!pr) throw new Error(`PR #${number} not found`);
+            if (!isObject(pr) || pr.number !== number || typeof pr.id !== 'string') {
+              throw new Error(`PR #${number}: malformed read-back (indeterminate)`);
+            }
+            if (typeof pr.state !== 'string' || !PR_STATES.has(pr.state)) {
+              throw new Error(`PR #${number}: read-back state unproven (indeterminate)`);
+            }
+            if (typeof pr.headRefOid !== 'string' || !pr.headRefOid) {
+              throw new Error(`PR #${number}: read-back headRefOid unproven (indeterminate)`);
+            }
+            armedState(pr, `PR #${number} read-back`);
             return pr;
           }
 
@@ -229,16 +280,20 @@ jobs:
             return 'posted';
           }
 
+          // candidate: { number, fromArmedList }. The merged-before-disarm drift
+          // alarm is raised only for a PR the armed listing reported as armed; a
+          // merged triggering PR is left to the recent-merge audit.
           async function disarm(candidate) {
             const live = await fetchPr(candidate.number); // live re-read before acting
             if (live.state === 'MERGED') {
+              if (!candidate.fromArmedList) return 'skip';
               console.log(`::error::PR #${live.number} head ${live.headRefOid}: native auto-merge merged before disarm`);
               throw new Error(`PR #${live.number}: merged before disarm (drift alarm)`);
             }
-            if (live.state !== 'OPEN' || !live.autoMergeRequest) return 'skip';
+            if (live.state !== 'OPEN' || live.autoMergeRequest === null) return 'skip';
             await graphql(DISARM, { id: live.id });
             const after = await fetchPr(live.number);
-            if (after.autoMergeRequest) throw new Error(`PR #${live.number}: auto-merge still armed after disarm`);
+            if (after.autoMergeRequest !== null) throw new Error(`PR #${live.number}: auto-merge still armed after disarm`);
             const receipt = await postReceipt(after);
             console.log(`ok: disarmed auto-merge for PR #${live.number} at ${after.headRefOid}; receipt ${receipt}; token source: ${tokenSource}`);
             return 'disarmed';
@@ -263,13 +318,17 @@ jobs:
           // Merge-commit auto-merge records AutoMergeEnabledEvent; SQUASH records
           // AutoSquashEnabledEvent and REBASE records AutoRebaseEnabledEvent.
           const ENABLE_TYPES = new Set(['AutoMergeEnabledEvent', 'AutoSquashEnabledEvent', 'AutoRebaseEnabledEvent']);
+          const TIMELINE_TYPES = new Set([...ENABLE_TYPES, 'AutoMergeDisabledEvent', 'MergedEvent']);
           const AUDIT_WINDOW_MS = 2 * 60 * 60 * 1000;
-          const RECENT_MERGED = `query RecentMerged($owner: String!, $name: String!) {
+          const AUDIT_PAGE_SIZE = 50;
+          const RECENT_MERGED = `query RecentMerged($owner: String!, $name: String!, $cursor: String) {
             repository(owner: $owner, name: $name) {
-              pullRequests(states: MERGED, first: 50, orderBy: { field: UPDATED_AT, direction: DESC }) {
+              pullRequests(states: MERGED, first: ${AUDIT_PAGE_SIZE}, after: $cursor, orderBy: { field: UPDATED_AT, direction: DESC }) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
-                  number mergedAt headRefOid mergeCommit { oid }
-                  timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 20) {
+                  number mergedAt updatedAt headRefOid mergeCommit { oid }
+                  timelineItems(itemTypes: [AUTO_MERGE_ENABLED_EVENT, AUTO_SQUASH_ENABLED_EVENT, AUTO_REBASE_ENABLED_EVENT, AUTO_MERGE_DISABLED_EVENT, MERGED_EVENT], last: 100) {
+                    pageInfo { hasPreviousPage }
                     nodes { __typename ... on AutoMergeEnabledEvent { createdAt } ... on AutoSquashEnabledEvent { createdAt } ... on AutoRebaseEnabledEvent { createdAt } ... on AutoMergeDisabledEvent { createdAt } ... on MergedEvent { createdAt } }
                   }
                 }
@@ -277,27 +336,74 @@ jobs:
             }
           }`;
 
-          // Detection only: no comment, no mutation. One list query carries the
-          // timeline reads (at most 50 PRs x 20 items).
-          async function auditRecentMerges(failures) {
-            const data = await graphql(RECENT_MERGED, { owner, name: repoName });
-            const nodes = data.repository?.pullRequests?.nodes;
-            if (!Array.isArray(nodes)) throw new Error('recent-merge audit: incomplete response');
-            const cutoff = Date.now() - AUDIT_WINDOW_MS;
-            for (const pr of nodes) {
-              if (!pr.mergedAt || Date.parse(pr.mergedAt) < cutoff) continue;
-              const items = pr.timelineItems?.nodes || [];
-              const mergedAt = items.filter((i) => i.__typename === 'MergedEvent').map((i) => i.createdAt).sort().pop();
-              const before = items
-                .filter((i) => (ENABLE_TYPES.has(i.__typename) || i.__typename === 'AutoMergeDisabledEvent') && (!mergedAt || i.createdAt <= mergedAt))
-                .sort((x, y) => (x.createdAt < y.createdAt ? -1 : x.createdAt > y.createdAt ? 1 : 0));
-              const last = before[before.length - 1];
-              if (last && ENABLE_TYPES.has(last.__typename)) {
-                const sha = pr.mergeCommit?.oid || pr.headRefOid;
-                console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
-                failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
-              }
+          // Decide from a validated timeline whether the PR merged via native
+          // auto-merge. Ordering is fail-closed:
+          //  - the merge time is the MergedEvent createdAt when present, else mergedAt;
+          //  - enable events count when createdAt <= merge time;
+          //  - AutoMergeDisabledEvent counts only when createdAt < merge time: a
+          //    system disable recorded at merge completion must not hide the enable;
+          //  - on equal timestamps a disable sorts BEFORE an enable, so a tie
+          //    resolves to "enabled" (alarm).
+          function mergedViaAutoMerge(pr, mergedAtMs) {
+            const tl = pr.timelineItems;
+            if (!isObject(tl) || !Array.isArray(tl.nodes)) throw new Error(`PR #${pr.number}: timelineItems missing (indeterminate)`);
+            if (!isObject(tl.pageInfo) || tl.pageInfo.hasPreviousPage !== false) {
+              throw new Error(`PR #${pr.number}: auto-merge timeline incomplete (hasPreviousPage is not false)`);
             }
+            const items = tl.nodes.map((i) => {
+              if (!isObject(i) || typeof i.__typename !== 'string' || !TIMELINE_TYPES.has(i.__typename)) {
+                throw new Error(`PR #${pr.number}: malformed timeline item (indeterminate)`);
+              }
+              return { type: i.__typename, t: parseTime(i.createdAt, `PR #${pr.number} ${i.__typename}.createdAt`) };
+            });
+            const mergeEvents = items.filter((i) => i.type === 'MergedEvent').map((i) => i.t);
+            const mergeTime = mergeEvents.length ? Math.max(...mergeEvents) : mergedAtMs;
+            const relevant = items
+              .filter((i) => (ENABLE_TYPES.has(i.type) && i.t <= mergeTime) || (i.type === 'AutoMergeDisabledEvent' && i.t < mergeTime))
+              .sort((x, y) => (x.t - y.t) || ((x.type === 'AutoMergeDisabledEvent' ? 0 : 1) - (y.type === 'AutoMergeDisabledEvent' ? 0 : 1)));
+            const last = relevant[relevant.length - 1];
+            return Boolean(last && ENABLE_TYPES.has(last.type));
+          }
+
+          // Detection only: no comment, no mutation.
+          //
+          // Completeness argument: merged PRs are listed ordered by updatedAt DESC.
+          // A PR merged inside the window has updatedAt >= mergedAt >= cutoff, so it
+          // must appear before any node whose updatedAt < cutoff. Pagination therefore
+          // continues until a page contains a node with updatedAt < cutoff, or
+          // hasNextPage is false; every in-window merge has then been seen. The walk
+          // is bounded by MAX_PAGES and throws if exceeded. updatedAt must be
+          // non-increasing across the walk; a violation means the ordering the
+          // argument rests on does not hold, so it throws. Residual: a PR updated
+          // again mid-walk moves ahead of the cursor and is missed by THIS run; it is
+          // still in the window for the next run.
+          async function auditRecentMerges(failures) {
+            const cutoff = Date.now() - AUDIT_WINDOW_MS;
+            let cursor = null;
+            let previousUpdated = Infinity;
+            for (let page = 1; page <= MAX_PAGES; page += 1) {
+              const data = await graphql(RECENT_MERGED, { owner, name: repoName, cursor });
+              const conn = data.repository?.pullRequests;
+              if (!isObject(conn) || !Array.isArray(conn.nodes)) throw new Error('recent-merge audit: incomplete response');
+              let reachedCutoff = false;
+              for (const pr of conn.nodes) {
+                if (!isObject(pr) || !Number.isInteger(pr.number)) throw new Error('recent-merge audit: malformed node (indeterminate)');
+                const updatedAt = parseTime(pr.updatedAt, `PR #${pr.number} updatedAt`);
+                const mergedAt = parseTime(pr.mergedAt, `PR #${pr.number} mergedAt`);
+                if (updatedAt > previousUpdated) throw new Error('recent-merge audit: updatedAt ordering violated (indeterminate)');
+                previousUpdated = updatedAt;
+                if (updatedAt < cutoff) reachedCutoff = true;
+                if (mergedAt < cutoff) continue;
+                if (mergedViaAutoMerge(pr, mergedAt)) {
+                  const sha = pr.mergeCommit?.oid || pr.headRefOid;
+                  console.log(`::error::PR #${pr.number} merged via native auto-merge at ${sha}; hermes grants no merge authority`);
+                  failures.push(`PR #${pr.number}: merged via native auto-merge (drift alarm)`);
+                }
+              }
+              cursor = nextCursor(conn.pageInfo, 'recent-merge audit');
+              if (reachedCutoff || cursor === null) return;
+            }
+            throw new Error(`recent-merge audit incomplete: exceeded ${MAX_PAGES} pages`);
           }
 
           const MAX_PASSES = 3;
@@ -314,15 +420,15 @@ jobs:
               console.error(`error: ${error.message}`);
             }
             await resolveIdentity();
-            const attempt = async (number) => {
+            const attempt = async (number, fromArmedList) => {
               try {
-                await disarm({ number });
+                await disarm({ number, fromArmedList });
               } catch (error) {
                 failures.push(`PR #${number}: ${error.message}`);
                 console.error(`error: ${error.message}`);
               }
             };
-            if (first !== null) await attempt(first);
+            if (first !== null) await attempt(first, false);
 
             try {
               // Up to MAX_PASSES list-and-disarm passes, then a final list that must
@@ -332,7 +438,7 @@ jobs:
                 const armed = await listArmed();
                 if (!armed.length) { remaining = []; break; }
                 console.log(`pass ${pass}: ${armed.length} armed PR(s)`);
-                for (const pr of armed) await attempt(pr.number);
+                for (const pr of armed) await attempt(pr.number, true);
               }
               if (remaining === null) remaining = await listArmed();
               if (remaining.length) {
