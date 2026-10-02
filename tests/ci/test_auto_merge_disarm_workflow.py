@@ -54,6 +54,7 @@ class FakeGitHub:
         self.user_login = None  # None => /user 403 (app token); else PAT user
         self.post_fail_count = 0
         self.merge_on_reread = set()  # armed in the list, MERGED by the time it is re-read
+        self.merge_on_disarm = set()  # auto-merge completes between the live read and the disable
         self.after_first_page = None
         self.merged = []  # dicts: number, mergedAt, sha, events[(type, time)]
         self.audit_fail = False
@@ -113,6 +114,8 @@ def _handler(fake: FakeGitHub):
                     return self._send(200, {"errors": [{"message": "denied"}], "data": None})
                 if n not in fake.disarm_noop:
                     fake.prs[n]["armed"] = False
+                if n in fake.merge_on_disarm:
+                    fake.prs[n]["state"] = "merged"
                 return self._send(200, {"data": {"disablePullRequestAutoMerge": {"pullRequest": {"number": n}}}})
             if "query PrByNumber" in query:
                 fake.calls.append(("GQL", "PrByNumber"))
@@ -773,6 +776,44 @@ def test_enable_and_disable_tie_resolves_to_enabled(gh):
     r = run(gh)
     assert r.returncode != 0
     assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+@needs_node
+def test_merged_event_created_after_merged_at_does_not_extend_the_disable_bound(gh):
+    # mergedAt = T; enable at T-60s; disable at T+1s; MergedEvent object created at T+2s.
+    # The disable is after the actual merge, so it must not hide the enable.
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    merged = datetime.now(timezone.utc) - timedelta(minutes=10)
+    add_merged(gh, 9, timedelta(minutes=10), [])
+    gh.merged[-1]["events"] = [
+        ("AutoMergeEnabledEvent", (merged - timedelta(seconds=60)).strftime(fmt)),
+        ("AutoMergeDisabledEvent", (merged + timedelta(seconds=1)).strftime(fmt)),
+        ("MergedEvent", (merged + timedelta(seconds=2)).strftime(fmt)),
+    ]
+    gh.merged[-1]["mergedAt"] = merged.strftime(fmt)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "::error::PR #9 merged via native auto-merge" in r.stdout
+
+
+@needs_node
+def test_audit_updated_at_before_merged_at_fails_closed(gh):
+    # updatedAt < mergedAt breaks the pagination completeness argument.
+    add_merged(gh, 9, timedelta(minutes=10), [], updated_ago=timedelta(minutes=20))
+    r = run(gh)
+    assert r.returncode != 0
+    assert "updatedAt precedes mergedAt (indeterminate)" in r.stdout + r.stderr
+
+
+@needs_node
+def test_merge_between_live_read_and_disable_is_a_drift_alarm_not_a_disarm(gh):
+    add_pr(gh, 1, armed=True)
+    gh.merge_on_disarm.add(1)
+    r = run(gh)
+    assert r.returncode != 0
+    assert "native auto-merge merged before disarm" in r.stdout
+    assert "ok: disarmed auto-merge for PR #1" not in r.stdout
+    assert 1 not in gh.comments
 
 
 def test_audit_query_shape():

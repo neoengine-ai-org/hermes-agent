@@ -293,6 +293,11 @@ jobs:
             if (live.state !== 'OPEN' || live.autoMergeRequest === null) return 'skip';
             await graphql(DISARM, { id: live.id });
             const after = await fetchPr(live.number);
+            if (after.state === 'MERGED') {
+              // Auto-merge completed between the live read and the disable.
+              console.log(`::error::PR #${after.number} head ${after.headRefOid}: native auto-merge merged before disarm`);
+              throw new Error(`PR #${after.number}: merged before disarm (drift alarm)`);
+            }
             if (after.autoMergeRequest !== null) throw new Error(`PR #${live.number}: auto-merge still armed after disarm`);
             const receipt = await postReceipt(after);
             console.log(`ok: disarmed auto-merge for PR #${live.number} at ${after.headRefOid}; receipt ${receipt}; token source: ${tokenSource}`);
@@ -338,7 +343,9 @@ jobs:
 
           // Decide from a validated timeline whether the PR merged via native
           // auto-merge. Ordering is fail-closed:
-          //  - the merge time is the MergedEvent createdAt when present, else mergedAt;
+          //  - the merge time is the EARLIEST of mergedAt and any MergedEvent
+          //    createdAt: event-object creation can lag the merge, and a later
+          //    bound would let a post-merge disable hide the enable;
           //  - enable events count when createdAt <= merge time;
           //  - AutoMergeDisabledEvent counts only when createdAt < merge time: a
           //    system disable recorded at merge completion must not hide the enable;
@@ -357,7 +364,7 @@ jobs:
               return { type: i.__typename, t: parseTime(i.createdAt, `PR #${pr.number} ${i.__typename}.createdAt`) };
             });
             const mergeEvents = items.filter((i) => i.type === 'MergedEvent').map((i) => i.t);
-            const mergeTime = mergeEvents.length ? Math.max(...mergeEvents) : mergedAtMs;
+            const mergeTime = Math.min(mergedAtMs, ...mergeEvents);
             const relevant = items
               .filter((i) => (ENABLE_TYPES.has(i.type) && i.t <= mergeTime) || (i.type === 'AutoMergeDisabledEvent' && i.t < mergeTime))
               .sort((x, y) => (x.t - y.t) || ((x.type === 'AutoMergeDisabledEvent' ? 0 : 1) - (y.type === 'AutoMergeDisabledEvent' ? 0 : 1)));
@@ -391,6 +398,8 @@ jobs:
                 const updatedAt = parseTime(pr.updatedAt, `PR #${pr.number} updatedAt`);
                 const mergedAt = parseTime(pr.mergedAt, `PR #${pr.number} mergedAt`);
                 if (updatedAt > previousUpdated) throw new Error('recent-merge audit: updatedAt ordering violated (indeterminate)');
+                // The completeness argument needs updatedAt >= mergedAt.
+                if (updatedAt < mergedAt) throw new Error(`recent-merge audit: PR #${pr.number} updatedAt precedes mergedAt (indeterminate)`);
                 previousUpdated = updatedAt;
                 if (updatedAt < cutoff) reachedCutoff = true;
                 if (mergedAt < cutoff) continue;
