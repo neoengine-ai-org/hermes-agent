@@ -4,7 +4,7 @@
   "files": {
     ".github/workflows/auto-merge-disarm-reconciler.yml": "1fac057bfafb978646a3b81f74f6d0d412a7debbc77a4123840e07d16a74abed",
     ".github/workflows/ci-runtime-os-advisory.yml": "857e928b1f4036c0685a41a5a93cf4e77e3cdef9fa569eb6d5f4260460dfd706",
-    "scripts/ci/runtime_os_adapter.py": "924b180fca2b0c63186124048de650c07bc5d4e39618adf9d9d22b3f0e021d46",
+    "scripts/ci/runtime_os_adapter.py": "fffdae7165c0ad04bfdadfea62059861bb755608effd4c609a1dd0c32f6a3c8f",
     "scripts/ci_risk_classifier.py": "6104b46b1b7d470ab8d8bd21070e6c48ce3745670243419735ead1b877c22ad6",
     "scripts/ci_risk_classifier_core.py": "7c1cbf9544ff9365a7fbf62ae7475a87d64a1a39be64062e5c0f1a2b252691ff",
     "scripts/review_receipt_validator.py": "9e9786705b5be06b9eb7e177e8c51fe075f4ec2634cd482838ec3d3d46dc1c2b",

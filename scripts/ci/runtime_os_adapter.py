@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import argparse
 import ast
-import functools
+import contextlib
+import errno
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -110,51 +113,160 @@ def full_proof(files: list[str], event_name: str, policy: dict[str, Any]) -> tup
     return False, "narrow_change"
 
 
-def _walk_py_files(start: Path, prune) -> list[Path]:
-    """``*.py`` files under ``start``, never descending into pruned dirs.
+# Discovery and reads use the immutable git objects of the candidate commit --
+# the commit checked out at ``CANDIDATE_ROOT``, pinned to its full SHA once
+# per plan -- never the live filesystem. The test universe is exactly what the
+# execution checkout of that commit contains: untracked files and bytecode
+# caches do not exist in it, contents are content-addressed blobs, and a
+# concurrent change to the working tree cannot alter a plan.
+_REGULAR_MODES = {"100644", "100755"}
+_SYMLINK_MODE = "120000"
+_GITLINK_MODE = "160000"
+_GIT_ENVIRONMENT = {
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_TERMINAL_PROMPT": "0",
+}
 
-    os.walk instead of Path.rglob: parallel test processes create and delete
-    ``__pycache__`` directories while this runs, and rglob raises
-    FileNotFoundError on a directory that vanishes mid-walk; os.walk skips it.
+# (root, commit) -> {path: (mode, object id)}; immutable for a given commit.
+_TREE_ENTRIES: dict[tuple[Path, str], dict[str, tuple[str, str]]] = {}
+# blob id -> raw bytes awaiting parse, and blob id -> parsed references /
+# dotted prefixes; content-addressed, so never stale.
+_PENDING_BLOBS: dict[str, bytes] = {}
+_REFERENCES_BY_BLOB: dict[str, frozenset[str]] = {}
+_PREFIXES_BY_BLOB: dict[str, frozenset[str]] = {}
+_PLAN: dict[str, object] | None = None
+
+
+def _git(root: Path, *args: str, stdin: bytes | None = None) -> bytes:
+    """Run plumbing git in ``root`` with a sanitized environment."""
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    environment.update(_GIT_ENVIRONMENT)
+    completed = subprocess.run(
+        ["git", "-c", "core.fsmonitor=false", "-C", str(root), *args],
+        input=stdin,
+        capture_output=True,
+        env=environment,
+        check=False,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"git {args[0]} failed in {root}: {detail}")
+    return completed.stdout
+
+
+def _resolve_candidate_commit(root: Path) -> str:
+    """Full SHA of the commit checked out at ``root`` (the repository top level)."""
+    if os.path.realpath(root) != str(root):
+        raise ValueError(f"candidate root must not be a symlink or contain one: {root}")
+    top_level = _git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()
+    if os.path.realpath(top_level) != str(root):
+        raise ValueError(f"candidate root must be the repository top level: {root} (found {top_level})")
+    commit = _git(root, "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}").decode("ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        raise ValueError(f"unexpected commit id from git: {commit!r}")
+    return commit
+
+
+def _tree_entries(root: Path, commit: str) -> dict[str, tuple[str, str]]:
+    key = (root, commit)
+    entries = _TREE_ENTRIES.get(key)
+    if entries is None:
+        entries = {}
+        for record in _git(root, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
+            if not record:
+                continue
+            header, _, raw_path = record.partition(b"\t")
+            mode, kind, object_id = header.decode("ascii").split(" ")
+            path = raw_path.decode("utf-8", "surrogateescape")
+            if kind not in {"blob", "commit"}:
+                raise ValueError(f"unexpected tree entry {kind} for {path!r}")
+            entries[path] = (mode, object_id)
+        _TREE_ENTRIES[key] = entries
+    return entries
+
+
+def _candidate_tree() -> tuple[str, dict[str, tuple[str, str]]]:
+    """The pinned candidate commit and its entries (one commit per plan)."""
+    if _PLAN is not None and _PLAN.get("root") == CANDIDATE_ROOT and _PLAN.get("commit"):
+        commit = str(_PLAN["commit"])
+    else:
+        commit = _resolve_candidate_commit(CANDIDATE_ROOT)
+        if _PLAN is not None:
+            _PLAN["root"], _PLAN["commit"] = CANDIDATE_ROOT, commit
+    return commit, _tree_entries(CANDIDATE_ROOT, commit)
+
+
+def _tree_python_files(prefix: tuple[str, ...], prune, refuse_links_when_pruned: bool) -> list[str]:
+    """Regular ``*.py`` blobs of the pinned commit under ``prefix``.
+
+    Python files below a directory for which ``prune(parts)`` is true are
+    skipped, but pruning never hides a link: a gitlink anywhere under
+    ``prefix`` raises (the execution checkout does not materialize
+    submodules, so its tests would silently be missing), and so does any
+    symlink outside pruned directories -- or anywhere, when
+    ``refuse_links_when_pruned`` (the test tree, whose pruned e2e,
+    integration and docker suites are collected by their own jobs) -- since
+    pytest could collect through it and a link can resolve differently in
+    another checkout. A ``prefix`` absent from, or not a directory in, the
+    commit raises too.
     """
-    def vanished_only(error: OSError) -> None:
-        # Only a directory that disappeared mid-walk is skipped; any other
-        # traversal error must not silently drop sources or tests.
-        if not isinstance(error, (FileNotFoundError, NotADirectoryError)):
-            raise error
+    _, entries = _candidate_tree()
+    label = "/".join(prefix)
+    if prefix and label in entries:
+        mode = entries[label][0]
+        if mode == _SYMLINK_MODE:
+            raise ValueError(f"runtime-OS discovery refuses symlink: {label}")
+        raise NotADirectoryError(errno.ENOTDIR, "Not a directory in the candidate commit", label)
+    found: list[str] = []
+    seen_prefix = not prefix
+    for path, (mode, _) in entries.items():
+        parts = tuple(path.split("/"))
+        if parts[: len(prefix)] != prefix:
+            continue
+        seen_prefix = True
+        if mode == _GITLINK_MODE:
+            raise ValueError(f"runtime-OS discovery refuses submodule: {path}")
+        pruned = any(prune(parts[: index + 1]) for index in range(len(prefix), len(parts) - 1))
+        if mode == _SYMLINK_MODE and (refuse_links_when_pruned or not pruned):
+            raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+        if not pruned and mode in _REGULAR_MODES and path.endswith(".py"):
+            found.append(path)
+    if not seen_prefix:
+        raise FileNotFoundError(errno.ENOENT, "Not present in the candidate commit", label)
+    return found
 
-    found: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(start, onerror=vanished_only):
-        relative = Path(dirpath).relative_to(CANDIDATE_ROOT).parts
-        dirnames[:] = [name for name in dirnames if not prune(relative + (name,))]
-        found.extend(Path(dirpath) / name for name in filenames if name.endswith(".py"))
-    return [path for path in found if path.is_file()]
+
+_TEST_SKIP_PARTS = {"integration", "e2e", "docker"}
+_SOURCE_EXCLUDED = {".git", ".venv", "tests", "venv"}
+# Generated interpreter/environment trees at the repository root are not
+# source: the bootstrap proof venv and the restored CI environment (which
+# carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
+_SOURCE_GENERATED_ROOTS = {".bootstrap-proof-venv", "ci-fast"}
+
+
+def _prune_tests(parts: tuple[str, ...]) -> bool:
+    return parts[-1] in _TEST_SKIP_PARTS
+
+
+def _prune_sources(parts: tuple[str, ...]) -> bool:
+    return parts[-1] in _SOURCE_EXCLUDED or (len(parts) == 1 and parts[0] in _SOURCE_GENERATED_ROOTS)
 
 
 def discover_tests() -> list[str]:
-    skip_parts = {"integration", "e2e", "docker"}
     return sorted(
-        str(path.relative_to(CANDIDATE_ROOT))
-        for path in _walk_py_files(CANDIDATE_ROOT / "tests", lambda parts: parts[-1] in skip_parts)
-        if path.name.startswith("test_")
-        and not (set(path.relative_to(CANDIDATE_ROOT).parts) & skip_parts)
+        path
+        for path in _tree_python_files(("tests",), _prune_tests, refuse_links_when_pruned=True)
+        if Path(path).name.startswith("test_") and not (set(Path(path).parts) & _TEST_SKIP_PARTS)
     )
 
 
 def discover_python_sources() -> list[str]:
-    excluded = {".git", ".venv", "tests", "venv"}
-    # Generated interpreter/environment trees at the repository root are not
-    # source: the bootstrap proof venv and the restored CI environment (which
-    # carries a whole CPython stdlib under ci-fast/) would otherwise be parsed.
-    generated_roots = {".bootstrap-proof-venv", "ci-fast"}
-
-    def prune(parts: tuple[str, ...]) -> bool:
-        return parts[-1] in excluded or (len(parts) == 1 and parts[0] in generated_roots)
-
     return sorted(
-        str(path.relative_to(CANDIDATE_ROOT))
-        for path in _walk_py_files(CANDIDATE_ROOT, prune)
-        if not (set(path.relative_to(CANDIDATE_ROOT).parts) & excluded)
+        path
+        for path in _tree_python_files((), _prune_sources, refuse_links_when_pruned=False)
+        if not (set(Path(path).parts) & _SOURCE_EXCLUDED)
     )
 
 
@@ -163,12 +275,100 @@ def _module_name(path: str) -> str:
     return module.removesuffix(".__init__")
 
 
-@functools.lru_cache(maxsize=None)
-def _module_references(path: str) -> frozenset[str]:
-    source = (CANDIDATE_ROOT / path).read_text(encoding="utf-8")
+def _iter_nodes(tree: ast.AST):
+    """Yield every node of ``tree`` (same node set as ``ast.walk``).
+
+    A plain stack walk avoids ``ast.walk``'s per-node ``iter_child_nodes`` /
+    ``iter_fields`` generator overhead, which dominated selection time.
+    """
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        yield node
+        for field in node._fields:
+            value = getattr(node, field, None)
+            if isinstance(value, list):
+                stack.extend(item for item in value if isinstance(item, ast.AST))
+            elif isinstance(value, ast.AST):
+                stack.append(value)
+
+
+def _decode_source(data: bytes) -> str:
+    """Decode exactly like ``Path.read_text(encoding="utf-8")`` (universal newlines)."""
+    return io.TextIOWrapper(io.BytesIO(data), encoding="utf-8").read()
+
+
+def _in_discoverable_universe(path: str) -> bool:
+    """Whether ``path`` lies where source or test discovery could return it."""
+    parts = tuple(path.split("/"))
+    if parts[0] == "tests":
+        return not any(_prune_tests(parts[: index + 1]) for index in range(1, len(parts) - 1))
+    return not any(_prune_sources(parts[: index + 1]) for index in range(len(parts) - 1))
+
+
+def _fetch_blobs(object_ids: list[str]) -> None:
+    """Load blobs with one ``git cat-file --batch``, verifying id and type."""
+    if not object_ids:
+        return
+    output = _git(CANDIDATE_ROOT, "cat-file", "--batch", stdin="".join(f"{oid}\n" for oid in object_ids).encode("ascii"))
+    offset = 0
+    for object_id in object_ids:
+        newline = output.index(b"\n", offset)
+        header = output[offset:newline].decode("ascii").split(" ")
+        if len(header) != 3 or header[0] != object_id or header[1] != "blob":
+            raise ValueError(f"git returned {header!r} for blob {object_id}")
+        size = int(header[2])
+        start = newline + 1
+        _PENDING_BLOBS[object_id] = output[start : start + size]
+        if output[start + size : start + size + 1] != b"\n":
+            raise ValueError(f"malformed git cat-file output for blob {object_id}")
+        offset = start + size + 1
+
+
+def _blob_for(path: str) -> str:
+    """Blob id of ``path`` in the pinned commit; a symlink or non-file raises."""
+    _, entries = _candidate_tree()
+    entry = entries.get(path)
+    if entry is None:
+        raise FileNotFoundError(errno.ENOENT, "Not present in the candidate commit", path)
+    mode, object_id = entry
+    if mode == _SYMLINK_MODE:
+        raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+    if mode not in _REGULAR_MODES:
+        raise ValueError(f"{path} is not a regular file in the candidate commit")
+    if object_id not in _REFERENCES_BY_BLOB and object_id not in _PENDING_BLOBS:
+        # Fetch every unparsed blob of the discoverable universe at once
+        # (pruned environments such as .venv are never fetched).
+        _fetch_blobs(
+            sorted(
+                {
+                    oid
+                    for name, (entry_mode, oid) in entries.items()
+                    if entry_mode in _REGULAR_MODES
+                    and name.endswith(".py")
+                    and _in_discoverable_universe(name)
+                    and oid not in _REFERENCES_BY_BLOB
+                    and oid not in _PENDING_BLOBS
+                }
+                | {object_id}
+            )
+        )
+    return object_id
+
+
+def _candidate_source(path: str) -> str:
+    object_id = _blob_for(path)
+    data = _PENDING_BLOBS.get(object_id)
+    if data is None:
+        _fetch_blobs([object_id])
+        data = _PENDING_BLOBS[object_id]
+    return _decode_source(data)
+
+
+def _parse_references(source: str, path: str) -> frozenset[str]:
     tree = ast.parse(source, filename=path)
     references: set[str] = set()
-    for node in ast.walk(tree):
+    for node in _iter_nodes(tree):
         if isinstance(node, ast.Import):
             references.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
@@ -190,6 +390,16 @@ def _module_references(path: str) -> frozenset[str]:
     return frozenset(references)
 
 
+def _module_references(path: str) -> frozenset[str]:
+    object_id = _blob_for(path)
+    references = _REFERENCES_BY_BLOB.get(object_id)
+    if references is None:
+        references = _parse_references(_candidate_source(path), path)
+        _REFERENCES_BY_BLOB[object_id] = references
+        _PENDING_BLOBS.pop(object_id, None)
+    return references
+
+
 def _imports_module(path: str, module_name: str) -> bool:
     """Return whether a source/test directly references a module boundary."""
     return any(
@@ -198,17 +408,23 @@ def _imports_module(path: str, module_name: str) -> bool:
     )
 
 
-@functools.lru_cache(maxsize=None)
 def _reference_prefixes(path: str) -> frozenset[str]:
     """Every dotted prefix of every reference: ``a.b.c`` -> ``a``, ``a.b``, ``a.b.c``.
 
     ``_imports_module(path, m)`` holds exactly when ``m`` is in this set.
     """
-    prefixes: set[str] = set()
-    for reference in _module_references(path):
-        parts = reference.split(".")
-        prefixes.update(".".join(parts[: index + 1]) for index in range(len(parts)))
-    return frozenset(prefixes)
+    object_id = _blob_for(path)
+    prefixes = _PREFIXES_BY_BLOB.get(object_id)
+    if prefixes is not None:
+        return prefixes
+    references = _module_references(path)
+    if prefixes is None:
+        expanded: set[str] = set()
+        for reference in references:
+            parts = reference.split(".")
+            expanded.update(".".join(parts[: index + 1]) for index in range(len(parts)))
+        prefixes = _PREFIXES_BY_BLOB[object_id] = frozenset(expanded)
+    return prefixes
 
 
 def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
@@ -242,18 +458,46 @@ def _impacted_closure(changed_module: str) -> tuple[set[str], list[str]]:
     return impacted, parse_failures
 
 
+@contextlib.contextmanager
+def _plan_snapshot():
+    """Pin one candidate commit for the whole plan (nested plans share it)."""
+    global _PLAN
+    if _PLAN is not None:
+        yield
+        return
+    _PLAN = {}
+    try:
+        yield
+    finally:
+        _PLAN = None
+
+
 def select_tests(files: list[str]) -> tuple[list[str], bool]:
+    with _plan_snapshot():
+        return _select_tests(files)
+
+
+def _select_tests(files: list[str]) -> tuple[list[str], bool]:
     all_tests = discover_tests()
     classifier = load_classifier()
     executable_suffixes = set(classifier.EXECUTABLE_SUFFIXES)
     selected: set[str] = set()
     unknown_executable = False
     for raw in files:
-        path = raw.replace("\\", "/").removeprefix("./")
-        candidate = CANDIDATE_ROOT / path
-        if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.name.startswith("test_") and candidate.exists():
-            selected.add(path)
+        if "\\" in raw:
+            # A literal backslash is a legal POSIX filename character; mapping
+            # it to "/" could select a different file. Force full proof.
+            unknown_executable = True
             continue
+        path = raw.removeprefix("./")
+        candidate = CANDIDATE_ROOT / path
+        if path.startswith("tests/") and candidate.suffix in TEST_SUFFIXES and candidate.name.startswith("test_"):
+            mode = _candidate_tree()[1].get(path, ("",))[0]
+            if mode == _SYMLINK_MODE:
+                raise ValueError(f"runtime-OS discovery refuses symlink: {path}")
+            if mode in _REGULAR_MODES:
+                selected.add(path)
+                continue
         suffix = candidate.suffix.lower()
         if suffix not in executable_suffixes and candidate.name not in EXECUTABLE_NAMES:
             if not classifier.is_documentation_file(path):
@@ -345,10 +589,11 @@ def plan(args: argparse.Namespace) -> int:
     classification = load_classifier().classify(files, body, additions=args.additions, pr_number=args.pr_number, repo=args.repo)
     review_classification = build_review_classification(classification)
     run_full, reason = full_proof(files, args.event_name, policy)
-    selected, unknown = select_tests(files)
-    if unknown:
-        run_full, reason = True, "unknown_executable_fails_closed"
-    tests = discover_tests() if run_full else selected
+    with _plan_snapshot():  # selection and full-proof discovery see one commit
+        selected, unknown = select_tests(files)
+        if unknown:
+            run_full, reason = True, "unknown_executable_fails_closed"
+        tests = discover_tests() if run_full else selected
     # The matrix travels colon-joined; a path containing ':' would split into
     # decoy paths and the real file would never run.
     ambiguous = sorted(
