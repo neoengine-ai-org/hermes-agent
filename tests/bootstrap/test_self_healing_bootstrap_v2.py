@@ -12,6 +12,15 @@ PIN=ROOT/"config/hermes-bootstrap-acquisition-v2.sha256"
 def run(argv,cwd,env=None):
     return subprocess.run(argv,cwd=cwd,env=env,text=True,capture_output=True,check=False,timeout=300)
 
+def local_clone(checkout,cwd):
+    # Hardlinked local clone: own .git, shared immutable objects. Sandboxes that
+    # forbid link(2) fail with EPERM; only then fall back to a full object copy.
+    clone=run(["git","clone","--local","--quiet",str(ROOT),str(checkout)],cwd)
+    if clone.returncode!=0:
+        shutil.rmtree(checkout,ignore_errors=True)
+        clone=run(["git","clone","--local","--no-hardlinks","--quiet",str(ROOT),str(checkout)],cwd)
+    return clone
+
 def test_policy_pin_and_shared_home_refusal():
     raw=POLICY.read_bytes()
     assert hashlib.sha256(raw).hexdigest()==PIN.read_text().split()[0]
@@ -23,7 +32,8 @@ def test_policy_pin_and_shared_home_refusal():
 @pytest.mark.timeout(300)
 def test_stage0_restores_deleted_resolver_and_rejects_wrong_pin(tmp_path):
     checkout=tmp_path/"hermes"
-    assert run(["git","clone","--no-local","--quiet",str(ROOT),str(checkout)],tmp_path).returncode==0
+    clone=local_clone(checkout,tmp_path)
+    assert clone.returncode==0,clone.stderr
     assert run(["git","remote","set-url","origin","https://github.com/neoengine-ai-org/hermes-agent.git"],checkout).returncode==0
     policy=json.loads((checkout/"config/hermes-bootstrap-acquisition-v2.json").read_text(encoding="utf-8"))
     resolver=checkout/policy["stage1"]["path"]
