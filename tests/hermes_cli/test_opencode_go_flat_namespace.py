@@ -126,9 +126,18 @@ def _run_switch(raw_input: str, **extra):
         # For other providers, return empty so tests don't depend on them.
         return []
 
+    # validate_requested_model() probes the provider's live /v1/models too;
+    # serve the same snapshot there so a catalog change upstream (e.g. a
+    # renamed model) can't auto-correct the requested name.
+    def fake_fetch_api_models(api_key, base_url, *args, **kwargs):
+        return list(_OPENCODE_GO_LIVE)
+
     with patch(
         "hermes_cli.model_switch.list_provider_models",
         side_effect=fake_list_provider_models,
+    ), patch(
+        "hermes_cli.models.fetch_api_models",
+        side_effect=fake_fetch_api_models,
     ):
         return switch_model(raw_input=raw_input, **defaults)
 
