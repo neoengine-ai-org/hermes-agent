@@ -90,7 +90,12 @@ def chrome_cdp(request):
             time.sleep(0.25)
     if ws_url is None:
         proc.terminate()
-        proc.wait(timeout=5)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            # A slow-exiting Chrome must not turn the skip into a setup ERROR.
+            proc.kill()
+            proc.wait()
         shutil.rmtree(profile, ignore_errors=True)
         pytest.skip("Chrome didn't expose CDP in time")
 
