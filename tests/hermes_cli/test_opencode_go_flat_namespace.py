@@ -138,6 +138,11 @@ def _run_switch(raw_input: str, **extra):
     ), patch(
         "hermes_cli.models.fetch_api_models",
         side_effect=fake_fetch_api_models,
+    ), patch(
+        # get_model_capabilities() / get_model_info() resolve this module
+        # global at call time; stub it so metadata lookups never hit models.dev.
+        "agent.models_dev.fetch_models_dev",
+        return_value={},
     ):
         return switch_model(raw_input=raw_input, **defaults)
 
