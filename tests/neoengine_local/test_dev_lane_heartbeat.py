@@ -335,3 +335,266 @@ def test_governance_bypass_cases_are_preserved(tmp_path: Path) -> None:
         "human": "awaiting_human_review",
         "refused": "refused_without_sidecar_evidence",
     }
+
+
+def _assignment_item(work_item_id="assigned", **overrides):
+    return {
+        "work_item_id": work_item_id,
+        "repo_scope": "repo",
+        "authorized_scopes": ["**"],
+        "status": "open",
+        "events": [{"event_id": "evt-1", "event_type": "explicit_operator_command", "created_at": "2026-06-24T00:00:00Z"}],
+        **overrides,
+    }
+
+
+def test_required_lane_blocks_wildcard_picker_and_direct_claim(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("intended", repo_scope="repo", authorized_scopes=["**"])
+    store.register_lane("wildcard", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item(_assignment_item(required_lane_id="intended"))
+
+    assert store.pick_next_work("wildcard", "other", now="2026-06-24T00:01:00Z")["action"] == "idle-no-work"
+    with pytest.raises(ValueError, match="outside_required_lane"):
+        store.claim_work("assigned", "wildcard", "other", "2026-06-24T00:01:00Z", 60, "receipts/other")
+    assert store.claim_for_work("assigned") is None
+    assert store.pick_next_work("intended", "owner", now="2026-06-24T00:01:00Z")["work_item_id"] == "assigned"
+
+
+def test_required_work_item_blocks_legacy_wildcard_work(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("intended", repo_scope="repo", authorized_scopes=["**"])
+    # A persisted lane record is also read by older processes. Exercise the
+    # consumer directly instead of relying on the new registration argument.
+    lanes = store.read_json("lanes.json", {})
+    lanes["intended"]["required_work_item_id"] = "assigned"
+    store.write_json("lanes.json", lanes)
+    store.add_work_item(_assignment_item("legacy", operator_priority=1))
+
+    assert store.pick_next_work("intended", "owner", now="2026-06-24T00:01:00Z")["action"] == "idle-no-work"
+    with pytest.raises(ValueError, match="outside_required_work_item"):
+        store.claim_work("legacy", "intended", "owner", "2026-06-24T00:01:00Z", 60, "receipts/legacy")
+    store.add_work_item(_assignment_item(required_lane_id="intended", operator_priority=100))
+    assert store.pick_next_work("intended", "owner", now="2026-06-24T00:01:00Z")["work_item_id"] == "assigned"
+    assert store.claim_for_work("legacy") is None
+
+
+def test_close_blocked_binds_current_event_until_new_event(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item(_assignment_item())
+    store.claim_work("assigned", "lane-a", "owner", "2026-06-24T00:00:00Z", 3600, "receipts/start")
+    store.record_event("assigned", "review_request", "2026-06-24T00:01:00Z", event_id="evt-2")
+    store.close_claim("assigned", "blocked", "receipts/blocker", "2026-06-24T00:02:00Z")
+
+    item = store.read_json("work/items.json")["assigned"]
+    assert item["status"] == "blocked"
+    assert item["blocked_at_event_id"] == "evt-2"
+    assert store.pick_next_work("lane-a", "next", now="2026-06-24T00:03:00Z")["action"] == "idle-no-work"
+    assert len(store.read_json("claims/history.json")) == 1
+    store.record_event("assigned", "governance_unblock", "2026-06-24T00:04:00Z", event_id="evt-3")
+    pickup = store.pick_next_work("lane-a", "next", now="2026-06-24T00:05:00Z")
+    assert pickup["action"] == "claimed"
+    assert pickup["wake_reason"] == "event:governance_unblock"
+
+
+def test_competing_claims_have_one_owner_after_delayed_publication(tmp_path: Path, monkeypatch) -> None:
+    import threading
+
+    first = DevLaneStore(tmp_path)
+    second = DevLaneStore(tmp_path)
+    first.add_work_item(_assignment_item())
+    reached_write = threading.Event()
+    release_first = threading.Event()
+    second_reached_write = threading.Event()
+    second_finished = threading.Event()
+    original_write = DevLaneStore.write_json
+    results = {}
+
+    def delayed_write(self, relative, value):
+        if str(relative) == "claims/assigned.json" and value.get("claim_status") == "active":
+            if value["claim_owner_session_id"] == "first":
+                reached_write.set()
+                if not release_first.wait(5):
+                    raise RuntimeError("test did not release first claimant")
+            else:
+                second_reached_write.set()
+        return original_write(self, relative, value)
+
+    def claim(store, owner):
+        try:
+            results[owner] = store.claim_work("assigned", owner, owner, "2026-06-24T00:00:00Z", 3600, "receipts/" + owner)
+        except Exception as exc:
+            results[owner] = exc
+        finally:
+            if owner == "second":
+                second_finished.set()
+
+    monkeypatch.setattr(DevLaneStore, "write_json", delayed_write)
+    a = threading.Thread(target=claim, args=(first, "first"))
+    b = threading.Thread(target=claim, args=(second, "second"))
+    a.start()
+    try:
+        assert reached_write.wait(5)
+        b.start()
+        if second_reached_write.wait(0.3):
+            assert second_finished.wait(5)
+    finally:
+        release_first.set()
+        a.join(5)
+        if b.ident is not None:
+            b.join(5)
+    assert not a.is_alive() and not b.is_alive()
+    assert isinstance(results["first"], dict)
+    assert isinstance(results["second"], ValueError)
+    assert "active claim already exists" in str(results["second"])
+    assert first.claim_for_work("assigned")["claim_owner_session_id"] == "first"
+    assert first.read_json("claims/history.json", []) == []
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("required_lane_id", None), ("required_lane_id", ""), ("required_lane_id", []), ("required_lane_id", 7),
+    ("required_work_item_id", None), ("required_work_item_id", ""), ("required_work_item_id", []), ("required_work_item_id", 7),
+])
+def test_malformed_persisted_assignments_refuse_without_claim(tmp_path: Path, field, bad) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    item = _assignment_item()
+    if field == "required_lane_id":
+        item[field] = bad
+    else:
+        lanes = store.read_json("lanes.json")
+        lanes["lane-a"][field] = bad
+        store.write_json("lanes.json", lanes)
+    store.add_work_item(item)
+    assert store.pick_next_work("lane-a", "owner", now="2026-06-24T00:00:00Z")["action"] == "idle-no-work"
+    with pytest.raises(ValueError, match="invalid_required_"):
+        store.claim_work("assigned", "lane-a", "owner", "2026-06-24T00:00:00Z", 60, "receipts/start")
+    assert store.claim_for_work("assigned") is None
+
+
+def test_explicit_assignment_requires_real_registered_lane(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item(_assignment_item(required_lane_id="missing"))
+    with pytest.raises(ValueError, match="required_lane_not_registered"):
+        store.claim_work("assigned", "missing", "owner", "2026-06-24T00:00:00Z", 60, "receipts/start")
+    assert store.claim_for_work("assigned") is None
+
+
+def test_wrong_assignment_does_not_mutate_expired_owner_or_history(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("intended", repo_scope="repo", authorized_scopes=["**"], required_work_item_id="assigned")
+    store.register_lane("other", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item(_assignment_item(required_lane_id="intended"))
+    store.claim_work("assigned", "intended", "old", "2026-06-24T00:00:00Z", 60, "receipts/old")
+    before_claim = (tmp_path / "claims/assigned.json").read_bytes()
+    before_items = (tmp_path / "work/items.json").read_bytes()
+    with pytest.raises(ValueError, match="outside_required_lane"):
+        store.claim_work("assigned", "other", "new", "2026-06-24T00:02:00Z", 60, "receipts/new", recovery_evidence_path="receipts/recovery")
+    assert (tmp_path / "claims/assigned.json").read_bytes() == before_claim
+    assert (tmp_path / "work/items.json").read_bytes() == before_items
+    assert store.read_json("claims/history.json", []) == []
+    recovered = store.claim_work("assigned", "intended", "new", "2026-06-24T00:02:00Z", 60, "receipts/new", recovery_evidence_path="receipts/recovery")
+    assert recovered["claim_owner_session_id"] == "new"
+    assert len(store.read_json("claims/history.json")) == 1
+
+
+def test_claim_rechecks_assignment_changed_after_pick_selection(tmp_path: Path, monkeypatch) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item(_assignment_item())
+    original_claim = store.claim_work
+
+    def change_assignment_then_claim(*args, **kwargs):
+        store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"], required_work_item_id="different")
+        return original_claim(*args, **kwargs)
+
+    monkeypatch.setattr(store, "claim_work", change_assignment_then_claim)
+    with pytest.raises(ValueError, match="outside_required_work_item"):
+        store.pick_next_work("lane-a", "owner", now="2026-06-24T00:00:00Z")
+    assert store.claim_for_work("assigned") is None
+
+
+def test_lane_registration_preserves_assignment_when_legacy_caller_omits_it(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    original = store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"], required_work_item_id="assigned")
+    repeated = store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    assert repeated == original
+
+
+@pytest.mark.parametrize("bad", ["", [], 7])
+def test_invalid_registration_assignment_does_not_change_registry(tmp_path: Path, bad) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    before = (tmp_path / "lanes.json").read_bytes()
+    with pytest.raises(ValueError, match="invalid required work-item assignment"):
+        store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"], required_work_item_id=bad)
+    assert (tmp_path / "lanes.json").read_bytes() == before
+
+
+@pytest.mark.parametrize("restriction,reason", [
+    ({"labels": ["do-not-merge"]}, "held_by_do_not_merge"),
+    ({"awaiting_human_review": True}, "awaiting_human_review"),
+    ({"status": "refused"}, "refused_without_sidecar_evidence"),
+    ({"repo_scope": "another-repo"}, "outside_repo_scope"),
+    ({"authorized_scopes": ["outside/**"]}, "outside_lane_capability"),
+])
+def test_assignment_does_not_override_existing_admission_guards(tmp_path: Path, restriction, reason) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["docs/**"], required_work_item_id="assigned")
+    store.add_work_item(_assignment_item(**({"required_lane_id": "lane-a", "authorized_scopes": ["docs/proof.md"]} | restriction)))
+    with pytest.raises(ValueError, match=reason):
+        store.claim_work("assigned", "lane-a", "owner", "2026-06-24T00:00:00Z", 60, "receipts/start")
+    assert store.claim_for_work("assigned") is None
+
+
+def test_exact_owner_closeout_refuses_replacement_owner(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item(_assignment_item())
+    store.claim_work("assigned", "lane-a", "original", "2026-06-24T00:00:00Z", 60, "receipts/original")
+    store.claim_work("assigned", "lane-a", "replacement", "2026-06-24T00:02:00Z", 60, "receipts/replacement", recovery_evidence_path="receipts/recovery")
+    before = {p: (tmp_path / p).read_bytes() for p in ("claims/assigned.json", "claims/history.json", "work/items.json")}
+    with pytest.raises(ValueError, match="claim owner changed"):
+        store.close_claim("assigned", "blocked", "receipts/old", "2026-06-24T00:02:01Z", expected_owner_session_id="original")
+    assert all((tmp_path / p).read_bytes() == raw for p, raw in before.items())
+    closed = store.close_claim("assigned", "blocked", "receipts/current", "2026-06-24T00:02:01Z", expected_owner_session_id="replacement")
+    assert closed["claim_owner_session_id"] == "replacement"
+    assert store.read_json("work/items.json")["assigned"]["blocked_at_event_id"] == "evt-1"
+
+
+@pytest.mark.parametrize("status", ["completed", "refused", "superseded", "no-op with evidence", "expired/recovered"])
+def test_nonblocked_closeout_does_not_invent_blocked_event(tmp_path: Path, status) -> None:
+    store = DevLaneStore(tmp_path)
+    store.add_work_item(_assignment_item())
+    store.claim_work("assigned", "lane-a", "owner", "2026-06-24T00:00:00Z", 3600, "receipts/start")
+    store.close_claim("assigned", status, "receipts/end", "2026-06-24T00:01:00Z", expected_owner_session_id="owner")
+    assert "blocked_at_event_id" not in store.read_json("work/items.json")["assigned"]
+
+
+def test_cli_registration_accepts_explicit_work_item(tmp_path: Path, capsys) -> None:
+    from neoengine_local.dev_lane_heartbeat import main
+
+    assert main(["--root", str(tmp_path), "register-lane", "lane-a", "--repo-scope", "repo", "--authorized-scope", "docs/**", "--required-work-item-id", "assigned"]) == 0
+    assert json.loads(capsys.readouterr().out)["required_work_item_id"] == "assigned"
+
+
+def test_registered_assignment_refuses_missing_item_before_expired_recovery(tmp_path: Path) -> None:
+    store = DevLaneStore(tmp_path)
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"])
+    store.add_work_item(_assignment_item("old-work"))
+    store.claim_work("old-work", "lane-a", "old-owner", "2026-06-24T00:00:00Z", 60, "receipts/old")
+    store.register_lane("lane-a", repo_scope="repo", authorized_scopes=["**"], required_work_item_id="new-work")
+    # Model a retained claim whose work item is no longer in the producer's
+    # current registry. The claim is real; missing state must not authorize
+    # recovery for a lane now bound to a different item.
+    store.write_json("work/items.json", {})
+    before_claim = (tmp_path / "claims/old-work.json").read_bytes()
+    before_items = (tmp_path / "work/items.json").read_bytes()
+
+    with pytest.raises(ValueError) as error:
+        store.claim_work("old-work", "lane-a", "new-owner", "2026-06-24T00:02:00Z", 60, "receipts/new", recovery_evidence_path="receipts/recovery")
+
+    assert store.read_json("claims/history.json", []) == []
+    assert (tmp_path / "claims/old-work.json").read_bytes() == before_claim
+    assert (tmp_path / "work/items.json").read_bytes() == before_items
+    assert "outside_required_work_item" in str(error.value)
