@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
+from functools import wraps
 import fnmatch
 import json
 import os
@@ -32,6 +34,14 @@ TERMINAL_CLAIM_STATUSES = {
 ACTIVE_CLAIM_STATUS = "active"
 
 
+def _serialize_claim_mutation(method):
+    @wraps(method)
+    def serialized(self, *args, **kwargs):
+        with self._claims_lock():
+            return method(self, *args, **kwargs)
+    return serialized
+
+
 class DevLaneStore:
     """Durable file-backed heartbeat, claim, and pickup store for developer lanes.
 
@@ -46,6 +56,30 @@ class DevLaneStore:
         self.root.mkdir(parents=True, exist_ok=True)
         for child in ("heartbeats", "continuity", "claims", "work", "receipts"):
             (self.root / child).mkdir(parents=True, exist_ok=True)
+
+    @contextmanager
+    def _claims_lock(self):
+        """Serialize claim, assignment, and event writes in this store."""
+        fd = os.open(self.root / ".claims.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        with os.fdopen(fd, "r+b") as handle:
+            if os.name == "nt":
+                import msvcrt
+                if os.fstat(handle.fileno()).st_size == 0:
+                    handle.write(b"\n")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def path_for(self, relative: str | Path) -> Path:
         return self.root / relative
@@ -64,14 +98,23 @@ class DevLaneStore:
         os.replace(tmp, path)
         return path
 
-    def register_lane(self, lane_id: str, *, repo_scope: str, authorized_scopes: list[str]) -> dict[str, Any]:
+    @_serialize_claim_mutation
+    def register_lane(self, lane_id: str, *, repo_scope: str, authorized_scopes: list[str], required_work_item_id: str | None = None) -> dict[str, Any]:
         lanes = self.read_json("lanes.json", {})
+        if required_work_item_id is None and "required_work_item_id" in lanes.get(lane_id, {}):
+            required_work_item_id = lanes[lane_id]["required_work_item_id"]
+            if required_work_item_id is None:
+                raise ValueError("invalid required work-item assignment")
+        if required_work_item_id is not None and (not isinstance(required_work_item_id, str) or not required_work_item_id):
+            raise ValueError("invalid required work-item assignment")
         lanes[lane_id] = {
             "lane_id": lane_id,
             "repo_scope": repo_scope,
             "authorized_scopes": authorized_scopes,
             "registered_at": lanes.get(lane_id, {}).get("registered_at") or utc_now(),
         }
+        if required_work_item_id is not None:
+            lanes[lane_id]["required_work_item_id"] = required_work_item_id
         self.write_json("lanes.json", lanes)
         return lanes[lane_id]
 
@@ -160,6 +203,7 @@ class DevLaneStore:
         claim = self.read_json(self._claim_path(work_item_id), None)
         return claim if isinstance(claim, dict) else None
 
+    @_serialize_claim_mutation
     def claim_work(
         self,
         work_item_id: str,
@@ -170,6 +214,19 @@ class DevLaneStore:
         evidence_path: str,
         recovery_evidence_path: str | None = None,
     ) -> dict[str, Any]:
+        # Recheck explicit assignment under the same lock as claim publication.
+        # Do this before expired-claim recovery, which also changes durable state.
+        registered_lane = self.read_json("lanes.json", {}).get(lane_id)
+        reason = self._required_work_item_reason(registered_lane or {}, work_item_id)
+        if reason:
+            raise ValueError(f"work item is not claimable: {reason}")
+        item = self.read_json("work/items.json", {}).get(work_item_id)
+        if item is not None:
+            reason = self._required_lane_reason(item, lane_id)
+            if reason:
+                raise ValueError(f"work item is not claimable: {reason}")
+            if "required_lane_id" in item and not registered_lane:
+                raise ValueError("work item is not claimable: required_lane_not_registered")
         current = self.claim_for_work(work_item_id)
         now_dt = utc_parse(now)
         if current and current.get("claim_status") == ACTIVE_CLAIM_STATUS:
@@ -226,11 +283,14 @@ class DevLaneStore:
         if not item:
             return
         item["status"] = status
+        if status == "blocked":
+            item["blocked_at_event_id"] = latest_event_id(item)
         item["updated_at"] = utc_now()
         items[work_item_id] = item
         self.write_json("work/items.json", items)
 
-    def close_claim(self, work_item_id: str, status: str, evidence_path: str, now: str, message: str | None = None) -> dict[str, Any]:
+    @_serialize_claim_mutation
+    def close_claim(self, work_item_id: str, status: str, evidence_path: str, now: str, message: str | None = None, *, expected_owner_session_id: str | None = None) -> dict[str, Any]:
         if status not in TERMINAL_CLAIM_STATUSES:
             raise ValueError(f"invalid terminal claim status: {status}")
         claim = self.claim_for_work(work_item_id)
@@ -238,6 +298,8 @@ class DevLaneStore:
             raise ValueError(f"no claim exists for {work_item_id}")
         if claim.get("claim_status") != ACTIVE_CLAIM_STATUS:
             raise ValueError(f"claim is not active for {work_item_id}: {claim.get('claim_status')}")
+        if expected_owner_session_id is not None and claim.get("claim_owner_session_id") != expected_owner_session_id:
+            raise ValueError(f"claim owner changed for {work_item_id}")
         closed = dict(claim)
         closed.update({"claim_status": status, "closed_at": now, "closeout_evidence_path": evidence_path})
         if message:
@@ -255,6 +317,7 @@ class DevLaneStore:
         self._set_work_item_status(work_item_id, status_by_close[status])
         return closed
 
+    @_serialize_claim_mutation
     def add_work_item(self, item: dict[str, Any]) -> dict[str, Any]:
         if "work_item_id" not in item:
             raise ValueError("work item missing work_item_id")
@@ -267,6 +330,7 @@ class DevLaneStore:
         self.write_json("work/items.json", items)
         return item
 
+    @_serialize_claim_mutation
     def record_event(self, work_item_id: str, event_type: str, created_at: str, event_id: str | None = None) -> dict[str, Any]:
         if event_type not in VALID_WAKE_EVENTS:
             raise ValueError(f"invalid wake event: {event_type}")
@@ -414,7 +478,27 @@ class DevLaneStore:
                 claims.append(claim)
         return claims
 
+    def _required_lane_reason(self, item: dict[str, Any], lane_id: str) -> str | None:
+        """Logical assignment does not manufacture a physical owner or claim."""
+        if "required_lane_id" not in item:
+            return None
+        required = item["required_lane_id"]
+        if not isinstance(required, str) or not required:
+            return "invalid_required_lane_assignment"
+        return None if required == lane_id else "outside_required_lane"
+
+    def _required_work_item_reason(self, lane: dict[str, Any], work_item_id: str) -> str | None:
+        if "required_work_item_id" not in lane:
+            return None
+        required = lane["required_work_item_id"]
+        if not isinstance(required, str) or not required:
+            return "invalid_required_work_item_assignment"
+        return None if required == work_item_id else "outside_required_work_item"
+
     def _is_item_pickable_for_lane(self, item: dict[str, Any], lane: dict[str, Any], now: str) -> tuple[bool, str | None]:
+        reason = self._required_lane_reason(item, lane["lane_id"]) or self._required_work_item_reason(lane, item["work_item_id"])
+        if reason:
+            return False, reason
         if item.get("repo_scope") != lane.get("repo_scope"):
             return False, "outside_repo_scope"
         if not scopes_overlap(lane.get("authorized_scopes", []), item.get("authorized_scopes", [])):
@@ -521,6 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
     reg.add_argument("lane_id")
     reg.add_argument("--repo-scope", required=True)
     reg.add_argument("--authorized-scope", action="append", required=True)
+    reg.add_argument("--required-work-item-id")
 
     hb = sub.add_parser("heartbeat")
     hb.add_argument("lane_id")
@@ -550,7 +635,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = DevLaneStore(args.root)
     if args.command == "register-lane":
-        result = store.register_lane(args.lane_id, repo_scope=args.repo_scope, authorized_scopes=args.authorized_scope)
+        result = store.register_lane(args.lane_id, repo_scope=args.repo_scope, authorized_scopes=args.authorized_scope, required_work_item_id=args.required_work_item_id)
     elif args.command == "heartbeat":
         result = store.emit_heartbeat(
             args.lane_id,
